@@ -62,10 +62,10 @@ use super::{ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchS
 use crate::physical_plan::coalesce_batches::concat_batches;
 use log::debug;
 
-// Maps a `u64` hash value based on the left ["on" values] to a list of indices with this key's value.
+// Maps a hash value based on the left ["on" values] to a list of indices with this key's value.
 // E.g. 1 -> [3, 6, 8] indicates that the column values map to rows 3, 6 and 8 for hash value 1
 // As the key is a hash value, we need to check possible hash collisions in the probe stage
-type JoinHashMap = HashMap<u64, SmallVec<[u64; 1]>, IdHashBuilder>;
+type JoinHashMap = HashMap<(), SmallVec<[u64; 1]>, IdHashBuilder>;
 type JoinLeftData = Arc<(JoinHashMap, RecordBatch)>;
 
 /// join execution plan executes partitions in parallel and combines them into a set of
@@ -405,9 +405,9 @@ fn update_hash(
     // insert hashes to key of the hashmap
     for (row, hash_value) in hash_values.iter().enumerate() {
         hash.raw_entry_mut()
-            .from_key_hashed_nocheck(*hash_value, hash_value)
+            .from_hash(*hash_value, |_| true)
             .and_modify(|_, v| v.push((row + offset) as u64))
-            .or_insert_with(|| (*hash_value, smallvec![(row + offset) as u64]));
+            .or_insert_with(|| ((), smallvec![(row + offset) as u64]));
     }
     Ok(())
 }
@@ -574,7 +574,7 @@ fn build_join_indexes(
                 // For every item on the left and right we check if it matches
                 // This possibly contains rows with hash collisions,
                 // So we have to check here whether rows are equal or not
-                if let Some(indices) = left.get(hash_value) {
+                if let Some((_, indices)) = left.raw_entry().from_hash(*hash_value, |_| true) {
                     for &i in indices {
                         // Check hash collisions
                         if equal_rows(i as usize, row, &left_join_values, &keys_values)? {
@@ -611,7 +611,7 @@ fn build_join_indexes(
 
             // First visit all of the rows
             for (row, hash_value) in hash_values.iter().enumerate() {
-                if let Some(indices) = left.get(hash_value) {
+                if let Some((_, indices)) =  left.raw_entry().from_hash(*hash_value, |_| true) {
                     for &i in indices {
                         // Collision check
                         if equal_rows(i as usize, row, &left_join_values, &keys_values)? {
@@ -638,8 +638,8 @@ fn build_join_indexes(
             let mut right_indices = UInt32Builder::new(0);
 
             for (row, hash_value) in hash_values.iter().enumerate() {
-                match left.get(hash_value) {
-                    Some(indices) => {
+                match left.raw_entry().from_hash(*hash_value, |_| true) {
+                    Some((_, indices)) => {
                         for &i in indices {
                             if equal_rows(
                                 i as usize,
