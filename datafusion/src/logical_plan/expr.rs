@@ -768,6 +768,83 @@ impl Expr {
         // now rewrite this expression itself
         rewriter.mutate(expr)
     }
+
+    /// Evaluates expression to scalar, if possible
+    pub fn to_scalar(self) -> Option<ScalarValue> {
+        match self {
+            Expr::Alias(e, _) => e.to_scalar(),
+            Expr::Column(_) => None,
+            Expr::ScalarVariable(_) => None,
+            Expr::Literal(s) => Some(s),
+            Expr::BinaryExpr { left, op, right } => {
+                let l = left.to_scalar()?;
+                let r = right.to_scalar()?;
+
+                match (l, op, r) {
+                    (
+                        ScalarValue::Float32(Some(v1)),
+                        Operator::Plus,
+                        ScalarValue::Float32(Some(v2)),
+                    ) => {
+                        Some(ScalarValue::Float32(Some(v1 + v2)))
+                    }
+                    (
+                        ScalarValue::Float64(Some(v1)),
+                        Operator::Plus,
+                        ScalarValue::Float64(Some(v2)),
+                    ) => {
+                        Some(ScalarValue::Float64(Some(v1 + v2)))
+                    }
+                    (
+                        ScalarValue::Int64(Some(v1)),
+                        Operator::Plus,
+                        ScalarValue::Int64(Some(v2)),
+                    ) => {
+                        Some(ScalarValue::Int64(Some(v1 + v2)))
+                    }
+                    _ => None,
+                }
+            }
+            Expr::Not(e) => {
+                let s = e.to_scalar()?;
+
+                match s {
+                    ScalarValue::Boolean(Some(b)) => Some(ScalarValue::Boolean(Some(!b))),
+                    ScalarValue::Boolean(None) => Some(ScalarValue::Boolean(None)),
+                    _ => None
+                }
+            },
+            Expr::IsNotNull(_) => None,
+            Expr::IsNull(_) => None,
+            Expr::Negative(_) => None,
+            Expr::Between {
+                ..
+            } => None,
+            Expr::Case {
+                ..
+            } => None,
+            Expr::Cast { .. } => None,
+            Expr::TryCast { .. } => None,
+            Expr::Sort {
+                ..
+            } => None,
+            Expr::ScalarFunction { .. } => {
+                None
+            },
+            Expr::ScalarUDF { .. } => None,
+            Expr::AggregateFunction {
+                ..
+            } => None,
+            Expr::WindowFunction {
+                ..
+            } => None,
+            Expr::AggregateUDF { .. } => None,
+            Expr::InList {
+                ..
+            } => None,
+            Expr::Wildcard => None
+        }
+    }
 }
 
 #[allow(clippy::boxed_local)]
