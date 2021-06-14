@@ -263,8 +263,10 @@ impl ParquetExec {
         // sum the statistics
         let mut num_rows: Option<usize> = None;
         let mut total_byte_size: Option<usize> = None;
-        let mut null_counts: Vec<usize> = vec![0; schema.fields().len()];
-        let mut has_null_counts = false;
+        let mut null_counts: Vec<Option<usize>> = vec![Some(0); schema.fields().len()];
+        // let mut max_values: Vec<Option<ScalarValue>> = vec![Some(0); schema.fields().len()];
+        // let mut min_values: Vec<Option<ScalarValue>> = vec![Some(0); schema.fields().len()];
+
         for part in &partitions {
             if let Some(n) = part.statistics.num_rows {
                 num_rows = Some(num_rows.unwrap_or(0) + n)
@@ -275,28 +277,29 @@ impl ParquetExec {
             if let Some(x) = &part.statistics.column_statistics {
                 let part_nulls: Vec<Option<usize>> =
                     x.iter().map(|c| c.null_count).collect();
-                has_null_counts = true;
-
+                let max_vals: Vec<Option<ScalarValue>> =
+                    x.iter().map(|c| c.max_value.clone()).collect();
+                let min_vals: Vec<Option<ScalarValue>> =
+                    x.iter().map(|c| c.min_value.clone()).collect();
+                
                 for &i in projection.iter() {
-                    null_counts[i] = part_nulls[i].unwrap_or(0);
+                    null_counts[i] = null_counts[i].and_then(|x| part_nulls[i].and_then(|y| Some(x+y)));
                 }
+
+                
             }
         }
-        let column_stats = if has_null_counts {
-            Some(
-                null_counts
-                    .iter()
-                    .map(|null_count| ColumnStatistics {
-                        null_count: Some(*null_count),
-                        distinct_count: None,
-                        max_value: None,
-                        min_value: None,
-                    })
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        let column_stats = 
+
+            Some(null_counts
+                .into_iter()
+                .map(|null_count| ColumnStatistics {
+                    null_count,
+                    distinct_count: None,
+                    max_value: None,
+                    min_value: None,
+                })
+                .collect());
 
         let statistics = Statistics {
             num_rows,
