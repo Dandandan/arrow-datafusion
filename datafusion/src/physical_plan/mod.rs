@@ -107,6 +107,11 @@ impl SQLMetric {
         self.value.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Add elapsed nanoseconds since `start`to self
+    pub fn add_elapsed(&self, start: std::time::Instant) {
+        self.add(start.elapsed().as_nanos() as usize)
+    }
+
     /// Get the current value
     pub fn value(&self) -> usize {
         self.value.load(Ordering::Relaxed)
@@ -341,9 +346,8 @@ pub async fn collect_partitioned(
 pub enum Partitioning {
     /// Allocate batches using a round-robin algorithm and the specified number of partitions
     RoundRobinBatch(usize),
-    /// Allocate rows based on a hash of one of more expressions and the specified
-    /// number of partitions
-    /// This partitioning scheme is not yet fully supported. See [ARROW-11011](https://issues.apache.org/jira/browse/ARROW-11011)
+    /// Allocate rows based on a hash of one of more expressions and the specified number of
+    /// partitions
     Hash(Vec<Arc<dyn PhysicalExpr>>, usize),
     /// Unknown partitioning scheme with a known number of partitions
     UnknownPartitioning(usize),
@@ -617,6 +621,5 @@ pub mod udf;
 #[cfg(feature = "unicode_expressions")]
 pub mod unicode_expressions;
 pub mod union;
-pub mod window_frames;
 pub mod window_functions;
 pub mod windows;

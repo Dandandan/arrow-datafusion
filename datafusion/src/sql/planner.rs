@@ -19,6 +19,7 @@
 
 use crate::catalog::TableReference;
 use crate::datasource::TableProvider;
+use crate::logical_plan::window_frames::{WindowFrame, WindowFrameUnits};
 use crate::logical_plan::Expr::Alias;
 use crate::logical_plan::{
     and, lit, DFSchema, Expr, LogicalPlan, LogicalPlanBuilder, Operator, PlanType,
@@ -85,8 +86,8 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     /// Generate a logical plan from an DataFusion SQL statement
     pub fn statement_to_plan(&self, statement: &DFStatement) -> Result<LogicalPlan> {
         match statement {
-            DFStatement::CreateExternalTable(s) => self.external_table_to_plan(&s),
-            DFStatement::Statement(s) => self.sql_statement_to_plan(&s),
+            DFStatement::CreateExternalTable(s) => self.external_table_to_plan(s),
+            DFStatement::Statement(s) => self.sql_statement_to_plan(s),
         }
     }
 
@@ -97,9 +98,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 verbose,
                 statement,
                 analyze: _,
-            } => self.explain_statement_to_plan(*verbose, &statement),
-            Statement::Query(query) => self.query_to_plan(&query),
-            Statement::ShowVariable { variable } => self.show_variable_to_plan(&variable),
+            } => self.explain_statement_to_plan(*verbose, statement),
+            Statement::Query(query) => self.query_to_plan(query),
+            Statement::ShowVariable { variable } => self.show_variable_to_plan(variable),
             Statement::ShowColumns {
                 extended,
                 full,
@@ -231,7 +232,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             FileType::NdJson => {}
         };
 
-        let schema = self.build_schema(&columns)?;
+        let schema = self.build_schema(columns)?;
 
         Ok(LogicalPlan::CreateExternalTable {
             schema: schema.to_dfschema_ref()?,
@@ -249,7 +250,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         verbose: bool,
         statement: &Statement,
     ) -> Result<LogicalPlan> {
-        let plan = self.sql_statement_to_plan(&statement)?;
+        let plan = self.sql_statement_to_plan(statement)?;
 
         let stringified_plans = vec![StringifiedPlan::new(
             PlanType::LogicalPlan,
@@ -369,7 +370,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         left: &LogicalPlan,
         right: &LogicalPlan,
     ) -> Result<LogicalPlan> {
-        LogicalPlanBuilder::from(&left).cross_join(&right)?.build()
+        LogicalPlanBuilder::from(left).cross_join(right)?.build()
     }
 
     fn parse_join(
@@ -382,7 +383,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         match constraint {
             JoinConstraint::On(sql_expr) => {
                 let mut keys: Vec<(String, String)> = vec![];
-                let join_schema = left.schema().join(&right.schema())?;
+                let join_schema = left.schema().join(right.schema())?;
 
                 // parse ON expression
                 let expr = self.sql_to_rex(sql_expr, &join_schema)?;
@@ -395,14 +396,14 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     keys.iter().map(|pair| pair.1.as_str()).collect();
 
                 // return the logical plan representing the join
-                LogicalPlanBuilder::from(&left)
-                    .join(&right, join_type, &left_keys, &right_keys)?
+                LogicalPlanBuilder::from(left)
+                    .join(right, join_type, &left_keys, &right_keys)?
                     .build()
             }
             JoinConstraint::Using(idents) => {
                 let keys: Vec<&str> = idents.iter().map(|x| x.value.as_str()).collect();
-                LogicalPlanBuilder::from(&left)
-                    .join(&right, join_type, &keys, &keys)?
+                LogicalPlanBuilder::from(left)
+                    .join(right, join_type, &keys, &keys)?
                     .build()
             }
             JoinConstraint::Natural => {
@@ -423,7 +424,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         ctes: &mut HashMap<String, LogicalPlan>,
     ) -> Result<LogicalPlan> {
         match relation {
-            TableFactor::Table { name, .. } => {
+            TableFactor::Table { name, alias, .. } => {
                 let table_name = name.to_string();
                 let cte = ctes.get(&table_name);
                 match (
@@ -431,10 +432,17 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     self.schema_provider.get_table_provider(name.try_into()?),
                 ) {
                     (Some(cte_plan), _) => Ok(cte_plan.clone()),
-                    (_, Some(provider)) => {
-                        LogicalPlanBuilder::scan(&table_name, provider, None)?.build()
-                    }
-                    (_, None) => Err(DataFusionError::Plan(format!(
+                    (_, Some(provider)) => LogicalPlanBuilder::scan(
+                        // take alias into account to support `JOIN table1 as table2`
+                        alias
+                            .as_ref()
+                            .map(|a| a.name.value.as_str())
+                            .unwrap_or(&table_name),
+                        provider,
+                        None,
+                    )?
+                    .build(),
+                    (None, None) => Err(DataFusionError::Plan(format!(
                         "Table or CTE with name '{}' not found",
                         name
                     ))),
@@ -471,7 +479,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 // build join schema
                 let mut fields = vec![];
                 for plan in &plans {
-                    fields.extend_from_slice(&plan.schema().fields());
+                    fields.extend_from_slice(plan.schema().fields());
                 }
                 let join_schema = DFSchema::new(fields)?;
 
@@ -672,16 +680,16 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
         Ok(projection
             .iter()
-            .map(|expr| self.sql_select_to_rex(&expr, &input_schema))
+            .map(|expr| self.sql_select_to_rex(expr, input_schema))
             .collect::<Result<Vec<Expr>>>()?
             .iter()
-            .flat_map(|expr| expand_wildcard(&expr, &input_schema))
+            .flat_map(|expr| expand_wildcard(expr, input_schema))
             .collect::<Vec<Expr>>())
     }
 
     /// Wrap a plan in a projection
     fn project(&self, input: &LogicalPlan, expr: Vec<Expr>) -> Result<LogicalPlan> {
-        self.validate_schema_satisfies_exprs(&input.schema(), &expr)?;
+        self.validate_schema_satisfies_exprs(input.schema(), &expr)?;
         LogicalPlanBuilder::from(input).project(expr)?.build()
     }
 
@@ -713,7 +721,6 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         let select_exprs = select_exprs
             .iter()
             .map(|expr| rebase_expr(expr, &window_exprs, &plan))
-            .into_iter()
             .collect::<Result<Vec<_>>>()?;
         Ok((plan, select_exprs))
     }
@@ -733,7 +740,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             .cloned()
             .collect::<Vec<Expr>>();
 
-        let plan = LogicalPlanBuilder::from(&input)
+        let plan = LogicalPlanBuilder::from(input)
             .aggregate(group_by_exprs, aggr_exprs)?
             .build()?;
 
@@ -784,14 +791,14 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     fn limit(&self, input: &LogicalPlan, limit: &Option<SQLExpr>) -> Result<LogicalPlan> {
         match *limit {
             Some(ref limit_expr) => {
-                let n = match self.sql_to_rex(&limit_expr, &input.schema())? {
+                let n = match self.sql_to_rex(limit_expr, input.schema())? {
                     Expr::Literal(ScalarValue::Int64(Some(n))) => Ok(n as usize),
                     _ => Err(DataFusionError::Plan(
                         "Unexpected expression for LIMIT clause".to_string(),
                     )),
                 }?;
 
-                LogicalPlanBuilder::from(&input).limit(n)?.build()
+                LogicalPlanBuilder::from(input).limit(n)?.build()
             }
             _ => Ok(input.clone()),
         }
@@ -810,10 +817,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         let order_by_rex = order_by
             .iter()
             .map(|e| self.order_by_to_sort_expr(e))
-            .into_iter()
             .collect::<Result<Vec<_>>>()?;
 
-        LogicalPlanBuilder::from(&plan).sort(order_by_rex)?.build()
+        LogicalPlanBuilder::from(plan).sort(order_by_rex)?.build()
     }
 
     /// convert sql OrderByExpr to Expr::Sort
@@ -837,7 +843,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             .iter()
             .try_for_each(|col| match col {
                 Expr::Column(name) => {
-                    schema.field_with_unqualified_name(&name).map_err(|_| {
+                    schema.field_with_unqualified_name(name).map_err(|_| {
                         DataFusionError::Plan(format!(
                             "Invalid identifier '{}' for schema {}",
                             name,
@@ -855,7 +861,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         match sql {
             SelectItem::UnnamedExpr(expr) => self.sql_to_rex(expr, schema),
             SelectItem::ExprWithAlias { expr, alias } => Ok(Alias(
-                Box::new(self.sql_to_rex(&expr, schema)?),
+                Box::new(self.sql_to_rex(expr, schema)?),
                 alias.value.clone(),
             )),
             SelectItem::Wildcard => Ok(Expr::Wildcard),
@@ -978,7 +984,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 ref expr,
                 ref data_type,
             } => Ok(Expr::Cast {
-                expr: Box::new(self.sql_expr_to_logical_expr(&expr)?),
+                expr: Box::new(self.sql_expr_to_logical_expr(expr)?),
                 data_type: convert_data_type(data_type)?,
             }),
 
@@ -986,7 +992,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 ref expr,
                 ref data_type,
             } => Ok(Expr::TryCast {
-                expr: Box::new(self.sql_expr_to_logical_expr(&expr)?),
+                expr: Box::new(self.sql_expr_to_logical_expr(expr)?),
                 data_type: convert_data_type(data_type)?,
             }),
 
@@ -1041,10 +1047,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 ref low,
                 ref high,
             } => Ok(Expr::Between {
-                expr: Box::new(self.sql_expr_to_logical_expr(&expr)?),
+                expr: Box::new(self.sql_expr_to_logical_expr(expr)?),
                 negated: *negated,
-                low: Box::new(self.sql_expr_to_logical_expr(&low)?),
-                high: Box::new(self.sql_expr_to_logical_expr(&high)?),
+                low: Box::new(self.sql_expr_to_logical_expr(low)?),
+                high: Box::new(self.sql_expr_to_logical_expr(high)?),
             }),
 
             SQLExpr::InList {
@@ -1058,7 +1064,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     .collect::<Result<Vec<_>>>()?;
 
                 Ok(Expr::InList {
-                    expr: Box::new(self.sql_expr_to_logical_expr(&expr)?),
+                    expr: Box::new(self.sql_expr_to_logical_expr(expr)?),
                     list: list_expr,
                     negated: *negated,
                 })
@@ -1092,9 +1098,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 }?;
 
                 Ok(Expr::BinaryExpr {
-                    left: Box::new(self.sql_expr_to_logical_expr(&left)?),
+                    left: Box::new(self.sql_expr_to_logical_expr(left)?),
                     op: operator,
-                    right: Box::new(self.sql_expr_to_logical_expr(&right)?),
+                    right: Box::new(self.sql_expr_to_logical_expr(right)?),
                 })
             }
 
@@ -1126,18 +1132,27 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                         .partition_by
                         .iter()
                         .map(|e| self.sql_expr_to_logical_expr(e))
-                        .into_iter()
                         .collect::<Result<Vec<_>>>()?;
                     let order_by = window
                         .order_by
                         .iter()
                         .map(|e| self.order_by_to_sort_expr(e))
-                        .into_iter()
                         .collect::<Result<Vec<_>>>()?;
                     let window_frame = window
                         .window_frame
                         .as_ref()
-                        .map(|window_frame| window_frame.clone().try_into())
+                        .map(|window_frame| {
+                            let window_frame: WindowFrame = window_frame.clone().try_into()?;
+                            if WindowFrameUnits::Range == window_frame.units
+                                && order_by.len() != 1
+                            {
+                                Err(DataFusionError::Plan(format!(
+                                    "With window frame of type RANGE, the order by expression must be of length 1, got {}", order_by.len())))
+                            } else {
+                                Ok(window_frame)
+                            }
+
+                        })
                         .transpose()?;
                     let fun = window_functions::WindowFunction::from_str(&name)?;
                     match fun {
@@ -1201,7 +1216,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 }
             }
 
-            SQLExpr::Nested(e) => self.sql_expr_to_logical_expr(&e),
+            SQLExpr::Nested(e) => self.sql_expr_to_logical_expr(e),
 
             _ => Err(DataFusionError::NotImplemented(format!(
                 "Unsupported ast node {:?} in sqltorel",
@@ -2859,10 +2874,10 @@ mod tests {
 
     #[test]
     fn over_order_by_with_window_frame_double_end() {
-        let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY order_id RANGE BETWEEN 3 PRECEDING and 3 FOLLOWING), MIN(qty) OVER (ORDER BY order_id DESC) from orders";
+        let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY order_id ROWS BETWEEN 3 PRECEDING and 3 FOLLOWING), MIN(qty) OVER (ORDER BY order_id DESC) from orders";
         let expected = "\
-        Projection: #order_id, #MAX(qty) RANGE BETWEEN 3 PRECEDING AND 3 FOLLOWING, #MIN(qty)\
-        \n  WindowAggr: windowExpr=[[MAX(#qty) RANGE BETWEEN 3 PRECEDING AND 3 FOLLOWING]]\
+        Projection: #order_id, #MAX(qty) ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING, #MIN(qty)\
+        \n  WindowAggr: windowExpr=[[MAX(#qty) ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING]]\
         \n    Sort: #order_id ASC NULLS FIRST\
         \n      WindowAggr: windowExpr=[[MIN(#qty)]]\
         \n        Sort: #order_id DESC NULLS FIRST\
@@ -2872,15 +2887,47 @@ mod tests {
 
     #[test]
     fn over_order_by_with_window_frame_single_end() {
-        let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY order_id RANGE 3 PRECEDING), MIN(qty) OVER (ORDER BY order_id DESC) from orders";
+        let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY order_id ROWS 3 PRECEDING), MIN(qty) OVER (ORDER BY order_id DESC) from orders";
         let expected = "\
-        Projection: #order_id, #MAX(qty) RANGE BETWEEN 3 PRECEDING AND CURRENT ROW, #MIN(qty)\
-        \n  WindowAggr: windowExpr=[[MAX(#qty) RANGE BETWEEN 3 PRECEDING AND CURRENT ROW]]\
+        Projection: #order_id, #MAX(qty) ROWS BETWEEN 3 PRECEDING AND CURRENT ROW, #MIN(qty)\
+        \n  WindowAggr: windowExpr=[[MAX(#qty) ROWS BETWEEN 3 PRECEDING AND CURRENT ROW]]\
         \n    Sort: #order_id ASC NULLS FIRST\
         \n      WindowAggr: windowExpr=[[MIN(#qty)]]\
         \n        Sort: #order_id DESC NULLS FIRST\
         \n          TableScan: orders projection=None";
         quick_test(sql, expected);
+    }
+
+    #[test]
+    fn over_order_by_with_window_frame_range_value_check() {
+        let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY order_id RANGE 3 PRECEDING) from orders";
+        let err = logical_plan(sql).expect_err("query should have failed");
+        assert_eq!(
+            "NotImplemented(\"With WindowFrameUnits=RANGE, the bound cannot be 3 PRECEDING or FOLLOWING at the moment\")",
+            format!("{:?}", err)
+        );
+    }
+
+    #[test]
+    fn over_order_by_with_window_frame_range_order_by_check() {
+        let sql =
+            "SELECT order_id, MAX(qty) OVER (RANGE UNBOUNDED PRECEDING) from orders";
+        let err = logical_plan(sql).expect_err("query should have failed");
+        assert_eq!(
+            "Plan(\"With window frame of type RANGE, the order by expression must be of length 1, got 0\")",
+            format!("{:?}", err)
+        );
+    }
+
+    #[test]
+    fn over_order_by_with_window_frame_range_order_by_check_2() {
+        let sql =
+            "SELECT order_id, MAX(qty) OVER (ORDER BY order_id, qty RANGE UNBOUNDED PRECEDING) from orders";
+        let err = logical_plan(sql).expect_err("query should have failed");
+        assert_eq!(
+            "Plan(\"With window frame of type RANGE, the order by expression must be of length 1, got 2\")",
+            format!("{:?}", err)
+        );
     }
 
     #[test]
@@ -3127,7 +3174,7 @@ mod tests {
 
     fn logical_plan(sql: &str) -> Result<LogicalPlan> {
         let planner = SqlToRel::new(&MockContextProvider {});
-        let result = DFParser::parse_sql(&sql);
+        let result = DFParser::parse_sql(sql);
         let ast = result.unwrap();
         planner.statement_to_plan(&ast[0])
     }
