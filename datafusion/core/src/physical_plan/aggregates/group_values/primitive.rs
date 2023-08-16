@@ -175,8 +175,15 @@ where
 
         let array: PrimitiveArray<T> = match emit_to {
             EmitTo::All => {
+                let values = build_primitive(
+                    std::mem::take(&mut self.values),
+                    self.null_group.take(),
+                );
+
                 self.map.clear();
-                build_primitive(std::mem::take(&mut self.values), self.null_group.take())
+                self.values.clear();
+
+                values
             }
             EmitTo::First(n) => {
                 // SAFETY: self.map outlives iterator and is not modified concurrently

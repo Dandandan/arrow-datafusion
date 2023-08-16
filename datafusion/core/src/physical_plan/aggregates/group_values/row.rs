@@ -151,8 +151,10 @@ impl GroupValues for GroupValuesRows {
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         Ok(match emit_to {
             EmitTo::All => {
-                // Eventually we may also want to clear the hash table here
-                self.row_converter.convert_rows(&self.group_values)?
+                let rows = self.row_converter.convert_rows(&self.group_values)?;
+                self.map.clear();
+                self.group_values.clear();
+                rows
             }
             EmitTo::First(n) => {
                 let groups_rows = self.group_values.iter().take(n);

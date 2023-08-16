@@ -320,6 +320,9 @@ impl Stream for GroupedHashAggregateStream {
                             if let Some(to_emit) = self.group_ordering.emit_to() {
                                 let batch = extract_ok!(self.emit(to_emit));
                                 self.exec_state = ExecutionState::ProducingOutput(batch);
+                            } else if self.mode == AggregateMode::Partial && self.group_values.len() > 10000 {
+                                let batch = extract_ok!(self.emit(EmitTo::All));
+                                self.exec_state = ExecutionState::ProducingOutput(batch);
                             }
                             timer.done();
                         }
