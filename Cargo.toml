@@ -52,7 +52,7 @@ version = "32.0.0"
 arrow = { version = "48.0.0", features = ["prettyprint"] }
 arrow-array = { version = "48.0.0", default-features = false, features = ["chrono-tz"] }
 arrow-buffer = { version = "48.0.0", default-features = false }
-arrow-flight = { version = "48.0.0", features = ["flight-sql-experimental"] }
+arrow-flight = { version = "49.0.0", features = ["flight-sql-experimental"] }
 arrow-schema = { version = "48.0.0", default-features = false }
 async-trait = "0.1.73"
 bigdecimal = "0.4.1"
