@@ -24,7 +24,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{any::Any, vec};
 
-use arrow::array::{ArrayRef, UInt64Builder};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow_array::Array;
@@ -182,7 +181,7 @@ impl BatchPartitioner {
                         create_hashes(&arrays, random_state, hash_buffer)?;
 
                         for (index, hash) in hash_buffer.iter().enumerate() {
-                            let p = (*hash % *partitions as u64);
+                            let p = *hash % *partitions as u64;
                             indices[p as usize].push((i, index))
                         }
                     }
@@ -742,6 +741,8 @@ impl RepartitionExec {
                 }
                 timer.done();
             }
+
+            batches_buffer.clear();
 
             // If the input stream is endless, we may spin forever and
             // never yield back to tokio.  See
