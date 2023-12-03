@@ -103,9 +103,10 @@ mod tests {
             .filter(col("id").eq(lit(1)))?
             .select_columns(&["bool_col", "int_col"])?;
 
-        let plan = df.explain(false, false)?.collect().await?;
+        let plan = df.explain(true, false)?.collect().await?;
         // Filters all the way to Parquet
         let formatted = pretty::pretty_format_batches(&plan)?.to_string();
+        println!("{}", formatted);
         assert!(formatted.contains("FilterExec: id@0 = 1"));
 
         Ok(())

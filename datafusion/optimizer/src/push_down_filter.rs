@@ -23,7 +23,6 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::Alias;
 use datafusion_expr::utils::{conjunction, split_conjunction, split_conjunction_owned};
-use datafusion_expr::Volatility;
 use datafusion_expr::{
     and,
     expr_rewriter::replace_col,
@@ -31,6 +30,7 @@ use datafusion_expr::{
     or, BinaryExpr, Expr, Filter, Operator, ScalarFunctionDefinition,
     TableProviderFilterPushDown,
 };
+use datafusion_expr::{Projection, Volatility};
 use itertools::Itertools;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -907,9 +907,17 @@ impl OptimizerRule for PushDownFilter {
                     Some(predicate) => LogicalPlan::Filter(Filter::try_new(
                         predicate,
                         Arc::new(new_scan),
-                        None,
+                        filter.projected_schema.clone(),
                     )?),
-                    None => new_scan,
+                    None => match &filter.projected_schema {
+                        Some(projected_schema) => {
+                            LogicalPlan::Projection(Projection::new_from_schema(
+                                Arc::new(new_scan),
+                                projected_schema.clone(),
+                            ))
+                        }
+                        None => new_scan,
+                    },
                 }
             }
             LogicalPlan::Extension(extension_plan) => {
