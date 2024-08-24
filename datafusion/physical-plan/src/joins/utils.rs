@@ -55,7 +55,6 @@ use datafusion_physical_expr::{
 
 use futures::future::{BoxFuture, Shared};
 use futures::{ready, FutureExt};
-use hashbrown::raw::RawTable;
 use parking_lot::Mutex;
 
 /// Maps a `u64` hash value based on the build side ["on" values] to a list of indices with this key's value.
@@ -121,22 +120,22 @@ use parking_lot::Mutex;
 /// ---------------------
 /// ```
 pub struct JoinHashMap {
-    // Stores hash value to last row index
-    map: RawTable<(u64, u64)>,
-    // Stores indices in chained list data structure
-    next: Vec<u64>,
+    // Stores last hash and row index
+    map: Vec<(u64, u64)>,
+    // Stores hash and indices in chained list data structure
+    next: Vec<(u64, u64)>,
 }
 
 impl JoinHashMap {
     #[cfg(test)]
-    pub(crate) fn new(map: RawTable<(u64, u64)>, next: Vec<u64>) -> Self {
+    pub(crate) fn new(map: Vec<(u64, u64)>, next: Vec<(u64, u64)>) -> Self {
         Self { map, next }
     }
 
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         JoinHashMap {
-            map: RawTable::with_capacity(capacity),
-            next: vec![0; capacity],
+            map: vec![(0, 0); capacity * 8],
+            next: vec![(0, 0); capacity],
         }
     }
 }
@@ -149,9 +148,12 @@ pub(crate) type JoinHashMapOffset = (usize, Option<u64>);
 macro_rules! chain_traverse {
     (
         $input_indices:ident, $match_indices:ident, $hash_values:ident, $next_chain:ident,
-        $input_idx:ident, $chain_idx:ident, $deleted_offset:ident, $remaining_output:ident
+        $input_idx:ident, $chain_idx:ident, $deleted_offset:ident, $remaining_output:ident,
+        $hash_value:ident, 
+        $hash:ident
     ) => {
         let mut i = $chain_idx - 1;
+        let mut hash = $hash;
         loop {
             let match_row_idx = if let Some(offset) = $deleted_offset {
                 // This arguments means that we prune the next index way before here.
@@ -163,11 +165,14 @@ macro_rules! chain_traverse {
             } else {
                 i
             };
-            $match_indices.push(match_row_idx);
-            $input_indices.push($input_idx as u32);
+            if $hash_value == hash {
+                $match_indices.push(match_row_idx);
+                $input_indices.push($input_idx as u32);    
+            }
             $remaining_output -= 1;
             // Follow the chain to get the next index value
-            let next = $next_chain[match_row_idx as usize];
+            let (new_hash, next) = $next_chain[match_row_idx as usize];
+            hash = new_hash;
 
             if $remaining_output == 0 {
                 // In case current input index is the last, and no more chain values left
@@ -191,13 +196,13 @@ macro_rules! chain_traverse {
 // Trait defining methods that must be implemented by a hash map type to be used for joins.
 pub trait JoinHashMapType {
     /// The type of list used to store the next list
-    type NextType: IndexMut<usize, Output = u64>;
+    type NextType: IndexMut<usize, Output = (u64, u64)>;
     /// Extend with zero
     fn extend_zero(&mut self, len: usize);
     /// Returns mutable references to the hash map and the next.
-    fn get_mut(&mut self) -> (&mut RawTable<(u64, u64)>, &mut Self::NextType);
+    fn get_mut(&mut self) -> (&mut Vec<(u64, u64)>, &mut Self::NextType);
     /// Returns a reference to the hash map.
-    fn get_map(&self) -> &RawTable<(u64, u64)>;
+    fn get_map(&self) -> &Vec<(u64, u64)>;
     /// Returns a reference to the next.
     fn get_list(&self) -> &Self::NextType;
 
@@ -208,22 +213,19 @@ pub trait JoinHashMapType {
         deleted_offset: usize,
     ) {
         let (mut_map, mut_list) = self.get_mut();
+        let len = mut_map.len();
         for (row, hash_value) in iter {
-            let item = mut_map.get_mut(*hash_value, |(hash, _)| *hash_value == *hash);
-            if let Some((_, index)) = item {
+            let bucket = *hash_value as usize % len;
+            let (prev_hash, index) = mut_map[bucket];
+            if index > 0 {
                 // Already exists: add index to next array
-                let prev_index = *index;
+                let prev_index = index;
                 // Store new value inside hashmap
-                *index = (row + 1) as u64;
-                // Update chained Vec at `row` with previous value
-                mut_list[row - deleted_offset] = prev_index;
+                mut_map[bucket] = (*hash_value, (row + 1) as u64);
+                // Update chained Vec at `row` with previous hash and value
+                mut_list[row - deleted_offset] = (prev_hash, prev_index);
             } else {
-                mut_map.insert(
-                    *hash_value,
-                    // store the value + 1 as 0 value reserved for end of list
-                    (*hash_value, (row + 1) as u64),
-                    |(hash, _)| *hash,
-                );
+                mut_map[bucket] = (*hash_value, (row + 1) as u64);
                 // chained list at `row` is already initialized with 0
                 // meaning end of list
             }
@@ -246,10 +248,10 @@ pub trait JoinHashMapType {
         let next_chain = self.get_list();
         for (row_idx, hash_value) in iter {
             // Get the hash and find it in the index
-            if let Some((_, index)) =
-                hash_map.get(*hash_value, |(hash, _)| *hash_value == *hash)
-            {
-                let mut i = *index - 1;
+            let (mut hash, index) = hash_map[*hash_value as usize % hash_map.len()];
+
+            if index > 0 {
+                let mut i = index - 1;
                 loop {
                     let match_row_idx = if let Some(offset) = deleted_offset {
                         // This arguments means that we prune the next index way before here.
@@ -261,10 +263,13 @@ pub trait JoinHashMapType {
                     } else {
                         i
                     };
-                    match_indices.push(match_row_idx);
-                    input_indices.push(row_idx as u32);
+                    if *hash_value == hash {
+                        match_indices.push(match_row_idx);
+                        input_indices.push(row_idx as u32);
+                    }
                     // Follow the chain to get the next index value
-                    let next = next_chain[match_row_idx as usize];
+                    let (new_hash, next) = next_chain[match_row_idx as usize];
+                    hash = new_hash;
                     if next == 0 {
                         // end of list
                         break;
@@ -295,7 +300,7 @@ pub trait JoinHashMapType {
 
         let mut remaining_output = limit;
 
-        let hash_map: &RawTable<(u64, u64)> = self.get_map();
+        let hash_map = self.get_map();
         let next_chain = self.get_list();
 
         // Calculate initial `hash_values` index before iterating
@@ -308,6 +313,8 @@ pub trait JoinHashMapType {
             // Otherwise, process remaining `initial_idx` matches by traversing `next_chain`,
             // to start with the next index
             (initial_idx, Some(initial_next_idx)) => {
+                let hash_value = hash_values[initial_idx];
+                let (hash, _) = hash_map[hash_value as usize % hash_map.len()];
                 chain_traverse!(
                     input_indices,
                     match_indices,
@@ -316,7 +323,9 @@ pub trait JoinHashMapType {
                     initial_idx,
                     initial_next_idx,
                     deleted_offset,
-                    remaining_output
+                    remaining_output,
+                    hash_value,
+                    hash
                 );
 
                 initial_idx + 1
@@ -324,9 +333,9 @@ pub trait JoinHashMapType {
         };
 
         let mut row_idx = to_skip;
-        for hash_value in &hash_values[to_skip..] {
-            if let Some((_, index)) =
-                hash_map.get(*hash_value, |(hash, _)| *hash_value == *hash)
+        for &hash_value in &hash_values[to_skip..] {
+            let (hash, index) = hash_map[hash_value as usize % hash_map.len()];
+            if index > 0
             {
                 chain_traverse!(
                     input_indices,
@@ -336,7 +345,9 @@ pub trait JoinHashMapType {
                     row_idx,
                     index,
                     deleted_offset,
-                    remaining_output
+                    remaining_output,
+                    hash_value,
+                    hash
                 );
             }
             row_idx += 1;
@@ -348,18 +359,18 @@ pub trait JoinHashMapType {
 
 /// Implementation of `JoinHashMapType` for `JoinHashMap`.
 impl JoinHashMapType for JoinHashMap {
-    type NextType = Vec<u64>;
+    type NextType = Vec<(u64, u64)>;
 
     // Void implementation
     fn extend_zero(&mut self, _: usize) {}
 
     /// Get mutable references to the hash map and the next.
-    fn get_mut(&mut self) -> (&mut RawTable<(u64, u64)>, &mut Self::NextType) {
+    fn get_mut(&mut self) -> (&mut Vec<(u64, u64)>, &mut Self::NextType) {
         (&mut self.map, &mut self.next)
     }
 
     /// Get a reference to the hash map.
-    fn get_map(&self) -> &RawTable<(u64, u64)> {
+    fn get_map(&self) -> &Vec<(u64, u64)> {
         &self.map
     }
 
