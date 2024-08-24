@@ -139,6 +139,41 @@ impl JoinHashMap {
             next: vec![0; capacity],
         }
     }
+
+    // Optimize `next` array for cache-efficiency
+    // This transfo
+    fn finalize(
+        &mut self,
+    ) {
+        let mut items = vec![0; self.map.len() + self.next.len()];
+        let (map, next_chain) = self.get_mut();
+        let mut offset = 0;
+        for i in unsafe { map.iter()} {
+            let (_, index) = unsafe {i.as_mut()};
+            let start_offset = offset;
+            offset += 1;
+            items[offset] = *index;
+            
+            let mut next_i = *index;
+            let mut len = 1;
+            loop {
+                let next = next_chain[next_i as usize];
+                if next == 0 {
+                    // end of list
+                    break;
+                }
+                next_i = next - 1;
+
+                items[offset] = next_i;
+                len += 1;
+            }
+
+            items[start_offset] = len;
+        }
+        *next_chain = items;
+
+        
+    }
 }
 
 // Type of offsets for obtaining indices from JoinHashMap.
