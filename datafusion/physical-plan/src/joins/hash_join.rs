@@ -3133,8 +3133,8 @@ mod tests {
         )?;
 
         // Create hash collisions (same hashes)
-        hashmap_left.insert(hashes[0], (hashes[0], 1), |(h, _)| *h);
-        hashmap_left.insert(hashes[1], (hashes[1], 1), |(h, _)| *h);
+        hashmap_left.insert(hashes[0], 1, |h| *h);
+        hashmap_left.insert(hashes[1], 1, |h| *h);
 
         let next = vec![2, 0];
 

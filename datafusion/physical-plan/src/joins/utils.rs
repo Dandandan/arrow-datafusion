@@ -121,15 +121,15 @@ use parking_lot::Mutex;
 /// ---------------------
 /// ```
 pub struct JoinHashMap {
-    // Stores hash value to last row index
-    map: RawTable<(u64, u64)>,
+    // Stores last row index + last 8 bits from hash value
+    map: RawTable<u64>,
     // Stores indices in chained list data structure
     next: Vec<u64>,
 }
 
 impl JoinHashMap {
     #[cfg(test)]
-    pub(crate) fn new(map: RawTable<(u64, u64)>, next: Vec<u64>) -> Self {
+    pub(crate) fn new(map: RawTable<u64>, next: Vec<u64>) -> Self {
         Self { map, next }
     }
 
@@ -195,37 +195,48 @@ pub trait JoinHashMapType {
     /// Extend with zero
     fn extend_zero(&mut self, len: usize);
     /// Returns mutable references to the hash map and the next.
-    fn get_mut(&mut self) -> (&mut RawTable<(u64, u64)>, &mut Self::NextType);
+    fn get_mut(&mut self) -> (&mut RawTable<u64>, &mut Self::NextType);
     /// Returns a reference to the hash map.
-    fn get_map(&self) -> &RawTable<(u64, u64)>;
+    fn get_map(&self) -> &RawTable<u64>;
     /// Returns a reference to the next.
     fn get_list(&self) -> &Self::NextType;
 
     /// Updates hashmap from iterator of row indices & row hashes pairs.
     fn update_from_iter<'a>(
         &mut self,
-        iter: impl Iterator<Item = (usize, &'a u64)>,
+        iter: impl ExactSizeIterator<Item = (usize, &'a u64)>,
         deleted_offset: usize,
     ) {
         let (mut_map, mut_list) = self.get_mut();
+        assert!(iter.len() + mut_map.len() <= mut_map.capacity());
+
         for (row, hash_value) in iter {
-            let item = mut_map.get_mut(*hash_value, |(hash, _)| *hash_value == *hash);
-            if let Some((_, index)) = item {
-                // Already exists: add index to next array
-                let prev_index = *index;
-                // Store new value inside hashmap
-                *index = (row + 1) as u64;
-                // Update chained Vec at `row` with previous value
-                mut_list[row - deleted_offset] = prev_index;
-            } else {
-                mut_map.insert(
-                    *hash_value,
-                    // store the value + 1 as 0 value reserved for end of list
-                    (*hash_value, (row + 1) as u64),
-                    |(hash, _)| *hash,
-                );
-                // chained list at `row` is already initialized with 0
-                // meaning end of list
+            let item = mut_map.find_or_find_insert_slot(*hash_value, |_| true, |hash| *hash);
+            match item {
+                Ok(bucket) => {
+                    // SAFETY: bucket is found above
+                    let index = unsafe { bucket.as_mut() };
+                    // Already exists: add index to next array
+                    let prev_index = *index;
+                    // Store new value inside hashmap
+                    *index = (row + 1) as u64;
+                    // Update chained Vec at `row` with previous value
+                    mut_list[row - deleted_offset] = prev_index;
+                }
+                Err(slot) => {
+                    // SAFETY: slot from above, 
+                    unsafe {
+                        mut_map.insert_in_slot(
+                            *hash_value,
+                            slot,
+                            // store the value + 1 as 0 value reserved for end of list
+                            (row + 1) as u64,
+                        );
+                    }
+                    // chained list at `row` is already initialized with 0
+                    // meaning end of list
+
+                }
             }
         }
     }
@@ -242,14 +253,14 @@ pub trait JoinHashMapType {
         let mut input_indices = vec![];
         let mut match_indices = vec![];
 
-        let hash_map = self.get_map();
+        let hash_map: &RawTable<u64> = self.get_map();
         let next_chain = self.get_list();
         for (row_idx, hash_value) in iter {
             // Get the hash and find it in the index
-            if let Some((_, index)) =
-                hash_map.get(*hash_value, |(hash, _)| *hash_value == *hash)
+            if let Some(index) =
+                hash_map.get(*hash_value, |_|true)
             {
-                let mut i = *index - 1;
+                let mut i = index - 1;
                 loop {
                     let match_row_idx = if let Some(offset) = deleted_offset {
                         // This arguments means that we prune the next index way before here.
@@ -295,7 +306,7 @@ pub trait JoinHashMapType {
 
         let mut remaining_output = limit;
 
-        let hash_map: &RawTable<(u64, u64)> = self.get_map();
+        let hash_map: &RawTable<u64> = self.get_map();
         let next_chain = self.get_list();
 
         // Calculate initial `hash_values` index before iterating
@@ -325,8 +336,8 @@ pub trait JoinHashMapType {
 
         let mut row_idx = to_skip;
         for hash_value in &hash_values[to_skip..] {
-            if let Some((_, index)) =
-                hash_map.get(*hash_value, |(hash, _)| *hash_value == *hash)
+            if let Some(index) =
+                hash_map.get(*hash_value, |_| true)
             {
                 chain_traverse!(
                     input_indices,
@@ -354,12 +365,12 @@ impl JoinHashMapType for JoinHashMap {
     fn extend_zero(&mut self, _: usize) {}
 
     /// Get mutable references to the hash map and the next.
-    fn get_mut(&mut self) -> (&mut RawTable<(u64, u64)>, &mut Self::NextType) {
+    fn get_mut(&mut self) -> (&mut RawTable<u64>, &mut Self::NextType) {
         (&mut self.map, &mut self.next)
     }
 
     /// Get a reference to the hash map.
-    fn get_map(&self) -> &RawTable<(u64, u64)> {
+    fn get_map(&self) -> &RawTable<u64> {
         &self.map
     }
 
