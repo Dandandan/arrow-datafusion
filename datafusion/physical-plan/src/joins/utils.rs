@@ -236,7 +236,7 @@ pub trait JoinHashMapType {
     /// equality may be required.
     fn get_matched_indices<'a>(
         &self,
-        iter: impl Iterator<Item = (usize, &'a u64)>,
+        iter: impl ExactSizeIterator<Item = (usize, &'a u64)>,
         deleted_offset: Option<usize>,
     ) -> (Vec<u32>, Vec<u64>) {
         let mut input_indices = vec![];
@@ -244,33 +244,39 @@ pub trait JoinHashMapType {
 
         let hash_map = self.get_map();
         let next_chain = self.get_list();
+        let mut firsts = Vec::with_capacity(iter.len());
+
         for (row_idx, hash_value) in iter {
             // Get the hash and find it in the index
             if let Some((_, index)) =
                 hash_map.get(*hash_value, |(hash, _)| *hash_value == *hash)
             {
-                let mut i = *index - 1;
-                loop {
-                    let match_row_idx = if let Some(offset) = deleted_offset {
-                        // This arguments means that we prune the next index way before here.
-                        if i < offset as u64 {
-                            // End of the list due to pruning
-                            break;
-                        }
-                        i - offset as u64
-                    } else {
-                        i
-                    };
-                    match_indices.push(match_row_idx);
-                    input_indices.push(row_idx as u32);
-                    // Follow the chain to get the next index value
-                    let next = next_chain[match_row_idx as usize];
-                    if next == 0 {
-                        // end of list
+                firsts.push((row_idx, *index));
+            }
+        }
+        for (row_idx, index) in firsts {
+            // Get the hash and find it in the index
+            let mut i = index - 1;
+            loop {
+                let match_row_idx = if let Some(offset) = deleted_offset {
+                    // This arguments means that we prune the next index way before here.
+                    if i < offset as u64 {
+                        // End of the list due to pruning
                         break;
                     }
-                    i = next - 1;
+                    i - offset as u64
+                } else {
+                    i
+                };
+                match_indices.push(match_row_idx);
+                input_indices.push(row_idx as u32);
+                // Follow the chain to get the next index value
+                let next = next_chain[match_row_idx as usize];
+                if next == 0 {
+                    // end of list
+                    break;
                 }
+                i = next - 1;
             }
         }
 
@@ -322,24 +328,29 @@ pub trait JoinHashMapType {
                 initial_idx + 1
             }
         };
+        let mut firsts = Vec::with_capacity(hash_values[to_skip..].len());
+        let mut row_idx: usize = to_skip;
 
-        let mut row_idx = to_skip;
         for hash_value in &hash_values[to_skip..] {
             if let Some((_, index)) =
                 hash_map.get(*hash_value, |(hash, _)| *hash_value == *hash)
             {
-                chain_traverse!(
-                    input_indices,
-                    match_indices,
-                    hash_values,
-                    next_chain,
-                    row_idx,
-                    index,
-                    deleted_offset,
-                    remaining_output
-                );
+                firsts.push((row_idx, index))
             }
             row_idx += 1;
+        }
+
+        for (row_idx, index) in firsts {
+            chain_traverse!(
+                input_indices,
+                match_indices,
+                hash_values,
+                next_chain,
+                row_idx,
+                index,
+                deleted_offset,
+                remaining_output
+            );
         }
 
         (input_indices, match_indices, None)
