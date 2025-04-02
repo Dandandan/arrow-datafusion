@@ -772,7 +772,13 @@ impl ExternalSorter {
                 .map(|expr| expr.evaluate_to_sort_column(&batch))
                 .collect::<Result<Vec<_>>>()?;
 
-            let sorted = if is_multi_column_with_lists(&sort_columns) {
+            let multi_column = sort_columns.len() > 1;
+            // Use row based whenever
+            // 1. there are multiple columns and no limit
+            // 2. there are multiple columns and at least one of them is a list column
+            let sorted = if multi_column && fetch.is_none()
+                || multi_column && is_any_list_column(&sort_columns)
+            {
                 // lex_sort_to_indices doesn't support List with more than one column
                 // https://github.com/apache/arrow-rs/issues/5454
                 sort_batch_row_based(&batch, &expressions, row_converter, fetch)?
@@ -879,13 +885,7 @@ pub fn sort_batch(
         .map(|expr| expr.evaluate_to_sort_column(batch))
         .collect::<Result<Vec<_>>>()?;
 
-    let indices = if is_multi_column_with_lists(&sort_columns) {
-        // lex_sort_to_indices doesn't support List with more than one column
-        // https://github.com/apache/arrow-rs/issues/5454
-        lexsort_to_indices_multi_columns(sort_columns, fetch)?
-    } else {
-        lexsort_to_indices(&sort_columns, fetch)?
-    };
+    let indices = lexsort_to_indices(&sort_columns, fetch)?;
 
     let mut columns = take_arrays(batch.columns(), &indices, None)?;
 
@@ -906,7 +906,7 @@ pub fn sort_batch(
 }
 
 #[inline]
-fn is_multi_column_with_lists(sort_columns: &[SortColumn]) -> bool {
+fn is_any_list_column(sort_columns: &[SortColumn]) -> bool {
     sort_columns.iter().any(|c| {
         matches!(
             c.values.data_type(),
@@ -914,41 +914,6 @@ fn is_multi_column_with_lists(sort_columns: &[SortColumn]) -> bool {
         )
     })
 }
-
-pub(crate) fn lexsort_to_indices_multi_columns(
-    sort_columns: Vec<SortColumn>,
-    limit: Option<usize>,
-) -> Result<UInt32Array> {
-    let (fields, columns) = sort_columns.into_iter().fold(
-        (vec![], vec![]),
-        |(mut fields, mut columns), sort_column| {
-            fields.push(SortField::new_with_options(
-                sort_column.values.data_type().clone(),
-                sort_column.options.unwrap_or_default(),
-            ));
-            columns.push(sort_column.values);
-            (fields, columns)
-        },
-    );
-
-    // Note: row converter is reused through `sort_batch_row_based()`, this function
-    // is not used during normal sort execution, but it's kept temporarily because
-    // it's inside a public interface `sort_batch()`.
-    let converter = RowConverter::new(fields)?;
-    let rows = converter.convert_columns(&columns)?;
-    let mut sort: Vec<_> = rows.iter().enumerate().collect();
-    sort.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
-
-    let mut len = rows.num_rows();
-    if let Some(limit) = limit {
-        len = limit.min(len);
-    }
-    let indices =
-        UInt32Array::from_iter_values(sort.iter().take(len).map(|(i, _)| *i as u32));
-
-    Ok(indices)
-}
-
 /// Sort execution plan.
 ///
 /// Support sorting datasets that are larger than the memory allotted
