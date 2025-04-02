@@ -60,7 +60,7 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr_common::sort_expr::LexRequirement;
 
-use futures::{StreamExt, TryStreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use log::{debug, trace};
 
 struct ExternalSorterMetrics {
@@ -205,8 +205,11 @@ struct ExternalSorter {
     schema: SchemaRef,
     /// Sort expressions
     expr: Arc<[PhysicalSortExpr]>,
-    /// RowConverter corresponding to the sort expressions
-    sort_keys_row_converter: Arc<RowConverter>,
+
+    /// Rowconverter corresponding to the sort expressions
+    row_converter: Arc<RowConverter>,
+    /// Scratch space for row converter
+    scratch_rows: Rows,
     /// If Some, the maximum number of output rows that will be produced
     fetch: Option<usize>,
     /// The target number of rows for output batches
@@ -289,9 +292,10 @@ impl ExternalSorter {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let converter = RowConverter::new(sort_fields).map_err(|e| {
+        let row_converter = RowConverter::new(sort_fields).map_err(|e| {
             exec_datafusion_err!("Failed to create RowConverter: {:?}", e)
         })?;
+        let rows = row_converter.empty_rows(batch_size, batch_size * 20);
 
         let spill_manager = SpillManager::new(
             Arc::clone(&runtime),
@@ -305,7 +309,8 @@ impl ExternalSorter {
             in_progress_spill_file: None,
             finished_spill_files: vec![],
             expr: expr.into(),
-            sort_keys_row_converter: Arc::new(converter),
+            row_converter: Arc::new(row_converter),
+            scratch_rows: rows,
             metrics,
             fetch,
             reservation,
@@ -709,16 +714,16 @@ impl ExternalSorter {
             return self.sort_batch_stream(batch, metrics, reservation);
         }
 
-        // If less than sort_in_place_threshold_bytes, concatenate and sort in place
-        if self.reservation.size() < self.sort_in_place_threshold_bytes {
-            // Concatenate memory batches together and sort
-            let batch = concat_batches(&self.schema, &self.in_mem_batches)?;
-            self.in_mem_batches.clear();
-            self.reservation
-                .try_resize(get_reserved_byte_for_record_batch(&batch))?;
-            let reservation = self.reservation.take();
-            return self.sort_batch_stream(batch, metrics, reservation);
-        }
+        // // If less than sort_in_place_threshold_bytes, concatenate and sort in place
+        // if self.reservation.size() < self.sort_in_place_threshold_bytes {
+        //     // Concatenate memory batches together and sort
+        //     let batch = concat_batches(&self.schema, &self.in_mem_batches)?;
+        //     self.in_mem_batches.clear();
+        //     self.reservation
+        //         .try_resize(get_reserved_byte_for_record_batch(&batch))?;
+        //     let reservation = self.reservation.take();
+        //     return self.sort_batch_stream(batch, metrics, reservation);
+        // }
 
         let streams = std::mem::take(&mut self.in_mem_batches)
             .into_iter()
@@ -750,7 +755,7 @@ impl ExternalSorter {
     /// `reservation` accounts for the memory used by this batch and
     /// is released when the sort is complete
     fn sort_batch_stream(
-        &self,
+        &mut self,
         batch: RecordBatch,
         metrics: BaselineMetrics,
         reservation: MemoryReservation,
@@ -761,38 +766,44 @@ impl ExternalSorter {
         );
         let schema = batch.schema();
 
+        let _timer = metrics.elapsed_compute().timer();
         let fetch = self.fetch;
         let expressions: LexOrdering = self.expr.iter().cloned().collect();
-        let row_converter = Arc::clone(&self.sort_keys_row_converter);
-        let stream = futures::stream::once(async move {
-            let _timer = metrics.elapsed_compute().timer();
+        let row_converter = self.row_converter.clone();
 
-            let sort_columns = expressions
-                .iter()
-                .map(|expr| expr.evaluate_to_sort_column(&batch))
-                .collect::<Result<Vec<_>>>()?;
+        let sort_columns = expressions
+            .iter()
+            .map(|expr| expr.evaluate_to_sort_column(&batch))
+            .collect::<Result<Vec<_>>>()?;
 
-            let multi_column = sort_columns.len() > 1;
-            // Use row based whenever
-            // 1. there are multiple columns and no limit
-            // 2. there are multiple columns and at least one of them is a list column
-            let sorted = if multi_column && fetch.is_none()
-                || multi_column && is_any_list_column(&sort_columns)
-            {
-                // lex_sort_to_indices doesn't support List with more than one column
-                // https://github.com/apache/arrow-rs/issues/5454
-                sort_batch_row_based(&batch, &expressions, row_converter, fetch)?
-            } else {
-                sort_batch(&batch, &expressions, fetch)?
-            };
+        let multi_column = sort_columns.len() > 1;
+        // Use row based whenever
+        // 1. there are multiple columns and no limit
+        // 2. there are multiple columns and at least one of them is a list column
+        let sorted = if multi_column && self.fetch.is_none()
+            || multi_column && is_any_list_column(&sort_columns)
+        {
+            // lex_sort_to_indices doesn't support List with more than one column
+            // https://github.com/apache/arrow-rs/issues/5454
+            sort_batch_row_based(
+                &batch,
+                &expressions,
+                &row_converter,
+                &mut self.scratch_rows,
+                fetch,
+            )?
+        } else {
+            sort_batch(&batch, &expressions, fetch)?
+        };
 
-            metrics.record_output(sorted.num_rows());
-            drop(batch);
-            drop(reservation);
-            Ok(sorted)
-        });
+        metrics.record_output(sorted.num_rows());
+        drop(batch);
+        drop(reservation);
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(sorted)]),
+        )))
     }
 
     /// If this sort may spill, pre-allocates
@@ -838,7 +849,7 @@ impl Debug for ExternalSorter {
 
 /// Converts rows into a sorted array of indices based on their order.
 /// This function returns the indices that represent the sorted order of the rows.
-fn rows_to_indices(rows: Rows, limit: Option<usize>) -> Result<UInt32Array> {
+fn rows_to_indices(rows: &mut Rows, limit: Option<usize>) -> Result<UInt32Array> {
     let mut sort: Vec<_> = rows.iter().enumerate().collect();
     sort.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
 
@@ -855,14 +866,16 @@ fn rows_to_indices(rows: Rows, limit: Option<usize>) -> Result<UInt32Array> {
 fn sort_batch_row_based(
     batch: &RecordBatch,
     expressions: &LexOrdering,
-    row_converter: Arc<RowConverter>,
+    row_converter: &RowConverter,
+    rows: &mut Rows,
     fetch: Option<usize>,
 ) -> Result<RecordBatch> {
     let sort_columns = expressions
         .iter()
         .map(|expr| expr.evaluate_to_sort_column(batch).map(|col| col.values))
         .collect::<Result<Vec<_>>>()?;
-    let rows = row_converter.convert_columns(&sort_columns)?;
+    rows.clear();
+    let _ = row_converter.append(rows, &sort_columns);
     let indices = rows_to_indices(rows, fetch)?;
     let columns = take_arrays(batch.columns(), &indices, None)?;
 
@@ -1193,7 +1206,7 @@ impl ExecutionPlan for SortExec {
                 )?;
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     self.schema(),
-                    futures::stream::once(async move {
+                    stream::once(async move {
                         while let Some(batch) = input.next().await {
                             let batch = batch?;
                             topk.insert_batch(batch)?;
@@ -1217,7 +1230,7 @@ impl ExecutionPlan for SortExec {
                 )?;
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     self.schema(),
-                    futures::stream::once(async move {
+                    stream::once(async move {
                         while let Some(batch) = input.next().await {
                             let batch = batch?;
                             sorter.insert_batch(batch).await?;
