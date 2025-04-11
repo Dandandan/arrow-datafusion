@@ -682,17 +682,15 @@ impl ExternalSorter {
             return self.sort_batch_stream(batch, metrics, reservation);
         }
 
-        let streams = std::mem::take(&mut self.in_mem_batches)
-            .into_iter()
-            .map(|batch| {
-                let metrics = self.metrics.baseline.intermediate();
-                let reservation = self
-                    .reservation
-                    .split(get_reserved_byte_for_record_batch(&batch));
-                let input = self.sort_batch_stream(batch, metrics, reservation)?;
-                Ok(input)
-            })
-            .collect::<Result<_>>()?;
+        let mut streams = vec![];
+        while let Some(batch) = self.in_mem_batches.pop() {
+            let metrics = self.metrics.baseline.intermediate();
+            let reservation = self
+                .reservation
+                .split(get_reserved_byte_for_record_batch(&batch));
+            let input = self.sort_batch_stream(batch, metrics, reservation)?;
+            streams.push(input)
+        }
 
         let expressions: LexOrdering = self.expr.iter().cloned().collect();
 
