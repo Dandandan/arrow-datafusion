@@ -24,7 +24,6 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use crate::common::spawn_buffered;
 use crate::execution_plan::{Boundedness, CardinalityEffect, EmissionType};
 use crate::expressions::PhysicalSortExpr;
 use crate::limit::LimitStream;
@@ -691,7 +690,7 @@ impl ExternalSorter {
                     .reservation
                     .split(get_reserved_byte_for_record_batch(&batch));
                 let input = self.sort_batch_stream(batch, metrics, reservation)?;
-                Ok(spawn_buffered(input, 1))
+                Ok(input)
             })
             .collect::<Result<_>>()?;
 
@@ -725,30 +724,27 @@ impl ExternalSorter {
         let schema = batch.schema();
 
         let expressions: LexOrdering = self.expr.iter().cloned().collect();
-        let row_converter = Arc::clone(&self.sort_keys_row_converter);
-        let stream = futures::stream::once(async move {
-            let _timer = metrics.elapsed_compute().timer();
+        let _timer = metrics.elapsed_compute().timer();
 
-            let sort_columns = expressions
-                .iter()
-                .map(|expr| expr.evaluate_to_sort_column(&batch))
-                .collect::<Result<Vec<_>>>()?;
+        let sort_columns = expressions
+            .iter()
+            .map(|expr| expr.evaluate_to_sort_column(&batch))
+            .collect::<Result<Vec<_>>>()?;
 
-            let sorted = if is_multi_column_with_lists(&sort_columns) {
-                // lex_sort_to_indices doesn't support List with more than one column
-                // https://github.com/apache/arrow-rs/issues/5454
-                sort_batch_row_based(&batch, &expressions, row_converter, None)?
-            } else {
-                sort_batch(&batch, &expressions, None)?
-            };
+        let sorted = if is_multi_column_with_lists(&sort_columns) {
+            // lex_sort_to_indices doesn't support List with more than one column
+            // https://github.com/apache/arrow-rs/issues/5454
+            let row_converter = self.sort_keys_row_converter.clone();
+            sort_batch_row_based(&batch, &expressions, row_converter, None)?
+        } else {
+            sort_batch(&batch, &expressions, None)?
+        };
 
-            metrics.record_output(sorted.num_rows());
-            drop(batch);
-            drop(reservation);
-            Ok(sorted)
-        });
+        metrics.record_output(sorted.num_rows());
+        drop(batch);
+        drop(reservation);
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, futures::stream::iter(vec![Ok(sorted)]))))
     }
 
     /// If this sort may spill, pre-allocates
