@@ -95,6 +95,7 @@ enum BatchPartitionerState {
     RoundRobin {
         num_partitions: usize,
         next_idx: usize,
+        senders: Vec<DistributionSender<MaybeBatch>>,
     },
 }
 
@@ -108,6 +109,7 @@ impl BatchPartitioner {
                 BatchPartitionerState::RoundRobin {
                     num_partitions,
                     next_idx: 0,
+                    senders: Vec::new(),
                 }
             }
             Partitioning::Hash(exprs, num_partitions) => BatchPartitionerState::Hash {
@@ -156,9 +158,29 @@ impl BatchPartitioner {
                 BatchPartitionerState::RoundRobin {
                     num_partitions,
                     next_idx,
+                    senders,
                 } => {
-                    let idx = *next_idx;
-                    *next_idx = (*next_idx + 1) % *num_partitions;
+                    let idx = if senders.is_empty() {
+                        // Fallback to old logic if senders are not populated
+                        let current_idx = *next_idx;
+                        *next_idx = (*next_idx + 1) % *num_partitions;
+                        current_idx
+                    } else {
+                        let mut min_depth = usize::MAX;
+                        let mut selected_idx = 0;
+                        // Start search from next_idx for fairness, iterate over all partitions
+                        for i in 0..*num_partitions {
+                            let current_partition_idx = (*next_idx + i) % *num_partitions;
+                            let depth = senders[current_partition_idx].queue_depth();
+                            if depth < min_depth {
+                                min_depth = depth;
+                                selected_idx = current_partition_idx;
+                            }
+                        }
+                        // Update next_idx for the next call, for tie-breaking primarily
+                        *next_idx = (selected_idx + 1) % *num_partitions;
+                        selected_idx
+                    };
                     Box::new(std::iter::once(Ok((idx, batch))))
                 }
                 BatchPartitionerState::Hash {
@@ -230,6 +252,149 @@ impl BatchPartitioner {
             BatchPartitionerState::RoundRobin { num_partitions, .. } => num_partitions,
             BatchPartitionerState::Hash { num_partitions, .. } => num_partitions,
         }
+    }
+
+    pub fn set_round_robin_senders(&mut self, senders: Vec<DistributionSender<MaybeBatch>>) {
+        if let BatchPartitionerState::RoundRobin { senders: existing_senders, .. } = &mut self.state {
+            *existing_senders = senders;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_round_robin_load_balancing() -> Result<()> {
+        let schema = test_schema();
+        let num_output_partitions = 2;
+        let num_input_batches = 100; // Sufficiently large to observe balancing
+
+        // 1. Setup Input Data and Exec
+        // Single input partition with num_input_batches
+        let input_data_vec = create_vec_batches(num_input_batches);
+        let input_exec = Arc::new(MemoryExec::try_new(
+            &[input_data_vec],
+            schema.clone(),
+            None,
+        )?);
+
+        // 2. Setup RepartitionExec with RoundRobinBatch
+        let partitioning = Partitioning::RoundRobinBatch(num_output_partitions);
+        let repartition_exec =
+            Arc::new(RepartitionExec::try_new(input_exec, partitioning)?);
+        let task_ctx = Arc::new(TaskContext::default());
+
+        // 3. Execute and get Output Streams
+        let mut stream0 = repartition_exec.execute(0, task_ctx.clone())?;
+        let mut stream1 = repartition_exec.execute(1, task_ctx.clone())?;
+
+        let mut batches_for_stream0 = 0;
+        let mut batches_for_stream1 = 0;
+
+        let mut stream0_done = false;
+        let mut stream1_done = false;
+
+        // Loop until all expected batches are consumed
+        while (batches_for_stream0 + batches_for_stream1) < num_input_batches {
+            let mut stream1_actually_polled_batch_this_iteration = false;
+            if !stream1_done {
+                match stream1.next().await {
+                    Some(Ok(_batch)) => {
+                        batches_for_stream1 += 1;
+                        stream1_actually_polled_batch_this_iteration = true;
+                    }
+                    Some(Err(e)) => return Err(e.into()),
+                    None => {
+                        stream1_done = true;
+                    }
+                }
+            }
+
+            let mut stream0_actually_polled_batch_this_iteration = false;
+            if !stream0_done {
+                // Poll stream0 (slow consumer) only if:
+                // 1. Stream1 (fast consumer) is already done (stream0 needs to catch up).
+                // 2. Stream1 (fast consumer) successfully polled a batch in this iteration (stream0 gets a turn).
+                if stream1_done || stream1_actually_polled_batch_this_iteration {
+                    match stream0.next().await {
+                        Some(Ok(_batch)) => {
+                            batches_for_stream0 += 1;
+                            stream0_actually_polled_batch_this_iteration = true;
+                        }
+                        Some(Err(e)) => return Err(e.into()),
+                        None => {
+                            stream0_done = true;
+                        }
+                    }
+                }
+            }
+
+            // Termination / Error conditions:
+            if stream0_done && stream1_done {
+                // Both streams are done.
+                if (batches_for_stream0 + batches_for_stream1) < num_input_batches {
+                    // This is an unexpected state: streams are done, but not all batches were consumed.
+                    log::warn!(
+                        "Both streams reported done, but total batches consumed ({}) is less than expected ({}). Stream0: {}, Stream1: {}.",
+                        batches_for_stream0 + batches_for_stream1, num_input_batches, batches_for_stream0, batches_for_stream1
+                    );
+                }
+                // Exit loop as no more batches can be consumed.
+                break;
+            }
+            
+            // If neither stream made progress in this iteration, AND neither stream is marked as done yet,
+            // it could indicate that both are pending.
+            // A yield_now() can be useful here if we suspect the test scheduler needs a chance
+            // to run other tasks (like the producer tasks within RepartitionExec).
+            // However, since .next().await is used, the streams themselves should yield if pending.
+            // This explicit yield is a fallback for safety against unexpected tight loops in the test.
+            if !stream1_actually_polled_batch_this_iteration && !stream0_actually_polled_batch_this_iteration && !stream0_done && !stream1_done {
+                // Before yielding, quickly check if they are really pending to avoid unnecessary yields.
+                // This is an optimization to the yield.
+                let s0_poll = futures::poll!(stream0.next());
+                let s1_poll = futures::poll!(stream1.next());
+
+                if s0_poll.is_pending() && s1_poll.is_pending() {
+                    // log::trace!("Both streams pending, yielding. s0_batches: {}, s1_batches: {}", batches_for_stream0, batches_for_stream1);
+                    tokio::task::yield_now().await;
+                } else {
+                    // If one of them is not pending (e.g. Ready(None) but not yet processed by the main loop logic for done status)
+                    // or Ready(Some(Ok(_))), the main loop will catch it in the next iteration.
+                    // No explicit yield needed if one of them is ready.
+                }
+            }
+        }
+
+        // 4. Assertions
+        println!(
+            "Batches for Stream 0 (slow consumer): {}",
+            batches_for_stream0
+        );
+        println!(
+            "Batches for Stream 1 (fast consumer): {}",
+            batches_for_stream1
+        );
+
+        assert_eq!(
+            batches_for_stream0 + batches_for_stream1,
+            num_input_batches,
+            "All input batches should be consumed by the output streams."
+        );
+
+        // Key assertion: The "fast" consumer (stream1) should have received more batches.
+        assert!(
+            batches_for_stream1 > batches_for_stream0,
+            "Stream 1 (fast consumer) should have processed more batches than Stream 0 (slow consumer). \
+            Actual: Stream0={}, Stream1={}", batches_for_stream0, batches_for_stream1
+        );
+
+        // Also assert that the fast consumer got more than its "fair share" if distribution was even.
+        // This provides a stronger guarantee that balancing occurred.
+        assert!(
+            batches_for_stream1 > num_input_batches / num_output_partitions,
+            "Stream 1 (fast consumer) should have processed more than an even split ({}). Actual: {}",
+            num_input_batches / num_output_partitions, batches_for_stream1
+        );
+
+        Ok(())
     }
 }
 
@@ -681,7 +846,33 @@ impl RepartitionExec {
         context: Arc<TaskContext>,
     ) -> Result<()> {
         let mut partitioner =
-            BatchPartitioner::try_new(partitioning, metrics.repartition_time.clone())?;
+            BatchPartitioner::try_new(partitioning.clone(), metrics.repartition_time.clone())?;
+
+        // ---- BEGIN NEW CODE ----
+        if let Partitioning::RoundRobinBatch(_) = &partitioning {
+            let num_output_partitions = partitioner.num_partitions();
+            let mut collected_senders = Vec::with_capacity(num_output_partitions);
+            let mut all_senders_collected = true;
+            for i in 0..num_output_partitions {
+                if let Some((sender, _reservation)) = output_channels.get(&i) {
+                    collected_senders.push(sender.clone());
+                } else {
+                    // This partition's sender is not in output_channels, perhaps due to early exit (e.g. LIMIT).
+                    // We cannot proceed with dynamic round robin if any sender is missing.
+                    all_senders_collected = false;
+                    break;
+                }
+            }
+
+            if all_senders_collected && collected_senders.len() == num_output_partitions {
+                 partitioner.set_round_robin_senders(collected_senders);
+            } else if !all_senders_collected {
+                 log::warn!("Could not collect all senders for dynamic round robin due to missing entries in output_channels. Expected {}. Falling back to simple round robin.", num_output_partitions);
+            }
+            // The case where all_senders_collected is true but len is mismatched should not happen if logic is correct.
+            // If it does, it implies a more fundamental issue. The current warning covers the expected missing sender scenario.
+        }
+        // ---- END NEW CODE ----
 
         // execute the child operator
         let timer = metrics.fetch_time.timer();

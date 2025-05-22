@@ -139,6 +139,12 @@ impl<T> DistributionSender<T> {
             element: Box::new(Some(element)),
         }
     }
+
+    /// Returns the number of items currently buffered in the channel.
+    pub fn queue_depth(&self) -> usize {
+        let guard = self.channel.lock();
+        guard.data.len()
+    }
 }
 
 impl<T> Clone for DistributionSender<T> {
