@@ -792,11 +792,66 @@ pub(crate) fn need_produce_result_in_final(join_type: JoinType) -> bool {
 }
 
 pub(crate) fn get_final_indices_from_shared_bitmap(
-    shared_bitmap: &SharedBitmapBuilder,
+    shared_bitmaps: &[SharedBitmapBuilder], // Changed
     join_type: JoinType,
-) -> (UInt64Array, UInt32Array) {
-    let bitmap = shared_bitmap.lock();
-    get_final_indices_from_bit_map(&bitmap, join_type)
+) -> ((UInt32Array, UInt32Array), UInt32Array) { // Changed return type
+    let mut final_build_batch_ids_builder = UInt32Builder::new();
+    let mut final_build_row_ids_in_batch_builder = UInt32Builder::new();
+    let mut total_left_indices_count = 0;
+
+    for (batch_id, shared_bitmap_for_batch) in shared_bitmaps.iter().enumerate() {
+        let bitmap_buffer = shared_bitmap_for_batch.lock();
+        let num_rows_in_batch = bitmap_buffer.len();
+
+        if join_type == JoinType::LeftMark {
+            for row_id in 0..num_rows_in_batch {
+                final_build_batch_ids_builder.append_value(batch_id as u32);
+                final_build_row_ids_in_batch_builder.append_value(row_id as u32);
+                // probe_indices for LeftMark are handled differently, see below
+            }
+            total_left_indices_count += num_rows_in_batch;
+        } else if join_type == JoinType::LeftSemi {
+            for row_id in 0..num_rows_in_batch {
+                if bitmap_buffer.get_bit(row_id) {
+                    final_build_batch_ids_builder.append_value(batch_id as u32);
+                    final_build_row_ids_in_batch_builder.append_value(row_id as u32);
+                    total_left_indices_count += 1;
+                }
+            }
+        } else { // Left, LeftAnti, Full
+            for row_id in 0..num_rows_in_batch {
+                if !bitmap_buffer.get_bit(row_id) {
+                    final_build_batch_ids_builder.append_value(batch_id as u32);
+                    final_build_row_ids_in_batch_builder.append_value(row_id as u32);
+                    total_left_indices_count += 1;
+                }
+            }
+        }
+    }
+
+    let final_build_batch_ids = final_build_batch_ids_builder.finish();
+    let final_build_row_ids_in_batch = final_build_row_ids_in_batch_builder.finish();
+
+    // Create probe_indices (right_indices)
+    // For LeftMark, it's based on the bitmap itself. For others, it's all nulls.
+    let final_probe_indices = if join_type == JoinType::LeftMark {
+        let mut builder = UInt32Builder::with_capacity(total_left_indices_count);
+        for (batch_id, shared_bitmap_for_batch) in shared_bitmaps.iter().enumerate() {
+            let bitmap_buffer = shared_bitmap_for_batch.lock();
+            let num_rows_in_batch = bitmap_buffer.len();
+            for row_id in 0..num_rows_in_batch {
+                 // We are iterating all rows for LeftMark, so batch_id and row_id are implicitly part of the output
+                builder.append_option(bitmap_buffer.get_bit(row_id).then_some(0));
+            }
+        }
+        builder.finish()
+    } else {
+        let mut builder = UInt32Builder::with_capacity(total_left_indices_count);
+        builder.append_nulls(total_left_indices_count);
+        builder.finish()
+    };
+
+    ((final_build_batch_ids, final_build_row_ids_in_batch), final_probe_indices)
 }
 
 /// In the end of join execution, need to use bit map of the matched
@@ -808,6 +863,7 @@ pub(crate) fn get_final_indices_from_shared_bitmap(
 /// 2. join_type: `Left`
 ///
 /// The result is: `([1,4], [null, null])`
+#[deprecated = "Use get_final_indices_from_shared_bitmap with Vec<SharedBitmapBuilder> instead"]
 pub(crate) fn get_final_indices_from_bit_map(
     left_bit_map: &BooleanBufferBuilder,
     join_type: JoinType,
@@ -840,22 +896,25 @@ pub(crate) fn get_final_indices_from_bit_map(
 }
 
 pub(crate) fn apply_join_filter_to_indices(
-    build_input_buffer: &RecordBatch,
+    build_input_batches: &[RecordBatch], // Changed: Was build_input_buffer: &RecordBatch
     probe_batch: &RecordBatch,
-    build_indices: UInt64Array,
+    build_indices_tuple: (UInt32Array, UInt32Array), // Changed: Was build_indices: UInt64Array
     probe_indices: UInt32Array,
     filter: &JoinFilter,
     build_side: JoinSide,
-) -> Result<(UInt64Array, UInt32Array)> {
-    if build_indices.is_empty() && probe_indices.is_empty() {
-        return Ok((build_indices, probe_indices));
+) -> Result<((UInt32Array, UInt32Array), UInt32Array)> { // Changed return type
+    let (build_batch_ids, build_row_ids_in_batch) = build_indices_tuple;
+
+    if build_batch_ids.is_empty() && probe_indices.is_empty() {
+        return Ok(((build_batch_ids, build_row_ids_in_batch), probe_indices));
     };
 
     let intermediate_batch = build_batch_from_indices(
         filter.schema(),
-        build_input_buffer,
+        build_input_batches, // Pass Vec<RecordBatch>
         probe_batch,
-        &build_indices,
+        &build_batch_ids, // Pass unpacked IDs
+        &build_row_ids_in_batch, // Pass unpacked IDs
         &probe_indices,
         filter.column_indices(),
         build_side,
@@ -866,11 +925,13 @@ pub(crate) fn apply_join_filter_to_indices(
         .into_array(intermediate_batch.num_rows())?;
     let mask = as_boolean_array(&filter_result)?;
 
-    let left_filtered = compute::filter(&build_indices, mask)?;
-    let right_filtered = compute::filter(&probe_indices, mask)?;
+    let filtered_build_batch_ids = downcast_array(compute::filter(&build_batch_ids, mask)?.as_ref());
+    let filtered_build_row_ids_in_batch = downcast_array(compute::filter(&build_row_ids_in_batch, mask)?.as_ref());
+    let filtered_probe_indices = downcast_array(compute::filter(&probe_indices, mask)?.as_ref());
+
     Ok((
-        downcast_array(left_filtered.as_ref()),
-        downcast_array(right_filtered.as_ref()),
+        (filtered_build_batch_ids, filtered_build_row_ids_in_batch),
+        filtered_probe_indices,
     ))
 }
 
@@ -878,17 +939,51 @@ pub(crate) fn apply_join_filter_to_indices(
 /// The resulting batch has [Schema] `schema`.
 pub(crate) fn build_batch_from_indices(
     schema: &Schema,
-    build_input_buffer: &RecordBatch,
+    build_input_batches: &[RecordBatch], // Changed
     probe_batch: &RecordBatch,
-    build_indices: &UInt64Array,
+    build_batch_ids: &UInt32Array, // Changed
+    build_row_ids_in_batch: &UInt32Array, // Changed
     probe_indices: &UInt32Array,
     column_indices: &[ColumnIndex],
     build_side: JoinSide,
 ) -> Result<RecordBatch> {
+    let num_output_rows = build_batch_ids.len(); // Or probe_indices.len(), they should match for joined columns
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new()
             .with_match_field_names(true)
-            .with_row_count(Some(build_indices.len()));
+            .with_row_count(Some(num_output_rows));
+
+        return Ok(RecordBatch::try_new_with_options(
+            Arc::new(schema.clone()),
+            vec![],
+            &options,
+        )?);
+    }
+
+    // build the columns of the new [RecordBatch]:
+    // 1. pick whether the column is from the left or right
+    // 2. based on the pick, `take` items from the different RecordBatches
+    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
+
+use arrow::array::FixedSizeListBuilder;
+
+/// Returns a new [RecordBatch] by combining the `left` and `right` according to `indices`.
+/// The resulting batch has [Schema] `schema`.
+pub(crate) fn build_batch_from_indices(
+    schema: &Schema,
+    build_input_batches: &[RecordBatch], // Changed
+    probe_batch: &RecordBatch,
+    build_batch_ids: &UInt32Array, // Changed
+    build_row_ids_in_batch: &UInt32Array, // Changed
+    probe_indices: &UInt32Array,
+    column_indices: &[ColumnIndex],
+    build_side: JoinSide,
+) -> Result<RecordBatch> {
+    let num_output_rows = build_batch_ids.len(); // Or probe_indices.len(), they should match for joined columns
+    if schema.fields().is_empty() {
+        let options = RecordBatchOptions::new()
+            .with_match_field_names(true)
+            .with_row_count(Some(num_output_rows));
 
         return Ok(RecordBatch::try_new_with_options(
             Arc::new(schema.clone()),
@@ -907,21 +1002,45 @@ pub(crate) fn build_batch_from_indices(
             // LeftMark join, the mark column is a true if the indices is not null, otherwise it will be false
             Arc::new(compute::is_not_null(probe_indices)?)
         } else if column_index.side == build_side {
-            let array = build_input_buffer.column(column_index.index);
-            if array.is_empty() || build_indices.null_count() == build_indices.len() {
-                // Outer join would generate a null index when finding no match at our side.
-                // Therefore, it's possible we are empty but need to populate an n-length null array,
-                // where n is the length of the index array.
-                assert_eq!(build_indices.null_count(), build_indices.len());
-                new_null_array(array.data_type(), build_indices.len())
-            } else {
-                compute::take(array.as_ref(), build_indices, None)?
+            // Data comes from the build side
+            if build_input_batches.is_empty() || num_output_rows == 0 {
+                 new_null_array(schema.field(columns.len()).data_type(), num_output_rows)
+            } else if build_batch_ids.null_count() == num_output_rows {
+                // All build indices are null (e.g. right join unmatched rows)
+                new_null_array(build_input_batches[0].schema().field(column_index.index).data_type(), num_output_rows)
+            }
+            else {
+                let arrays_for_interleave: Vec<ArrayRef> = build_input_batches
+                    .iter()
+                    .map(|batch| batch.column(column_index.index))
+                    .collect();
+
+                let arrays_for_interleave_refs: Vec<&dyn Array> = arrays_for_interleave
+                    .iter()
+                    .map(|arr| arr.as_ref())
+                    .collect();
+
+                let mut list_builder = FixedSizeListBuilder::new(UInt32Builder::new(), 2);
+                for i in 0..num_output_rows {
+                    if build_batch_ids.is_null(i) || build_row_ids_in_batch.is_null(i) {
+                        list_builder.append_null();
+                    } else {
+                        let batch_id = build_batch_ids.value(i);
+                        let row_id = build_row_ids_in_batch.value(i);
+                        list_builder.values().append_value(batch_id);
+                        list_builder.values().append_value(row_id);
+                        list_builder.append(true);
+                    }
+                }
+                let interleave_indices_array = list_builder.finish();
+                compute::interleave(&arrays_for_interleave_refs, &interleave_indices_array)?
             }
         } else {
+            // Data comes from the probe side
             let array = probe_batch.column(column_index.index);
-            if array.is_empty() || probe_indices.null_count() == probe_indices.len() {
-                assert_eq!(probe_indices.null_count(), probe_indices.len());
-                new_null_array(array.data_type(), probe_indices.len())
+            if array.is_empty() || probe_indices.null_count() == num_output_rows {
+                 // Ensure consistent length for probe side null arrays if all probe indices are null
+                new_null_array(array.data_type(), num_output_rows)
             } else {
                 compute::take(array.as_ref(), probe_indices, None)?
             }

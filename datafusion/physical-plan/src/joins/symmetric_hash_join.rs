@@ -34,7 +34,9 @@ use std::vec;
 
 use crate::common::SharedMemoryReservation;
 use crate::execution_plan::{boundedness_from_children, emission_type_from_children};
-use crate::joins::hash_join::{equal_rows_arr, update_hash};
+// Corrected path for equal_rows_arr
+use crate::joins::hash_join::equal_rows_arr as common_equal_rows_arr;
+use crate::joins::hash_join::update_hash;
 use crate::joins::stream_join_utils::{
     calculate_filter_expr_intervals, combine_two_batches,
     convert_sort_expr_with_filter_schema, get_pruning_anti_indices,
@@ -59,11 +61,11 @@ use crate::{
 };
 
 use arrow::array::{
-    ArrowPrimitiveType, NativeAdapter, PrimitiveArray, PrimitiveBuilder, UInt32Array,
+    ArrayRef, ArrowPrimitiveType, NativeAdapter, PrimitiveArray, PrimitiveBuilder, UInt32Array,
     UInt64Array,
 };
 use arrow::compute::concat_batches;
-use arrow::datatypes::{ArrowNativeType, Schema, SchemaRef};
+use arrow::datatypes::{ArrowNativeType, Schema, SchemaRef, UInt32Type, UInt64Type};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::utils::bisect;
@@ -883,23 +885,34 @@ pub(crate) fn build_side_determined_results(
         && need_to_produce_result_in_final(build_hash_joiner.build_side, join_type)
     {
         // Calculate the indices for build and probe sides based on join type and build side:
-        let (build_indices, probe_indices) = calculate_indices_by_join_type(
-            build_hash_joiner.build_side,
-            prune_length,
-            &build_hash_joiner.visited_rows,
-            build_hash_joiner.deleted_offset,
-            join_type,
-        )?;
+        // calculate_indices_by_join_type returns direct row IDs for the single buffer
+        let (build_indices_u64, probe_indices_u32): (UInt64Array, UInt32Array) =
+            calculate_indices_by_join_type::<UInt64Type, UInt32Type>(
+                build_hash_joiner.build_side,
+                prune_length,
+                &build_hash_joiner.visited_rows,
+                build_hash_joiner.deleted_offset,
+                join_type,
+            )?;
+
+        // For SymmetricHashJoin, batch_id is always 0 for its input_buffer
+        let build_batch_ids_zeros =
+            UInt32Array::from_value(0u32, build_indices_u64.len());
+        // build_indices_u64 are direct row IDs for the single buffer, convert to u32
+        let build_row_ids_u32 = UInt32Array::from_iter_values(
+            build_indices_u64.values().iter().map(|&v| v as u32),
+        );
 
         // Create an empty probe record batch:
         let empty_probe_batch = RecordBatch::new_empty(probe_schema);
         // Build the final result from the indices of build and probe sides:
-        build_batch_from_indices(
+        crate::joins::utils::build_batch_from_indices(
             output_schema.as_ref(),
-            &build_hash_joiner.input_buffer,
+            &[build_hash_joiner.input_buffer.clone()], // Pass as slice
             &empty_probe_batch,
-            &build_indices,
-            &probe_indices,
+            &build_batch_ids_zeros,
+            &build_row_ids_u32,
+            &probe_indices_u32,
             column_indices,
             build_hash_joiner.build_side,
         )
@@ -944,45 +957,50 @@ pub(crate) fn join_with_probe_batch(
     if build_hash_joiner.input_buffer.num_rows() == 0 || probe_batch.num_rows() == 0 {
         return Ok(None);
     }
-    let (build_indices, probe_indices) = lookup_join_hashmap(
-        &build_hash_joiner.hashmap,
-        &build_hash_joiner.input_buffer,
-        probe_batch,
-        &build_hash_joiner.on,
-        &probe_hash_joiner.on,
-        random_state,
-        null_equals_null,
-        &mut build_hash_joiner.hashes_buffer,
-        Some(build_hash_joiner.deleted_offset),
-    )?;
-
-    let (build_indices, probe_indices) = if let Some(filter) = filter {
-        apply_join_filter_to_indices(
+    // ((build_batch_ids, build_row_ids_in_batch), probe_indices)
+    let ((build_batch_ids, build_row_ids_in_batch), probe_indices) =
+        lookup_join_hashmap(
+            &build_hash_joiner.hashmap,
             &build_hash_joiner.input_buffer,
             probe_batch,
-            build_indices,
-            probe_indices,
-            filter,
-            build_hash_joiner.build_side,
-        )?
-    } else {
-        (build_indices, probe_indices)
-    };
+            &build_hash_joiner.on,
+            &probe_hash_joiner.on,
+            random_state,
+            null_equals_null,
+            &mut build_hash_joiner.hashes_buffer,
+            Some(build_hash_joiner.deleted_offset),
+        )?;
+
+    let ((final_build_batch_ids, final_build_row_ids_in_batch), final_probe_indices) =
+        if let Some(filter) = filter {
+            apply_join_filter_to_indices(
+                &[build_hash_joiner.input_buffer.clone()], // Pass as slice
+                probe_batch,
+                (build_batch_ids, build_row_ids_in_batch), // Pass tuple
+                probe_indices,
+                filter,
+                build_hash_joiner.build_side,
+            )?
+        } else {
+            ((build_batch_ids, build_row_ids_in_batch), probe_indices)
+        };
 
     if need_to_produce_result_in_final(build_hash_joiner.build_side, join_type) {
+        // For SymmetricHashJoin, batch_id is 0, so build_row_ids_in_batch are direct indices
         record_visited_indices(
             &mut build_hash_joiner.visited_rows,
-            build_hash_joiner.deleted_offset,
-            &build_indices,
+            build_hash_joiner.deleted_offset, // This offset is for the conceptual full buffer if parts were deleted
+            &final_build_row_ids_in_batch, // These are effectively row indices in the current input_buffer
         );
     }
     if need_to_produce_result_in_final(build_hash_joiner.build_side.negate(), join_type) {
         record_visited_indices(
             &mut probe_hash_joiner.visited_rows,
-            probe_hash_joiner.offset,
-            &probe_indices,
+            probe_hash_joiner.offset, // This is the current offset *into the probe stream*
+            &final_probe_indices,
         );
     }
+
     if matches!(
         join_type,
         JoinType::LeftAnti
@@ -993,12 +1011,13 @@ pub(crate) fn join_with_probe_batch(
     ) {
         Ok(None)
     } else {
-        build_batch_from_indices(
+        crate::joins::utils::build_batch_from_indices(
             schema,
-            &build_hash_joiner.input_buffer,
+            &[build_hash_joiner.input_buffer.clone()], // Pass as slice
             probe_batch,
-            &build_indices,
-            &probe_indices,
+            &final_build_batch_ids,
+            &final_build_row_ids_in_batch,
+            &final_probe_indices,
             column_indices,
             build_hash_joiner.build_side,
         )
@@ -1012,7 +1031,7 @@ pub(crate) fn join_with_probe_batch(
 /// # Arguments
 ///
 /// * `build_hashmap` - hashmap collected from build side data.
-/// * `build_batch` - Build side record batch.
+/// * `build_batch` - Build side record batch (single, as it's from OneSideHashJoiner.input_buffer).
 /// * `probe_batch` - Probe side record batch.
 /// * `build_on` - An array of columns on which the join will be performed. The columns are from the build side of the join.
 /// * `probe_on` - An array of columns on which the join will be performed. The columns are from the probe side of the join.
@@ -1023,12 +1042,12 @@ pub(crate) fn join_with_probe_batch(
 ///
 /// # Returns
 ///
-/// A [Result] containing a tuple with two equal length arrays, representing indices of rows from build and probe side,
-/// matched by join key columns.
+/// A [Result] containing a tuple with ((build_batch_ids, build_row_ids_in_batch), probe_indices),
+/// representing indices of rows from build and probe side, matched by join key columns.
 #[allow(clippy::too_many_arguments)]
 fn lookup_join_hashmap(
     build_hashmap: &PruningJoinHashMap,
-    build_batch: &RecordBatch,
+    build_batch: &RecordBatch, // Single RecordBatch for build side
     probe_batch: &RecordBatch,
     build_on: &[PhysicalExprRef],
     probe_on: &[PhysicalExprRef],
@@ -1036,12 +1055,13 @@ fn lookup_join_hashmap(
     null_equals_null: bool,
     hashes_buffer: &mut Vec<u64>,
     deleted_offset: Option<usize>,
-) -> Result<(UInt64Array, UInt32Array)> {
+) -> Result<((UInt32Array, UInt32Array), UInt32Array)> {
     let keys_values = probe_on
         .iter()
         .map(|c| c.evaluate(probe_batch)?.into_array(probe_batch.num_rows()))
         .collect::<Result<Vec<_>>>()?;
-    let build_join_values = build_on
+    // build_join_values are Vec<ArrayRef> for the single build_batch
+    let build_join_values: Vec<ArrayRef> = build_on
         .iter()
         .map(|c| c.evaluate(build_batch)?.into_array(build_batch.num_rows()))
         .collect::<Result<Vec<_>>>()?;
@@ -1050,55 +1070,42 @@ fn lookup_join_hashmap(
     hashes_buffer.resize(probe_batch.num_rows(), 0);
     let hash_values = create_hashes(&keys_values, random_state, hashes_buffer)?;
 
-    // As SymmetricHashJoin uses LIFO JoinHashMap, the chained list algorithm
-    // will return build indices for each probe row in a reverse order as such:
-    // Build Indices: [5, 4, 3]
-    // Probe Indices: [1, 1, 1]
-    //
-    // This affects the output sequence. Hypothetically, it's possible to preserve the lexicographic order on the build side.
-    // Let's consider probe rows [0,1] as an example:
-    //
-    // When the probe iteration sequence is reversed, the following pairings can be derived:
-    //
-    // For probe row 1:
-    //     (5, 1)
-    //     (4, 1)
-    //     (3, 1)
-    //
-    // For probe row 0:
-    //     (5, 0)
-    //     (4, 0)
-    //     (3, 0)
-    //
-    // After reversing both sets of indices, we obtain reversed indices:
-    //
-    //     (3,0)
-    //     (4,0)
-    //     (5,0)
-    //     (3,1)
-    //     (4,1)
-    //     (5,1)
-    //
-    // With this approach, the lexicographic order on both the probe side and the build side is preserved.
-    let (mut matched_probe, mut matched_build) = build_hashmap
+    let (mut matched_probe_indices_vec, mut packed_build_indices_vec) = build_hashmap
         .get_matched_indices(hash_values.iter().enumerate().rev(), deleted_offset);
 
-    matched_probe.reverse();
-    matched_build.reverse();
+    matched_probe_indices_vec.reverse();
+    packed_build_indices_vec.reverse();
 
-    let build_indices: UInt64Array = matched_build.into();
-    let probe_indices: UInt32Array = matched_probe.into();
+    let packed_build_indices_arr: UInt64Array = packed_build_indices_vec.into();
+    let probe_indices_arr: UInt32Array = matched_probe_indices_vec.into();
 
-    let (build_indices, probe_indices) = equal_rows_arr(
-        &build_indices,
-        &probe_indices,
-        &build_join_values,
-        &keys_values,
-        null_equals_null,
-    )?;
+    // Unpack build_indices. For SymmetricHashJoin, batch_id is always 0.
+    let build_batch_ids_array =
+        UInt32Array::from_value(0u32, packed_build_indices_arr.len());
+    let build_row_ids_array = UInt32Array::from_iter_values(
+        packed_build_indices_arr
+            .values()
+            .iter()
+            .map(|&v| (v & 0xFFFFFFFF) as u32),
+    );
 
-    Ok((build_indices, probe_indices))
+    // Use common_equal_rows_arr (imported from hash_join.rs)
+    let ((filtered_build_batch_ids, filtered_build_row_ids_in_batch), filtered_probe_indices) =
+        common_equal_rows_arr(
+            &build_batch_ids_array,
+            &build_row_ids_array,
+            &probe_indices_arr,
+            &[build_join_values], // Wrap Vec<ArrayRef> in a slice to make &[Vec<ArrayRef>]
+            &keys_values, // This is already Vec<ArrayRef>
+            null_equals_null,
+        )?;
+
+    Ok((
+        (filtered_build_batch_ids, filtered_build_row_ids_in_batch),
+        filtered_probe_indices,
+    ))
 }
+
 
 pub struct OneSideHashJoiner {
     /// Build side
@@ -1171,15 +1178,17 @@ impl OneSideHashJoiner {
         self.hashes_buffer.resize(batch.num_rows(), 0);
         // Get allocation_info before adding the item
         // Update the hashmap with the join key values and hashes of the incoming batch:
+        // For OneSideHashJoiner, batch_id is always 0 as it manages a single conceptual buffer (input_buffer).
+        // The `update_hash` function expects a batch_id.
         update_hash(
             &self.on,
             batch,
+            0, // batch_id is 0 for OneSideHashJoiner's context
             &mut self.hashmap,
-            self.offset,
             random_state,
             &mut self.hashes_buffer,
-            self.deleted_offset,
-            false,
+            self.deleted_offset, // This is the offset *within the hashmap values* if rows were deleted
+            false, // fifo_hashmap = false for SymmetricHashJoin
         )?;
         Ok(())
     }

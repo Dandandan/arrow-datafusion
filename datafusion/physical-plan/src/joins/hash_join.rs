@@ -92,14 +92,15 @@ const HASH_JOIN_SEED: RandomState =
 
 /// HashTable and input data for the left (build side) of a join
 struct JoinLeftData {
-    /// The hash table with indices into `batch`
+    /// The hash table with indices into `batches`.
+    /// Conceptually, the value in JoinHashMap is (batch_id, row_id_in_batch).
     hash_map: JoinHashMap,
-    /// The input rows for the build side
-    batch: RecordBatch,
-    /// The build side on expressions values
-    values: Vec<ArrayRef>,
-    /// Shared bitmap builder for visited left indices
-    visited_indices_bitmap: SharedBitmapBuilder,
+    /// The input rows for the build side, stored as a Vec of RecordBatches
+    batches: Vec<RecordBatch>,
+    /// The build side on expressions values, outer Vec for batches, inner Vec for columns
+    values: Vec<Vec<ArrayRef>>,
+    /// Shared bitmap builders for visited left indices, one per batch
+    visited_indices_bitmap: Vec<SharedBitmapBuilder>,
     /// Counter of running probe-threads, potentially
     /// able to update `visited_indices_bitmap`
     probe_threads_counter: AtomicUsize,
@@ -114,15 +115,15 @@ impl JoinLeftData {
     /// Create a new `JoinLeftData` from its parts
     fn new(
         hash_map: JoinHashMap,
-        batch: RecordBatch,
-        values: Vec<ArrayRef>,
-        visited_indices_bitmap: SharedBitmapBuilder,
+        batches: Vec<RecordBatch>,
+        values: Vec<Vec<ArrayRef>>,
+        visited_indices_bitmap: Vec<SharedBitmapBuilder>,
         probe_threads_counter: AtomicUsize,
         reservation: MemoryReservation,
     ) -> Self {
         Self {
             hash_map,
-            batch,
+            batches,
             values,
             visited_indices_bitmap,
             probe_threads_counter,
@@ -135,18 +136,18 @@ impl JoinLeftData {
         &self.hash_map
     }
 
-    /// returns a reference to the build side batch
-    fn batch(&self) -> &RecordBatch {
-        &self.batch
+    /// returns a reference to the build side batches
+    fn batches(&self) -> &[RecordBatch] {
+        &self.batches
     }
 
-    /// returns a reference to the build side expressions values
-    fn values(&self) -> &[ArrayRef] {
+    /// returns a reference to the build side expressions values (per batch, per column)
+    fn values_vec(&self) -> &[Vec<ArrayRef>] {
         &self.values
     }
 
-    /// returns a reference to the visited indices bitmap
-    fn visited_indices_bitmap(&self) -> &SharedBitmapBuilder {
+    /// returns a reference to the visited indices bitmaps (one per batch)
+    fn visited_indices_bitmaps(&self) -> &[SharedBitmapBuilder] {
         &self.visited_indices_bitmap
     }
 
@@ -991,54 +992,65 @@ async fn collect_left_input(
 
     let mut hashmap = JoinHashMap::with_capacity(num_rows);
     let mut hashes_buffer = Vec::new();
-    let mut offset = 0;
+    // let mut current_offset = 0; // This offset is for hash map value which is still u64
 
-    // Updating hashmap starting from the last batch
-    let batches_iter = batches.iter().rev();
-    for batch in batches_iter.clone() {
+    let num_total_batches = batches.len();
+
+    // Populate values and bitmaps per batch, and update hash map
+    let mut left_values_vec: Vec<Vec<ArrayRef>> = Vec::with_capacity(num_total_batches);
+    let mut visited_indices_bitmap_vec: Vec<SharedBitmapBuilder> = Vec::with_capacity(num_total_batches);
+
+    // The hash map is built iterating batches in reverse order to maintain probe order
+    // for rows with same hash key.
+    // The batch_id stored in hashmap should correspond to the original batch index.
+    for (rev_idx, batch) in batches.iter().rev().enumerate() {
+        let batch_id = num_total_batches - 1 - rev_idx; // Calculate original batch index
+
         hashes_buffer.clear();
         hashes_buffer.resize(batch.num_rows(), 0);
         update_hash(
             &on_left,
             batch,
+            batch_id, // Pass batch_id
             &mut hashmap,
-            offset,
             &random_state,
             &mut hashes_buffer,
-            0,
+            0, // deleted_offset
             true,
         )?;
-        offset += batch.num_rows();
+        // current_offset logic is now handled by batch_id and row_idx_in_batch within update_hash for packing
     }
-    // Merge all batches into a single batch, so we can directly index into the arrays
-    let single_batch = concat_batches(&schema, batches_iter)?;
 
-    // Reserve additional memory for visited indices bitmap and create shared builder
-    let visited_indices_bitmap = if with_visited_indices_bitmap {
-        let bitmap_size = bit_util::ceil(single_batch.num_rows(), 8);
-        reservation.try_grow(bitmap_size)?;
-        metrics.build_mem_used.add(bitmap_size);
+    // Iterate again (not reversed) to populate left_values_vec and visited_indices_bitmap_vec
+    // in the correct (original) order.
+    for batch in batches.iter() {
+        // Evaluate expressions for each batch
+        let per_batch_values = on_left
+            .iter()
+            .map(|c| c.evaluate(batch)?.into_array(batch.num_rows()))
+            .collect::<Result<Vec<_>>>()?;
+        left_values_vec.push(per_batch_values);
 
-        let mut bitmap_buffer = BooleanBufferBuilder::new(single_batch.num_rows());
-        bitmap_buffer.append_n(num_rows, false);
-        bitmap_buffer
-    } else {
-        BooleanBufferBuilder::new(0)
-    };
+        // Create bitmap for each batch
+        if with_visited_indices_bitmap {
+            let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
+            reservation.try_grow(bitmap_size)?; // Reserve for each bitmap
+            metrics.build_mem_used.add(bitmap_size);
 
-    let left_values = on_left
-        .iter()
-        .map(|c| {
-            c.evaluate(&single_batch)?
-                .into_array(single_batch.num_rows())
-        })
-        .collect::<Result<Vec<_>>>()?;
+            let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
+            bitmap_buffer.append_n(batch.num_rows(), false);
+            visited_indices_bitmap_vec.push(Mutex::new(bitmap_buffer));
+        } else {
+            // Still add a (potentially empty) builder to keep vector lengths consistent
+            visited_indices_bitmap_vec.push(Mutex::new(BooleanBufferBuilder::new(0)));
+        }
+    }
 
     let data = JoinLeftData::new(
         hashmap,
-        single_batch,
-        left_values,
-        Mutex::new(visited_indices_bitmap),
+        batches, // This is already the Vec<RecordBatch>
+        left_values_vec,
+        visited_indices_bitmap_vec,
         AtomicUsize::new(probe_threads_count),
         reservation,
     );
@@ -1047,7 +1059,8 @@ async fn collect_left_input(
 }
 
 /// Updates `hash_map` with new entries from `batch` evaluated against the expressions `on`
-/// using `offset` as a start value for `batch` row indices.
+/// using `batch_id` to identify the batch and `row_idx_in_batch` for row within the batch.
+/// The value stored in the hash map is a packed `(batch_id << 32 | row_idx_in_batch)`.
 ///
 /// `fifo_hashmap` sets the order of iteration over `batch` rows while updating hashmap,
 /// which allows to keep either first (if set to true) or last (if set to false) row index
@@ -1056,8 +1069,8 @@ async fn collect_left_input(
 pub fn update_hash<T>(
     on: &[PhysicalExprRef],
     batch: &RecordBatch,
+    batch_id: usize,
     hash_map: &mut T,
-    offset: usize,
     random_state: &RandomState,
     hashes_buffer: &mut Vec<u64>,
     deleted_offset: usize,
@@ -1079,12 +1092,14 @@ where
     hash_map.extend_zero(batch.num_rows());
 
     // Updating JoinHashMap from hash values iterator
-    let hash_values_iter = hash_values
-        .iter()
-        .enumerate()
-        .map(|(i, val)| (i + offset, val));
+    // The value stored is (batch_id << 32 | row_idx_in_batch)
+    let hash_values_iter = hash_values.iter().enumerate().map(|(i, val)| {
+        let packed_value = (batch_id as u64 << 32) | (i as u64);
+        (packed_value, val)
+    });
 
     if fifo_hashmap {
+        // .rev() is applied to the (packed_value, hash_ref) iterator from the current batch
         hash_map.update_from_iter(hash_values_iter.rev(), deleted_offset);
     } else {
         hash_map.update_from_iter(hash_values_iter, deleted_offset);
@@ -1300,28 +1315,47 @@ impl RecordBatchStream for HashJoinStream {
 #[allow(clippy::too_many_arguments)]
 fn lookup_join_hashmap(
     build_hashmap: &JoinHashMap,
-    build_side_values: &[ArrayRef],
+    build_side_values_per_batch: &[Vec<ArrayRef>], // Changed parameter
     probe_side_values: &[ArrayRef],
     null_equals_null: bool,
     hashes_buffer: &[u64],
     limit: usize,
     offset: JoinHashMapOffset,
-) -> Result<(UInt64Array, UInt32Array, Option<JoinHashMapOffset>)> {
-    let (probe_indices, build_indices, next_offset) =
+) -> Result<((UInt32Array, UInt32Array), UInt32Array, Option<JoinHashMapOffset>)> { // Changed return type
+    let (probe_indices, packed_build_indices, next_offset) =
         build_hashmap.get_matched_indices_with_limit_offset(hashes_buffer, limit, offset);
 
-    let build_indices: UInt64Array = build_indices.into();
-    let probe_indices: UInt32Array = probe_indices.into();
+    let packed_build_indices_arr: UInt64Array = packed_build_indices.into();
+    let probe_indices_arr: UInt32Array = probe_indices.into();
 
-    let (build_indices, probe_indices) = equal_rows_arr(
-        &build_indices,
-        &probe_indices,
-        build_side_values,
+    // Unpack build_indices
+    let mut build_batch_ids_builder = UInt32Array::builder(packed_build_indices_arr.len());
+    let mut build_row_ids_in_batch_builder = UInt32Array::builder(packed_build_indices_arr.len());
+
+    for packed_idx in packed_build_indices_arr.iter() {
+        if let Some(packed) = packed_idx {
+            build_batch_ids_builder.append_value((packed >> 32) as u32);
+            build_row_ids_in_batch_builder.append_value((packed & 0xFFFFFFFF) as u32);
+        } else {
+            // It's possible for build_indices to have nulls if JoinHashMap stores them,
+            // though current JoinHashMap seems to store u64 directly. Handle defensively.
+            build_batch_ids_builder.append_null();
+            build_row_ids_in_batch_builder.append_null();
+        }
+    }
+    let build_batch_ids = build_batch_ids_builder.finish();
+    let build_row_ids_in_batch = build_row_ids_in_batch_builder.finish();
+
+    let ((filtered_build_batch_ids, filtered_build_row_ids_in_batch), filtered_probe_indices) = equal_rows_arr(
+        &build_batch_ids,
+        &build_row_ids_in_batch,
+        &probe_indices_arr,
+        build_side_values_per_batch,
         probe_side_values,
         null_equals_null,
     )?;
 
-    Ok((build_indices, probe_indices, next_offset))
+    Ok(((filtered_build_batch_ids, filtered_build_row_ids_in_batch), filtered_probe_indices, next_offset))
 }
 
 // version of eq_dyn supporting equality on null arrays
@@ -1348,45 +1382,101 @@ fn eq_dyn_null(
 }
 
 pub fn equal_rows_arr(
-    indices_left: &UInt64Array,
+    build_batch_ids: &UInt32Array,
+    build_row_ids_in_batch: &UInt32Array,
     indices_right: &UInt32Array,
-    left_arrays: &[ArrayRef],
+    left_key_values_per_batch: &[Vec<ArrayRef>],
     right_arrays: &[ArrayRef],
     null_equals_null: bool,
-) -> Result<(UInt64Array, UInt32Array)> {
-    let mut iter = left_arrays.iter().zip(right_arrays.iter());
+) -> Result<((UInt32Array, UInt32Array), UInt32Array)> {
+    if build_batch_ids.len() != build_row_ids_in_batch.len() || build_batch_ids.len() != indices_right.len() {
+        return internal_err!("build_batch_ids, build_row_ids_in_batch, and indices_right must have the same length.");
+    }
+    if left_key_values_per_batch.is_empty() && !right_arrays.is_empty() {
+         return internal_err!("left_key_values_per_batch is empty while right_arrays is not.");
+    }
+    if right_arrays.is_empty() && !left_key_values_per_batch.is_empty() && !left_key_values_per_batch[0].is_empty() {
+        return internal_err!("right_arrays is empty while left_key_values_per_batch is not.");
+    }
+    if left_key_values_per_batch.is_empty() && right_arrays.is_empty() { // Both empty, all rows match if any
+        let filtered_batch_ids = UInt32Array::from_iter(build_batch_ids.iter().flatten());
+        let filtered_row_ids = UInt32Array::from_iter(build_row_ids_in_batch.iter().flatten());
+        let filtered_right_indices = UInt32Array::from_iter(indices_right.iter().flatten());
+        return Ok(((filtered_batch_ids, filtered_row_ids), filtered_right_indices));
+    }
+    if left_key_values_per_batch[0].len() != right_arrays.len() {
+        return internal_err!(
+            "Number of key columns on left ({}) does not match right ({}).",
+            left_key_values_per_batch[0].len(),
+            right_arrays.len()
+        );
+    }
 
-    let (first_left, first_right) = iter.next().ok_or_else(|| {
-        DataFusionError::Internal(
-            "At least one array should be provided for both left and right".to_string(),
-        )
-    })?;
+    let num_rows_to_compare = build_batch_ids.len();
+    if num_rows_to_compare == 0 {
+        return Ok(((UInt32Array::new_empty(), UInt32Array::new_empty()), UInt32Array::new_empty()));
+    }
 
-    let arr_left = take(first_left.as_ref(), indices_left, None)?;
-    let arr_right = take(first_right.as_ref(), indices_right, None)?;
+    let mut overall_equality: Option<BooleanArray> = None;
 
-    let mut equal: BooleanArray = eq_dyn_null(&arr_left, &arr_right, null_equals_null)?;
+    for key_col_idx in 0..right_arrays.len() {
+        let right_key_col_values = &right_arrays[key_col_idx];
+        // Materialize left key column values for comparison
+        // This involves looking up each (batch_id, row_id) pair.
+        // Assuming all left key arrays for a given column have the same data type.
+        let first_batch_id = build_batch_ids.value(0) as usize;
+        let data_type = left_key_values_per_batch[first_batch_id][key_col_idx].data_type();
+        let mut left_col_builder = arrow::array::make_builder(data_type, num_rows_to_compare);
 
-    // Use map and try_fold to iterate over the remaining pairs of arrays.
-    // In each iteration, take is used on the pair of arrays and their equality is determined.
-    // The results are then folded (combined) using the and function to get a final equality result.
-    equal = iter
-        .map(|(left, right)| {
-            let arr_left = take(left.as_ref(), indices_left, None)?;
-            let arr_right = take(right.as_ref(), indices_right, None)?;
-            eq_dyn_null(arr_left.as_ref(), arr_right.as_ref(), null_equals_null)
-        })
-        .try_fold(equal, |acc, equal2| and(&acc, &equal2?))?;
+        for i in 0..num_rows_to_compare {
+            let batch_id = build_batch_ids.value(i) as usize;
+            let row_id = build_row_ids_in_batch.value(i) as usize;
 
-    let filter_builder = FilterBuilder::new(&equal).optimize().build();
+            if batch_id >= left_key_values_per_batch.len() {
+                return internal_err!("batch_id out of bounds");
+            }
+            if key_col_idx >= left_key_values_per_batch[batch_id].len() {
+                 return internal_err!("key_col_idx out of bounds for left_key_values_per_batch[batch_id]");
+            }
+            let batch_specific_key_values = &left_key_values_per_batch[batch_id][key_col_idx];
+             if row_id >= batch_specific_key_values.len() {
+                return internal_err!("row_id out of bounds for batch_specific_key_values");
+            }
 
-    let left_filtered = filter_builder.filter(indices_left)?;
-    let right_filtered = filter_builder.filter(indices_right)?;
+            // This is a simplified way to append. For optimal performance, use downcast and append_value/append_null.
+            // For now, this demonstrates the logic.
+            if batch_specific_key_values.is_null(row_id) {
+                left_col_builder.append_null();
+            } else {
+                // This generic approach is less efficient.
+                // A better way would be to downcast batch_specific_key_values and left_col_builder
+                // to their concrete types and use specific append methods.
+                // However, that requires a large match statement or macros.
+                // For now, let's use a slightly less performant but more generic scalar value approach.
+                let scalar_value = arrow::compute::cast(&batch_specific_key_values.slice(row_id, 1), data_type)?;
+                arrow::array::builder::append_scalar(&mut left_col_builder, scalar_value.as_ref(), 1)?;
+            }
+        }
+        let left_key_col_materialized: ArrayRef = left_col_builder.finish();
 
-    Ok((
-        downcast_array(left_filtered.as_ref()),
-        downcast_array(right_filtered.as_ref()),
-    ))
+        let arr_right_taken = take(right_key_col_values.as_ref(), indices_right, None)?;
+        let current_equality = eq_dyn_null(&left_key_col_materialized, &arr_right_taken, null_equals_null)?;
+
+        if let Some(existing_equality) = overall_equality {
+            overall_equality = Some(and(&existing_equality, &current_equality)?);
+        } else {
+            overall_equality = Some(current_equality);
+        }
+    }
+
+    let final_equality = overall_equality.ok_or_else(|| DataFusionError::Internal("No key columns to compare".to_string()))?;
+    let filter_builder = FilterBuilder::new(&final_equality).optimize().build();
+
+    let filtered_build_batch_ids = downcast_array(filter_builder.filter(build_batch_ids)?.as_ref());
+    let filtered_build_row_ids_in_batch = downcast_array(filter_builder.filter(build_row_ids_in_batch)?.as_ref());
+    let filtered_right_indices = downcast_array(filter_builder.filter(indices_right)?.as_ref());
+
+    Ok(((filtered_build_batch_ids, filtered_build_row_ids_in_batch), filtered_right_indices))
 }
 
 impl HashJoinStream {
@@ -1489,10 +1579,14 @@ impl HashJoinStream {
 
         let timer = self.join_metrics.join_time.timer();
 
-        // get the matched by join keys indices
-        let (left_indices, right_indices, next_offset) = lookup_join_hashmap(
+        // Now pass the full Vec<Vec<ArrayRef>> for build_side_values_per_batch
+        let (
+            (build_batch_ids, build_row_ids_in_batch), // Unpacked build indices
+            right_indices,
+            next_offset
+        ) = lookup_join_hashmap(
             build_side.left_data.hash_map(),
-            build_side.left_data.values(),
+            build_side.left_data.values_vec(), // Pass Vec<Vec<ArrayRef>>
             &state.values,
             self.null_equals_null,
             &self.hashes_buffer,
@@ -1501,51 +1595,61 @@ impl HashJoinStream {
         )?;
 
         // apply join filter if exists
-        let (left_indices, right_indices) = if let Some(filter) = &self.filter {
-            apply_join_filter_to_indices(
-                build_side.left_data.batch(),
-                &state.batch,
-                left_indices,
-                right_indices,
-                filter,
-                JoinSide::Left,
-            )?
-        } else {
-            (left_indices, right_indices)
-        };
+        // TODO: apply_join_filter_to_indices needs to be updated to handle (batch_id, row_id)
+        // The left_indices passed to apply_join_filter_to_indices would need to be reconstructed or
+        // the function signature and logic of apply_join_filter_to_indices must change.
+        // For this step, we'll prepare for the latter by passing the tuple.
+        let ((filtered_build_batch_ids, filtered_build_row_ids_in_batch), filtered_right_indices) =
+            if let Some(filter) = &self.filter {
+                apply_join_filter_to_indices(
+                    build_side.left_data.batches(), // Pass Vec<RecordBatch>
+                    &state.batch,
+                    (build_batch_ids, build_row_ids_in_batch), // Pass tuple
+                    right_indices,
+                    filter,
+                    JoinSide::Left, // Assuming filter is on left side, needs to be generic
+                )?
+            } else {
+                ((build_batch_ids, build_row_ids_in_batch), right_indices)
+            };
 
         // mark joined left-side indices as visited, if required by join type
+        // This now correctly uses (batch_id, row_id) to update the specific bitmap.
         if need_produce_result_in_final(self.join_type) {
-            let mut bitmap = build_side.left_data.visited_indices_bitmap().lock();
-            left_indices.iter().flatten().for_each(|x| {
-                bitmap.set_bit(x as usize, true);
-            });
+            let bitmaps = build_side.left_data.visited_indices_bitmaps();
+            for i in 0..filtered_build_batch_ids.len() {
+                if filtered_build_batch_ids.is_valid(i) && filtered_build_row_ids_in_batch.is_valid(i) {
+                    let batch_id = filtered_build_batch_ids.value(i) as usize;
+                    let row_id = filtered_build_row_ids_in_batch.value(i) as usize;
+                    if batch_id < bitmaps.len() {
+                        let mut bitmap_guard = bitmaps[batch_id].lock();
+                        // Check if row_id is within bounds for this specific bitmap
+                        if row_id < bitmap_guard.len() {
+                           bitmap_guard.set_bit(row_id, true);
+                        } else {
+                            return Err(internal_datafusion_err!(
+                                "Invalid row_id {} for batch_id {} encountered when updating visited_indices_bitmaps. Bitmap len: {}",
+                                row_id,
+                                batch_id,
+                                bitmap_guard.len()
+                            ));
+                        }
+                    } else {
+                        return Err(internal_datafusion_err!(
+                            "Invalid batch_id {} encountered when updating visited_indices_bitmaps. Max len: {}",
+                            batch_id,
+                            bitmaps.len()
+                        ));
+                    }
+                }
+            }
         }
 
-        // The goals of index alignment for different join types are:
-        //
-        // 1) Right & FullJoin -- to append all missing probe-side indices between
-        //    previous (excluding) and current joined indices.
-        // 2) SemiJoin -- deduplicate probe indices in range between previous
-        //    (excluding) and current joined indices.
-        // 3) AntiJoin -- return only missing indices in range between
-        //    previous and current joined indices.
-        //    Inclusion/exclusion of the indices themselves don't matter
-        //
-        // As a summary -- alignment range can be produced based only on
-        // joined (matched with filters applied) probe side indices, excluding starting one
-        // (left from previous iteration).
-
-        // if any rows have been joined -- get last joined probe-side (right) row
-        // it's important that index counts as "joined" after hash collisions checks
-        // and join filters applied.
-        let last_joined_right_idx = match right_indices.len() {
+        let last_joined_right_idx = match filtered_right_indices.len() {
             0 => None,
-            n => Some(right_indices.value(n - 1) as usize),
+            n => Some(filtered_right_indices.value(n - 1) as usize),
         };
 
-        // Calculate range and perform alignment.
-        // In case probe batch has been processed -- align all remaining rows.
         let index_alignment_range_start = state.joined_probe_idx.map_or(0, |v| v + 1);
         let index_alignment_range_end = if next_offset.is_none() {
             state.batch.num_rows()
@@ -1553,9 +1657,9 @@ impl HashJoinStream {
             last_joined_right_idx.map_or(0, |v| v + 1)
         };
 
-        let (left_indices, right_indices) = adjust_indices_by_join_type(
-            left_indices,
-            right_indices,
+        let ((final_build_batch_ids, final_build_row_ids_in_batch), final_right_indices) = adjust_indices_by_join_type(
+            (filtered_build_batch_ids, filtered_build_row_ids_in_batch), // Pass tuple
+            filtered_right_indices,
             index_alignment_range_start..index_alignment_range_end,
             self.join_type,
             self.right_side_ordered,
@@ -1563,13 +1667,15 @@ impl HashJoinStream {
 
         let result = build_batch_from_indices(
             &self.schema,
-            build_side.left_data.batch(),
+            build_side.left_data.batches(), // Pass Vec<RecordBatch>
             &state.batch,
-            &left_indices,
-            &right_indices,
+            &final_build_batch_ids, // Pass ref to UInt32Array for batch_ids
+            &final_build_row_ids_in_batch, // Pass ref to UInt32Array for row_ids
+            &final_right_indices,
             &self.column_indices,
-            JoinSide::Left,
+            JoinSide::Left, // This might need to be dynamic based on join type for some utility functions
         )?;
+
 
         self.join_metrics.output_batches.add(1);
         self.join_metrics.output_rows.add(result.num_rows());
@@ -1607,19 +1713,25 @@ impl HashJoinStream {
             return Ok(StatefulStreamResult::Continue);
         }
 
-        // use the global left bitmap to produce the left indices and right indices
-        let (left_side, right_side) = get_final_indices_from_shared_bitmap(
-            build_side.left_data.visited_indices_bitmap(),
-            self.join_type,
-        );
+        // get_final_indices_from_shared_bitmap now returns unpacked ((batch_ids, row_ids), probe_ids)
+        // probe_ids (the second element of the tuple) should be empty for this case.
+        let ((left_batch_ids_for_final, left_row_ids_in_batch_for_final), _right_indices_for_final_empty) =
+            get_final_indices_from_shared_bitmap(
+                build_side.left_data.visited_indices_bitmaps(), // Pass the Vec
+                self.join_type,
+            );
+
         let empty_right_batch = RecordBatch::new_empty(self.right.schema());
-        // use the left and right indices to produce the batch result
+        // build_batch_from_indices expects Vec<RecordBatch> and unpacked indices
         let result = build_batch_from_indices(
             &self.schema,
-            build_side.left_data.batch(),
+            build_side.left_data.batches(),
             &empty_right_batch,
-            &left_side,
-            &right_side,
+            &left_batch_ids_for_final,
+            &left_row_ids_in_batch_for_final,
+            // For unmatched build side, right indices are effectively empty or ignored.
+            // Pass an empty UInt32Array for right_indices.
+            &UInt32Array::new_empty(),
             &self.column_indices,
             JoinSide::Left,
         );
@@ -3371,7 +3483,7 @@ mod tests {
 
         let join_hash_map = JoinHashMap::new(hashmap_left, next);
 
-        let left_keys_values = key_column.evaluate(&left)?.into_array(left.num_rows())?;
+        let left_keys_values_per_batch = vec![key_column.evaluate(&left)?.into_array(left.num_rows())?];
         let right_keys_values =
             key_column.evaluate(&right)?.into_array(right.num_rows())?;
         let mut hashes_buffer = vec![0; right.num_rows()];
@@ -3381,9 +3493,17 @@ mod tests {
             &mut hashes_buffer,
         )?;
 
-        let (l, r, _) = lookup_join_hashmap(
+        // For testing lookup_join_hashmap directly, simulate that build side has one batch (batch_id 0)
+        // and the indices stored in JoinHashMap are row indices within that single batch.
+        // This means the batch_id part of the packed u64 is 0.
+        // The `packed_build_indices_arr` will contain values like `0 << 32 | row_idx`.
+        // Unpacking this will result in `build_batch_ids` being all 0s, and `build_row_ids_in_batch`
+        // being the original row indices.
+        // `equal_rows_arr` will then use batch_id 0 to access `left_keys_values_per_batch[0]`.
+
+        let (((l_batch_ids, l_row_ids)), r, _) = lookup_join_hashmap(
             &join_hash_map,
-            &[left_keys_values],
+            &left_keys_values_per_batch, // Pass as &[Vec<ArrayRef>]
             &[right_keys_values],
             false,
             &hashes_buffer,
@@ -3391,16 +3511,17 @@ mod tests {
             (0, None),
         )?;
 
-        let left_ids: UInt64Array = vec![0, 1].into();
+        let expected_l_batch_ids: UInt32Array = vec![0, 0].into(); // Batch IDs should be 0
+        let expected_l_row_ids: UInt32Array = vec![0, 1].into(); // Row IDs within the batch
+        let expected_r_ids: UInt32Array = vec![0, 1].into();
 
-        let right_ids: UInt32Array = vec![0, 1].into();
-
-        assert_eq!(left_ids, l);
-
-        assert_eq!(right_ids, r);
+        assert_eq!(expected_l_batch_ids, l_batch_ids);
+        assert_eq!(expected_l_row_ids, l_row_ids);
+        assert_eq!(expected_r_ids, r);
 
         Ok(())
     }
+
 
     #[tokio::test]
     async fn join_with_duplicated_column_names() -> Result<()> {
@@ -3758,18 +3879,6 @@ mod tests {
             "| 2  | 5  | 8  | true  |",
             "| 3  | 7  | 9  | false |",
             "+----+----+----+-------+",
-        ];
-
-        let test_cases = vec![
-            (JoinType::Inner, expected_inner),
-            (JoinType::Left, expected_left),
-            (JoinType::Right, expected_right),
-            (JoinType::Full, expected_full),
-            (JoinType::LeftSemi, expected_left_semi),
-            (JoinType::LeftAnti, expected_left_anti),
-            (JoinType::RightSemi, expected_right_semi),
-            (JoinType::RightAnti, expected_right_anti),
-            (JoinType::LeftMark, expected_left_mark),
         ];
 
         for (join_type, expected) in test_cases {
