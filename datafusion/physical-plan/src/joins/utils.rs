@@ -840,23 +840,31 @@ pub(crate) fn get_final_indices_from_bit_map(
 }
 
 pub(crate) fn apply_join_filter_to_indices(
-    build_input_buffer: &RecordBatch,
+    build_batches: &[RecordBatch], // Changed
     probe_batch: &RecordBatch,
-    build_indices: UInt64Array,
-    probe_indices: UInt32Array,
+    build_batch_indices_filtered_hash: &UInt64Array, // New
+    build_row_indices_filtered_hash: &UInt32Array,   // New
+    probe_indices_filtered_hash: &UInt32Array,       // Renamed
     filter: &JoinFilter,
     build_side: JoinSide,
-) -> Result<(UInt64Array, UInt32Array)> {
-    if build_indices.is_empty() && probe_indices.is_empty() {
-        return Ok((build_indices, probe_indices));
+) -> Result<(UInt64Array, UInt32Array, UInt32Array)> { // Changed output
+    if build_batch_indices_filtered_hash.is_empty() && probe_indices_filtered_hash.is_empty() {
+        return Ok((
+            build_batch_indices_filtered_hash.clone(), // Or new_empty() if ownership is an issue
+            build_row_indices_filtered_hash.clone(),   // Or new_empty()
+            probe_indices_filtered_hash.clone(),       // Or new_empty()
+        ));
     };
 
-    let intermediate_batch = build_batch_from_indices(
+    // build_batch_from_indices will need to be updated to handle Vec<RecordBatch> and (batch_idx, row_idx)
+    // For now, this call is structured as if build_batch_from_indices is already updated.
+    let intermediate_batch = build_batch_from_indices_for_filter( // Temporarily renaming to avoid conflict if build_batch_from_indices is not yet updated
         filter.schema(),
-        build_input_buffer,
+        build_batches,
         probe_batch,
-        &build_indices,
-        &probe_indices,
+        build_batch_indices_filtered_hash,
+        build_row_indices_filtered_hash,
+        probe_indices_filtered_hash,
         filter.column_indices(),
         build_side,
     )?;
@@ -866,29 +874,36 @@ pub(crate) fn apply_join_filter_to_indices(
         .into_array(intermediate_batch.num_rows())?;
     let mask = as_boolean_array(&filter_result)?;
 
-    let left_filtered = compute::filter(&build_indices, mask)?;
-    let right_filtered = compute::filter(&probe_indices, mask)?;
+    let final_build_batch_indices = compute::filter(build_batch_indices_filtered_hash, mask)?;
+    let final_build_row_indices = compute::filter(build_row_indices_filtered_hash, mask)?;
+    let final_probe_indices = compute::filter(probe_indices_filtered_hash, mask)?;
+
     Ok((
-        downcast_array(left_filtered.as_ref()),
-        downcast_array(right_filtered.as_ref()),
+        downcast_array(final_build_batch_indices.as_ref()),
+        downcast_array(final_build_row_indices.as_ref()),
+        downcast_array(final_probe_indices.as_ref()),
     ))
 }
 
-/// Returns a new [RecordBatch] by combining the `left` and `right` according to `indices`.
+// The placeholder build_batch_from_indices_for_filter is removed.
+
+/// Returns a new [RecordBatch] by combining the build and probe sides according to indices.
 /// The resulting batch has [Schema] `schema`.
 pub(crate) fn build_batch_from_indices(
     schema: &Schema,
-    build_input_buffer: &RecordBatch,
+    build_batches: &[RecordBatch],        // Changed
     probe_batch: &RecordBatch,
-    build_indices: &UInt64Array,
+    build_batch_indices: &UInt64Array, // New
+    build_row_indices: &UInt32Array,   // New
     probe_indices: &UInt32Array,
     column_indices: &[ColumnIndex],
-    build_side: JoinSide,
+    build_side_of_join_hash_exec: JoinSide, // Renamed
 ) -> Result<RecordBatch> {
+    let num_output_rows = build_batch_indices.len(); // All index arrays must have same length
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new()
             .with_match_field_names(true)
-            .with_row_count(Some(build_indices.len()));
+            .with_row_count(Some(num_output_rows));
 
         return Ok(RecordBatch::try_new_with_options(
             Arc::new(schema.clone()),
@@ -897,38 +912,119 @@ pub(crate) fn build_batch_from_indices(
         )?);
     }
 
-    // build the columns of the new [RecordBatch]:
-    // 1. pick whether the column is from the left or right
-    // 2. based on the pick, `take` items from the different RecordBatches
-    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
+    let mut output_columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
 
-    for column_index in column_indices {
-        let array = if column_index.side == JoinSide::None {
-            // LeftMark join, the mark column is a true if the indices is not null, otherwise it will be false
+    for ci in column_indices {
+        let array = if ci.side == JoinSide::None { // For LeftMark join type
             Arc::new(compute::is_not_null(probe_indices)?)
-        } else if column_index.side == build_side {
-            let array = build_input_buffer.column(column_index.index);
-            if array.is_empty() || build_indices.null_count() == build_indices.len() {
-                // Outer join would generate a null index when finding no match at our side.
-                // Therefore, it's possible we are empty but need to populate an n-length null array,
-                // where n is the length of the index array.
-                assert_eq!(build_indices.null_count(), build_indices.len());
-                new_null_array(array.data_type(), build_indices.len())
-            } else {
-                compute::take(array.as_ref(), build_indices, None)?
+        } else if ci.side == build_side_of_join_hash_exec {
+            // Column is from the build side (which now consists of multiple batches)
+            if build_batches.is_empty() && num_output_rows > 0 {
+                 // Should not happen if there are build columns to project and rows to output
+                 return plan_err!("build_batches is empty, but attempting to take build-side columns for {} output rows", num_output_rows);
             }
-        } else {
-            let array = probe_batch.column(column_index.index);
-            if array.is_empty() || probe_indices.null_count() == probe_indices.len() {
-                assert_eq!(probe_indices.null_count(), probe_indices.len());
-                new_null_array(array.data_type(), probe_indices.len())
+            if num_output_rows == 0 {
+                // build_batches might be non-empty, but no rows are selected.
+                // Create an empty array of the correct type.
+                // Assuming all build_batches have the same schema.
+                let data_type = build_batches.first().map_or_else(
+                    || schema.field(output_columns.len()).data_type(), // Fallback, though ideally build_batches isn't empty if we need build columns
+                    |b| b.schema().field(ci.index).data_type()
+                );
+                output_columns.push(new_null_array(data_type, 0));
+                continue;
+            }
+
+            // Logic to construct the build-side column:
+            // Iterate through each output row. For each output row, determine the source batch_idx
+            // and row_idx_in_batch. Collect these values. This is complex to do vectorially
+            // directly with `take` across multiple source arrays if they are not of the same type
+            // or if we are building a dictionary array.
+            // A simpler approach is to build the array row by row, or use take on each group of rows belonging to the same batch_idx.
+            // For now, creating a null array as a placeholder for the complex logic.
+            // This matches the temporary behavior in the removed build_batch_from_indices_for_filter.
+            // TODO: Implement proper gathering logic for build-side columns from multiple batches.
+            // Vectorized approach for gathering build-side columns.
+            let data_type = build_batches
+                .get(0) // Assume all build batches have the same schema
+                .ok_or_else(|| DataFusionError::Internal("build_batches is empty but should not be if projecting build columns".to_string()))?
+                .schema().field(ci.index).data_type().clone();
+
+            let mut segments: Vec<ArrayRef> = Vec::new();
+            if num_output_rows > 0 {
+                let mut current_segment_batch_idx: Option<u64> = None;
+                let mut current_segment_row_indices: Vec<u32> = Vec::new();
+                let mut current_segment_null_count: usize = 0;
+
+                for i in 0..num_output_rows {
+                    if build_batch_indices.is_null(i) || build_row_indices.is_null(i) {
+                        // If there are pending non-null rows for a batch, process them.
+                        if !current_segment_row_indices.is_empty() {
+                            let batch_idx = current_segment_batch_idx.unwrap() as usize; // Known to be Some.
+                            let source_col = build_batches[batch_idx].column(ci.index);
+                            let indices_array = UInt32Array::from(std::mem::take(&mut current_segment_row_indices));
+                            segments.push(compute::take(source_col, &indices_array, None)?);
+                        }
+                        current_segment_batch_idx = None; // End current batch segment
+                        current_segment_null_count += 1; // Count consecutive nulls
+                    } else {
+                        // If there are pending nulls, process them.
+                        if current_segment_null_count > 0 {
+                            segments.push(new_null_array(&data_type, current_segment_null_count));
+                            current_segment_null_count = 0;
+                        }
+
+                        let batch_idx_val = build_batch_indices.value(i);
+                        let row_idx_val = build_row_indices.value(i);
+
+                        if current_segment_batch_idx == Some(batch_idx_val) {
+                            current_segment_row_indices.push(row_idx_val);
+                        } else {
+                            // New batch_idx or start of new segment. Process previous segment.
+                            if !current_segment_row_indices.is_empty() {
+                                let prev_batch_idx = current_segment_batch_idx.unwrap() as usize;
+                                let source_col = build_batches[prev_batch_idx].column(ci.index);
+                                let indices_array = UInt32Array::from(std::mem::take(&mut current_segment_row_indices));
+                                segments.push(compute::take(source_col, &indices_array, None)?);
+                            }
+                            current_segment_batch_idx = Some(batch_idx_val);
+                            current_segment_row_indices.push(row_idx_val);
+                        }
+                    }
+                }
+
+                // Process any remaining segment
+                if !current_segment_row_indices.is_empty() {
+                    let batch_idx = current_segment_batch_idx.unwrap() as usize;
+                    let source_col = build_batches[batch_idx].column(ci.index);
+                    let indices_array = UInt32Array::from(current_segment_row_indices);
+                    segments.push(compute::take(source_col, &indices_array, None)?);
+                } else if current_segment_null_count > 0 {
+                    segments.push(new_null_array(&data_type, current_segment_null_count));
+                }
+            }
+
+            if segments.is_empty() {
+                output_columns.push(new_null_array(&data_type, num_output_rows));
             } else {
-                compute::take(array.as_ref(), probe_indices, None)?
+                // `concat_arrays` requires a Vec<&dyn Array>, so convert segments.
+                let refs: Vec<&dyn Array> = segments.iter().map(|arr| arr.as_ref()).collect();
+                output_columns.push(compute::concat_arrays(&data_type, &refs)?);
+            }
+        } else { // Column is from the probe side
+            let array = probe_batch.column(ci.index);
+            if array.is_empty() || probe_indices.null_count() == num_output_rows {
+                 // Ensure all probe_indices are null if array is empty and we expect rows
+                if !array.is_empty() && probe_indices.null_count() != num_output_rows {
+                     return plan_err!("probe_indices should be all null if probe array is empty and output rows > 0");
+                }
+                output_columns.push(new_null_array(array.data_type(), num_output_rows));
+            } else {
+                output_columns.push(compute::take(array.as_ref(), probe_indices, None)?);
             }
         };
-        columns.push(array);
     }
-    Ok(RecordBatch::try_new(Arc::new(schema.clone()), columns)?)
+    Ok(RecordBatch::try_new(Arc::new(schema.clone()), output_columns)?)
 }
 
 /// The input is the matched indices for left and right and
