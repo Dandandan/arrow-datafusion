@@ -233,11 +233,11 @@ impl BatchPartitioner {
     ///
     /// The time spent repartitioning, not including time spent in `f` will be recorded
     /// to the [`metrics::Time`] provided on construction
-    pub fn partition<F>(&mut self, batch: RecordBatch, mut f: F) -> Result<()>
+    pub fn partition<'a, F>(&'a mut self, input_batches: &'a [RecordBatch], mut f: F) -> Result<()>
     where
         F: FnMut(usize, RecordBatch) -> Result<()>,
     {
-        self.partition_iter(batch)?.try_for_each(|res| match res {
+        self.partition_iter(input_batches)?.try_for_each(|res| match res {
             Ok((partition, batch)) => f(partition, batch),
             Err(e) => Err(e),
         })
@@ -248,83 +248,108 @@ impl BatchPartitioner {
     /// The reason this was pulled out is that we need to have a variant of `partition` that works w/ sync functions,
     /// and one that works w/ async. Using an iterator as an intermediate representation was the best way to achieve
     /// this (so we don't need to clone the entire implementation).
-    fn partition_iter(
-        &mut self,
-        batch: RecordBatch,
-    ) -> Result<impl Iterator<Item = Result<(usize, RecordBatch)>> + Send + '_> {
-        let it: Box<dyn Iterator<Item = Result<(usize, RecordBatch)>> + Send> =
-            match &mut self.state {
-                BatchPartitionerState::RoundRobin {
-                    num_partitions,
-                    next_idx,
-                } => {
-                    let idx = *next_idx;
+    fn partition_iter<'a>(
+        &'a mut self,
+        input_batches: &'a [RecordBatch],
+    ) -> Result<impl Iterator<Item = Result<(usize, RecordBatch)>> + Send + 'a> {
+        match &mut self.state {
+            BatchPartitionerState::RoundRobin {
+                num_partitions,
+                next_idx,
+            } => {
+                if let Some(found_batch) = input_batches.iter().find(|b| b.num_rows() > 0) {
+                    let target_partition_idx = *next_idx;
                     *next_idx = (*next_idx + 1) % *num_partitions;
-                    Box::new(std::iter::once(Ok((idx, batch))))
+                    Ok(Box::new(std::iter::once(Ok((
+                        target_partition_idx,
+                        found_batch.clone(),
+                    )))))
+                } else {
+                    Ok(Box::new(std::iter::empty()))
                 }
-                BatchPartitionerState::Hash {
-                    random_state,
-                    exprs,
-                    num_partitions: partitions,
-                    hash_buffer,
-                } => {
-                    // Tracking time required for distributing indexes across output partitions
-                    let timer = self.timer.timer();
+            }
+            BatchPartitionerState::Hash {
+                random_state,
+                exprs,
+                num_partitions,
+                hash_buffer,
+            } => {
+                let _timer = self.timer.timer(); // Overall timer for hash partitioning logic
+
+                // Initialize a vector of vectors to hold batches for each output partition
+                let mut batches_for_output_partitions: Vec<Vec<RecordBatch>> =
+                    vec![Vec::new(); *num_partitions];
+                let mut result_vec: Vec<Result<(usize, RecordBatch)>> = Vec::new();
+
+                if input_batches.is_empty() || input_batches.iter().all(|b| b.num_rows() == 0) {
+                    return Ok(Box::new(std::iter::empty()));
+                }
+                let schema = input_batches.iter().find(|b| b.num_rows() > 0).unwrap().schema();
+
+
+                for current_input_batch in input_batches {
+                    if current_input_batch.num_rows() == 0 {
+                        continue;
+                    }
 
                     let arrays = exprs
                         .iter()
-                        .map(|expr| expr.evaluate(&batch)?.into_array(batch.num_rows()))
+                        .map(|expr| {
+                            expr.evaluate(current_input_batch)?
+                                .into_array(current_input_batch.num_rows())
+                        })
                         .collect::<Result<Vec<_>>>()?;
 
                     hash_buffer.clear();
-                    hash_buffer.resize(batch.num_rows(), 0);
-
+                    hash_buffer.resize(current_input_batch.num_rows(), 0);
                     create_hashes(&arrays, random_state, hash_buffer)?;
 
-                    let mut indices: Vec<_> = (0..*partitions)
-                        .map(|_| Vec::with_capacity(batch.num_rows()))
-                        .collect();
+                    let mut indices_for_input_batch_per_output_partition: Vec<Vec<u32>> =
+                        vec![Vec::new(); *num_partitions];
 
-                    for (index, hash) in hash_buffer.iter().enumerate() {
-                        indices[(*hash % *partitions as u64) as usize].push(index as u32);
+                    for (row_idx, hash_val) in hash_buffer.iter().enumerate() {
+                        let output_idx = (*hash_val % *num_partitions as u64) as usize;
+                        indices_for_input_batch_per_output_partition[output_idx].push(row_idx as u32);
                     }
 
-                    // Finished building index-arrays for output partitions
-                    timer.done();
-
-                    // Borrowing partitioner timer to prevent moving `self` to closure
-                    let partitioner_timer = &self.timer;
-                    let it = indices
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(partition, indices)| {
-                            let indices: PrimitiveArray<UInt32Type> = indices.into();
-                            (!indices.is_empty()).then_some((partition, indices))
-                        })
-                        .map(move |(partition, indices)| {
-                            // Tracking time required for repartitioned batches construction
-                            let _timer = partitioner_timer.timer();
-
-                            // Produce batches based on indices
-                            let columns = take_arrays(batch.columns(), &indices, None)?;
-
-                            let mut options = RecordBatchOptions::new();
-                            options = options.with_row_count(Some(indices.len()));
-                            let batch = RecordBatch::try_new_with_options(
-                                batch.schema(),
+                    for output_idx in 0..*num_partitions {
+                        let indices_for_current_output =
+                            &indices_for_input_batch_per_output_partition[output_idx];
+                        if !indices_for_current_output.is_empty() {
+                            let indices_array = PrimitiveArray::<UInt32Type>::from_vec(
+                                indices_for_current_output.clone(),
+                            );
+                            let columns =
+                                take_arrays(current_input_batch.columns(), &indices_array, None)?;
+                            let options = RecordBatchOptions::new()
+                                .with_row_count(Some(indices_array.len()));
+                            let taken_batch = RecordBatch::try_new_with_options(
+                                Arc::clone(current_input_batch.schema_ref()),
                                 columns,
                                 &options,
-                            )
-                            .unwrap();
-
-                            Ok((partition, batch))
-                        });
-
-                    Box::new(it)
+                            )?;
+                            batches_for_output_partitions[output_idx].push(taken_batch);
+                        }
+                    }
                 }
-            };
 
-        Ok(it)
+                for output_idx in 0..*num_partitions {
+                    let batches_to_concat = &batches_for_output_partitions[output_idx];
+                    if !batches_to_concat.is_empty() {
+                        // All batches for a given output partition must have the same schema
+                        // as the first non-empty input batch.
+                        let concatenated_batch = arrow::compute::concat_batches(
+                            &schema, // Use schema from the first non-empty input batch
+                            batches_to_concat.iter(),
+                        )?;
+                        if concatenated_batch.num_rows() > 0 {
+                             result_vec.push(Ok((output_idx, concatenated_batch)));
+                        }
+                    }
+                }
+                Ok(Box::new(result_vec.into_iter()))
+            }
+        }
     }
 
     // return the number of output partitions
@@ -885,7 +910,9 @@ impl RepartitionExec {
                 None => break,
             };
 
-            for res in partitioner.partition_iter(batch)? {
+            // With the new partition_iter, we pass a slice containing the single batch.
+            // The new `partition_iter` is designed to handle a slice of batches.
+            for res in partitioner.partition_iter(&[batch])? {
                 let (partition, batch) = res?;
                 let size = batch.get_array_memory_size();
 
@@ -1095,7 +1122,7 @@ impl RecordBatchStream for PerPartitionStream {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap as StdHashMap, HashSet};
 
     use super::*;
     use crate::test::TestMemoryExec;
@@ -1110,14 +1137,44 @@ mod tests {
         {collect, expressions::col},
     };
 
-    use arrow::array::{ArrayRef, StringArray, UInt32Array};
+    use arrow::array::{ArrayRef, RecordBatchIterator, StringArray, UInt32Array};
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::cast::as_string_array;
-    use datafusion_common::test_util::batches_to_sort_string;
-    use datafusion_common::{arrow_datafusion_err, exec_err};
+    use datafusion_common::cast::{as_string_array, as_uint32_array};
+    use datafusion_common::test_util::{batches_to_sorted_vec, batches_to_string};
+    use datafusion_common::{arrow_datafusion_err, exec_err, ScalarValue};
     use datafusion_common_runtime::JoinSet;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use insta::assert_snapshot;
+    use datafusion_physical_expr::expressions::Column as PhysicalColumn;
+    use crate::metrics::Time;
+
+
+    // Helper to create a schema for key/value tests
+    fn key_value_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]))
+    }
+
+    // Helper to create a record batch for key/value tests
+    fn create_key_value_batch(keys: Vec<u32>, values: Vec<&str>) -> Result<RecordBatch> {
+        let schema = key_value_schema();
+        let key_array = Arc::new(UInt32Array::from(keys)) as ArrayRef;
+        let value_array = Arc::new(StringArray::from(values)) as ArrayRef;
+        RecordBatch::try_new(schema, vec![key_array, value_array])
+    }
+
+    // Helper to get a hasher from BatchPartitionerState, useful for predicting partitions
+    impl BatchPartitionerState {
+        fn create_hasher(&self) -> ahash::AHasher {
+            match self {
+                BatchPartitionerState::Hash { random_state, .. } => random_state.hasher(),
+                _ => panic!("Not a hash partitioner"),
+            }
+        }
+    }
+
 
     #[tokio::test]
     async fn one_to_many_round_robin() -> Result<()> {
@@ -1573,25 +1630,40 @@ mod tests {
     #[tokio::test]
     async fn hash_repartition_avoid_empty_batch() -> Result<()> {
         let task_ctx = Arc::new(TaskContext::default());
-        let batch = RecordBatch::try_from_iter(vec![(
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_from_iter_with_schema(schema.clone(), vec![(
             "a",
             Arc::new(StringArray::from(vec!["foo"])) as ArrayRef,
-        )])
-        .unwrap();
+        )])?;
+
         let partitioning = Partitioning::Hash(
-            vec![Arc::new(crate::expressions::Column::new("a", 0))],
+            vec![Arc::new(PhysicalColumn::new_with_schema("a", &schema)?)],
             2,
         );
-        let schema = batch.schema();
-        let input = MockExec::new(vec![Ok(batch)], schema);
-        let exec = RepartitionExec::try_new(Arc::new(input), partitioning).unwrap();
-        let output_stream0 = exec.execute(0, Arc::clone(&task_ctx)).unwrap();
-        let batch0 = crate::common::collect(output_stream0).await.unwrap();
-        let output_stream1 = exec.execute(1, Arc::clone(&task_ctx)).unwrap();
-        let batch1 = crate::common::collect(output_stream1).await.unwrap();
-        assert!(batch0.is_empty() || batch1.is_empty());
+
+        // Create a BatchPartitioner
+        let mut partitioner = BatchPartitioner::try_new(partitioning, Time::new())?;
+        let input_batches = [batch];
+        let mut results: Vec<RecordBatch> = Vec::new();
+        partitioner.partition(&input_batches, |_idx, b| {
+            results.push(b);
+            Ok(())
+        })?;
+
+        // With a single row, one output partition will get the row, the other will be empty.
+        // The new logic ensures that partition_iter only yields batches for partitions that received rows.
+        // So, we expect exactly one output batch.
+        assert_eq!(results.len(), 1, "Expected one output batch for a single input row");
+        assert_eq!(results[0].num_rows(), 1, "The output batch should contain the input row");
+
+        // Further check: if we collect from the iterator directly
+        let mut iter_results = partitioner.partition_iter(&input_batches)?.collect::<Result<Vec<_>>>()?;
+        assert_eq!(iter_results.len(), 1, "Iterator should yield one item");
+        assert_eq!(iter_results[0].1.num_rows(), 1);
+
         Ok(())
     }
+
 
     #[tokio::test]
     async fn oom() -> Result<()> {
@@ -1644,6 +1716,161 @@ mod tests {
         )
         .unwrap()
     }
+
+    #[tokio::test]
+    async fn batch_partitioner_hash_take_then_concat_2_partitions() -> Result<()> {
+        let schema = key_value_schema();
+        let batch1 = create_key_value_batch(vec![1, 2], vec!["a", "b"])?; // Key 1 (P0), Key 2 (P1)
+        let batch2 = create_key_value_batch(vec![1, 3], vec!["c", "d"])?; // Key 1 (P0), Key 3 (P0)
+
+        // Hashes with seed(0,0,0,0):
+        // Key 1 (UInt32): 15993616680734244716 -> % 2 = 0
+        // Key 2 (UInt32): 12010311318339504901 -> % 2 = 1
+        // Key 3 (UInt32): 10865702158438033446 -> % 2 = 0
+
+        let physical_expr = Arc::new(PhysicalColumn::new_with_schema("key", &schema)?);
+        let partitioning = Partitioning::Hash(vec![physical_expr], 2); // 2 output partitions
+        let mut partitioner = BatchPartitioner::try_new(partitioning, Time::new())?;
+
+        let input_batches = [batch1, batch2];
+        let mut partitioned_results: StdHashMap<usize, Vec<RecordBatch>> = StdHashMap::new();
+
+        let output_from_iterator: Vec<_> = partitioner.partition_iter(&input_batches)?.collect::<Result<Vec<_>>>()?;
+
+        for (partition_idx, batch) in output_from_iterator {
+            partitioned_results.entry(partition_idx).or_default().push(batch);
+        }
+
+        assert_eq!(partitioned_results.len(), 2, "Should have outputs for 2 partitions");
+
+        // Verify Partition 0
+        assert!(partitioned_results.contains_key(&0));
+        let p0_batches = partitioned_results.get(&0).unwrap();
+        assert_eq!(p0_batches.len(), 1, "Partition 0 should have one final batch");
+        let p0_final_batch = &p0_batches[0];
+        assert_eq!(p0_final_batch.num_rows(), 3);
+        // Expected: (1,"a") from batch1, then (1,"c"), (3,"d") from batch2
+        let p0_expected_rows = vec![
+            "+-----+-------+",
+            "| key | value |",
+            "+-----+-------+",
+            "| 1   | a     |", // from batch1, take for key 1
+            "| 1   | c     |", // from batch2, take for key 1
+            "| 3   | d     |", // from batch2, take for key 3
+            "+-----+-------+",
+        ];
+        let p0_string_rows = batches_to_string(&[p0_final_batch.clone()]);
+        assert_eq!(p0_string_rows, p0_expected_rows);
+
+
+        // Verify Partition 1
+        assert!(partitioned_results.contains_key(&1));
+        let p1_batches = partitioned_results.get(&1).unwrap();
+         assert_eq!(p1_batches.len(), 1, "Partition 1 should have one final batch");
+        let p1_final_batch = &p1_batches[0];
+        assert_eq!(p1_final_batch.num_rows(), 1);
+        // Expected: (2,"b") from batch1
+         let p1_expected_rows = vec![
+            "+-----+-------+",
+            "| key | value |",
+            "+-----+-------+",
+            "| 2   | b     |", // from batch1, take for key 2
+            "+-----+-------+",
+        ];
+        let p1_string_rows = batches_to_string(&[p1_final_batch.clone()]);
+        assert_eq!(p1_string_rows, p1_expected_rows);
+
+        Ok(())
+    }
+
+
+    #[tokio::test]
+    async fn batch_partitioner_hash_empty_input_slice() -> Result<()> {
+        let schema = key_value_schema();
+        let physical_expr = Arc::new(PhysicalColumn::new_with_schema("key", &schema)?);
+        let partitioning = Partitioning::Hash(vec![physical_expr], 2);
+        let mut partitioner = BatchPartitioner::try_new(partitioning, Time::new())?;
+
+        let mut called = false;
+        partitioner.partition(&[], |_partition_idx, _batch| {
+            called = true;
+            Ok(())
+        })?;
+        assert!(!called, "Callback should not be called for empty input slice via partition()");
+
+        let iter_results: Vec<_> = partitioner.partition_iter(&[])?.collect();
+        assert!(iter_results.is_empty(), "Iterator should be empty for empty input slice");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_partitioner_hash_slice_with_only_empty_batches() -> Result<()> {
+        let schema = key_value_schema();
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let physical_expr = Arc::new(PhysicalColumn::new_with_schema("key", &schema)?);
+        let partitioning = Partitioning::Hash(vec![physical_expr], 2);
+        let mut partitioner = BatchPartitioner::try_new(partitioning, Time::new())?;
+
+        let input_batches = [empty_batch.clone(), empty_batch.clone()];
+
+        let mut called = false;
+        partitioner.partition(&input_batches, |_,_| {
+            called = true;
+            Ok(())
+        })?;
+        assert!(!called, "Callback should not be called when all input batches are empty (via partition())");
+
+        let iter_results: Vec<_> = partitioner.partition_iter(&input_batches)?.collect();
+        assert!(iter_results.is_empty(), "Iterator should be empty if all input batches are empty");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_partitioner_round_robin_multi_input_first_non_empty() -> Result<()> {
+        let schema = key_value_schema();
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batch1 = create_key_value_batch(vec![1], vec!["a"])?;
+        let batch2 = create_key_value_batch(vec![2], vec!["b"])?;
+
+        let partitioning = Partitioning::RoundRobinBatch(3);
+        let mut partitioner = BatchPartitioner::try_new(partitioning, Time::new())?;
+
+        // First call
+        let input_slice1 = [empty_batch.clone(), batch1.clone(), batch2.clone()];
+        let iter_results1: Vec<_> = partitioner.partition_iter(&input_slice1)?.collect::<Result<Vec<_>>>()?;
+        assert_eq!(iter_results1.len(), 1, "Should get one batch for first round robin call");
+        assert_eq!(iter_results1[0].0, 0, "Should be assigned to partition 0");
+        assert_eq!(iter_results1[0].1.num_rows(), 1);
+        assert_eq!(iter_results1[0].1.column(0), batch1.column(0)); // Should be batch1
+
+        // Second call
+        let input_slice2 = [empty_batch.clone(), batch2.clone(), batch1.clone()]; // Different order, batch2 is first non-empty
+        let iter_results2: Vec<_> = partitioner.partition_iter(&input_slice2)?.collect::<Result<Vec<_>>>()?;
+        assert_eq!(iter_results2.len(), 1, "Should get one batch for second round robin call");
+        assert_eq!(iter_results2[0].0, 1, "Should be assigned to partition 1");
+        assert_eq!(iter_results2[0].1.column(0), batch2.column(0)); // Should be batch2
+
+        // Third call - only empty batches
+        let input_slice3 = [empty_batch.clone(), empty_batch.clone()];
+        let iter_results3: Vec<_> = partitioner.partition_iter(&input_slice3)?.collect::<Result<Vec<_>>>()?;
+        assert!(iter_results3.is_empty(), "Should get no batches if all inputs are empty for round robin");
+
+        // Fourth call - ensure counter wraps around
+        let iter_results4: Vec<_> = partitioner.partition_iter(&input_slice1)?.collect::<Result<Vec<_>>>()?;
+        assert_eq!(iter_results4.len(), 1);
+        assert_eq!(iter_results4[0].0, 2, "Should be assigned to partition 2 (counter was 2)");
+        assert_eq!(iter_results4[0].1.column(0), batch1.column(0));
+
+        // Fifth call
+        let iter_results5: Vec<_> = partitioner.partition_iter(&input_slice1)?.collect::<Result<Vec<_>>>()?;
+        assert_eq!(iter_results5.len(), 1);
+        assert_eq!(iter_results5[0].0, 0, "Should be assigned to partition 0 again (counter was 0)");
+        assert_eq!(iter_results5[0].1.column(0), batch1.column(0));
+
+
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]
