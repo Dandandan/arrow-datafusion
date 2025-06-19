@@ -361,7 +361,7 @@ impl TopK {
             let mut current_thresholds = self.filter.thresholds.write();
 
             let more_selective = if let Some(current) = current_row.as_mut() {
-                let more_selective = current.as_slice() < max.row();
+                let more_selective = max.row() < current.as_slice();
                 // If the new thresholds are more selective, update the current ones
                 if more_selective {
                     current.copy_from_slice(&max.row);
