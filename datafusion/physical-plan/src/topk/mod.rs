@@ -364,8 +364,7 @@ impl TopK {
                 let more_selective = current.as_slice() < max.row();
                 // If the new thresholds are more selective, update the current ones
                 if more_selective {
-                        current.copy_from_slice(&max.row);
-
+                    current.copy_from_slice(&max.row);
                 }
                 more_selective
             } else {
@@ -385,7 +384,7 @@ impl TopK {
         if !should_update {
             return Ok(());
         }
-        
+
         let thresholds = thresholds.unwrap();
 
         // Create filter expressions for each threshold
