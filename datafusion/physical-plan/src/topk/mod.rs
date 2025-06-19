@@ -352,7 +352,7 @@ impl TopK {
             return Ok(());
         };
 
-        let mut thresholds = None;
+        let thresholds: Option<Vec<ScalarValue>>;
 
         // Are the new thresholds more selective than our existing ones?
         let should_update = {
