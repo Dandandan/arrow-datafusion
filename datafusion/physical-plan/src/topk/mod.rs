@@ -347,9 +347,12 @@ impl TopK {
     /// (a > 2 OR (a = 2 AND b < 3))
     /// ```
     fn update_filter(&mut self) -> Result<()> {
-        let Some(thresholds) = self.heap.get_threshold_values(&self.expr)? else {
+        let Some(max) = self.heap.max() else {
+            // If the heap is empty, there's nothing to update
             return Ok(());
         };
+
+        let mut thresholds = None;
 
         // Are the new thresholds more selective than our existing ones?
         let should_update = {
@@ -358,14 +361,11 @@ impl TopK {
             let mut current_thresholds = self.filter.thresholds.write();
 
             let more_selective = if let Some(current) = current_row.as_mut() {
-                let max = self.heap.max();
-                let more_selective =
-                    max.map(|x| current.as_slice() < x.row()).unwrap_or(false);
+                let more_selective = current.as_slice() < max.row();
                 // If the new thresholds are more selective, update the current ones
                 if more_selective {
-                    max.inspect(|x| {
-                        current.copy_from_slice(&x.row);
-                    });
+                        current.copy_from_slice(&max.row);
+
                 }
                 more_selective
             } else {
@@ -374,7 +374,9 @@ impl TopK {
             };
 
             if more_selective {
-                Some(thresholds.clone()).clone_into(&mut current_thresholds);
+                thresholds = self.heap.get_threshold_values(&self.expr)?;
+                // TODO: avoid this clone
+                *current_thresholds = thresholds.clone();
             }
 
             more_selective
@@ -383,6 +385,8 @@ impl TopK {
         if !should_update {
             return Ok(());
         }
+        
+        let thresholds = thresholds.unwrap();
 
         // Create filter expressions for each threshold
         let mut filters: Vec<Arc<dyn PhysicalExpr>> =
