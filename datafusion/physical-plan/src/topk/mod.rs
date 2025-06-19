@@ -240,36 +240,39 @@ impl TopK {
 
         // If a filter is provided, update it with the new rows
         let filter = self.filter.expr.current()?;
-        let filtered = filter.evaluate(&batch)?;
-        let num_rows = batch.num_rows();
-        let array = filtered.into_array(num_rows)?;
-        let mut filter = array.as_boolean().clone();
-        let true_count = filter.true_count();
-        if true_count == 0 {
-            // nothing to filter, so no need to update
-            return Ok(());
-        }
-        // only update the keys / rows if the filter does not match all rows
-        if true_count < num_rows {
-            // Indices in `set_indices` should be correct if filter contains nulls
-            // So we prepare the filter here. Note this is also done in the `FilterBuilder`
-            // so there is no overhead to do this here.
-            if filter.nulls().is_some() {
-                filter = prep_null_mask_filter(&filter);
-            }
 
-            let filter_predicate = FilterBuilder::new(&filter);
-            let filter_predicate = if sort_keys.len() > 1 {
-                // Optimize filter when it has multiple sort keys
-                filter_predicate.optimize().build()
-            } else {
-                filter_predicate.build()
-            };
-            selected_rows = Some(filter);
-            sort_keys = sort_keys
-                .iter()
-                .map(|key| filter_predicate.filter(key).map_err(|x| x.into()))
-                .collect::<Result<Vec<_>>>()?;
+        if filter != lit(true) {
+            let filtered = filter.evaluate(&batch)?;
+            let num_rows = batch.num_rows();
+            let array = filtered.into_array(num_rows)?;
+            let mut filter = array.as_boolean().clone();
+            let true_count = filter.true_count();
+            if true_count == 0 {
+                // nothing to filter, so no need to update
+                return Ok(());
+            }
+            // only update the keys / rows if the filter does not match all rows
+            if true_count < num_rows {
+                // Indices in `set_indices` should be correct if filter contains nulls
+                // So we prepare the filter here. Note this is also done in the `FilterBuilder`
+                // so there is no overhead to do this here.
+                if filter.nulls().is_some() {
+                    filter = prep_null_mask_filter(&filter);
+                }
+
+                let filter_predicate = FilterBuilder::new(&filter);
+                let filter_predicate = if sort_keys.len() > 1 {
+                    // Optimize filter when it has multiple sort keys
+                    filter_predicate.optimize().build()
+                } else {
+                    filter_predicate.build()
+                };
+                selected_rows = Some(filter);
+                sort_keys = sort_keys
+                    .iter()
+                    .map(|key| filter_predicate.filter(key).map_err(|x| x.into()))
+                    .collect::<Result<Vec<_>>>()?;
+            }
         }
         // reuse existing `Rows` to avoid reallocations
         let rows = &mut self.scratch_rows;
