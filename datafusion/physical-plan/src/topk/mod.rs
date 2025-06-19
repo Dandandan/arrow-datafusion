@@ -134,6 +134,8 @@ pub struct TopKDynamicFilters {
     /// The current *global* threshold for the dynamic filter.
     /// This is shared across all partitions and is updated by any of them.
     thresholds: Arc<RwLock<Option<Vec<ScalarValue>>>>,
+    /// Current global row that matches the dynamic filter.
+    row: Arc<RwLock<Option<Vec<u8>>>>,
     /// The expression used to evaluate the dynamic filter
     expr: Arc<DynamicFilterPhysicalExpr>,
 }
@@ -143,6 +145,7 @@ impl TopKDynamicFilters {
     pub fn new(expr: Arc<DynamicFilterPhysicalExpr>) -> Self {
         Self {
             thresholds: Arc::new(RwLock::new(None)),
+            row: Arc::new(RwLock::new(None)),
             expr,
         }
     }
@@ -350,75 +353,31 @@ impl TopK {
 
         // Are the new thresholds more selective than our existing ones?
         let should_update = {
-            let mut current = self.filter.thresholds.write();
-            if let Some(current) = current.as_mut() {
-                assert!(current.len() == thresholds.len());
-                // Check if new thresholds are more selective than current ones
-                let mut more_selective = false;
-                for ((current_value, new_value), sort_expr) in
-                    current.iter().zip(thresholds.iter()).zip(self.expr.iter())
-                {
-                    match current_value.partial_cmp(new_value) {
-                        Some(ordering) => {
-                            match ordering {
-                                Ordering::Equal => {
-                                    // Continue checking next values
-                                }
-                                Ordering::Less => {
-                                    // For descending sort: new > current means more selective
-                                    // For ascending sort: new > current means less selective
-                                    more_selective = sort_expr.options.descending;
-                                    break;
-                                }
-                                Ordering::Greater => {
-                                    // For descending sort: new < current means less selective
-                                    // For ascending sort: new < current means more selective
-                                    more_selective = !sort_expr.options.descending;
-                                    break;
-                                }
-                            }
-                        }
-                        None => {
-                            // One of the values is null or not comparable
-                            let current_is_null = current_value.is_null();
-                            let new_is_null = new_value.is_null();
-                            match (current_is_null, new_is_null) {
-                                (true, true) => {
-                                    // Both null, continue checking next values
-                                }
-                                (true, false) => {
-                                    // Current is null, new is not null
-                                    // For nulls_first: null < non-null, so new value is less selective
-                                    // For nulls_last: null > non-null, so new value is more selective
-                                    more_selective = !sort_expr.options.nulls_first;
-                                    break;
-                                }
-                                (false, true) => {
-                                    // Current is not null, new is null
-                                    // For nulls_first: non-null > null, so new value is more selective
-                                    // For nulls_last: non-null < null, so new value is less selective
-                                    more_selective = sort_expr.options.nulls_first;
-                                    break;
-                                }
-                                (false, false) => {
-                                    // Neither is null, we can't compare them
-                                    // This means we can't determine selectivity, so we assume that the new filter is more selective
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+            // TODO: single lock
+            let mut current_row = self.filter.row.write();
+            let mut current_thresholds = self.filter.thresholds.write();
+
+            let more_selective = if let Some(current) = current_row.as_mut() {
+                let max = self.heap.max();
+                let more_selective =
+                    max.map(|x| current.as_slice() < x.row()).unwrap_or(false);
                 // If the new thresholds are more selective, update the current ones
                 if more_selective {
-                    *current = thresholds.clone();
+                    max.inspect(|x| {
+                        current.copy_from_slice(&x.row);
+                    });
                 }
                 more_selective
             } else {
                 // No current thresholds, so update with the new ones
-                *current = Some(thresholds.clone());
                 true
+            };
+
+            if more_selective {
+                Some(thresholds.clone()).clone_into(&mut current_thresholds);
             }
+
+            more_selective
         };
 
         if !should_update {
