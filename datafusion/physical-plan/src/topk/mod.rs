@@ -369,14 +369,12 @@ impl TopK {
                 more_selective
             } else {
                 // No current thresholds, so update with the new ones
-                true
-            };
-
-            if more_selective {
                 thresholds = self.heap.get_threshold_values(&self.expr)?;
                 // TODO: avoid this clone
                 *current_thresholds = thresholds.clone();
-            }
+                *current_row = Some(max.row().to_vec());
+                true
+            };
 
             more_selective
         };
