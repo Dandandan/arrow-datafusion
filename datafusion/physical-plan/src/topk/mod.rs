@@ -352,7 +352,7 @@ impl TopK {
             return Ok(());
         };
 
-        let thresholds: Option<Vec<ScalarValue>>;
+        let mut thresholds: Option<Vec<ScalarValue>> = None;
 
         // Are the new thresholds more selective than our existing ones?
         let should_update = {
@@ -366,8 +366,9 @@ impl TopK {
                 if more_selective {
                     current.clear();
                     current.extend_from_slice(max.row());
+                    thresholds = self.heap.get_threshold_values(&self.expr)?;
+                    *current_thresholds = thresholds.clone();
                 }
-                thresholds = self.heap.get_threshold_values(&self.expr)?;
                 more_selective
             } else {
                 // No current thresholds, so update with the new ones
