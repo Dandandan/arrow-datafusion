@@ -366,6 +366,7 @@ impl TopK {
                 if more_selective {
                     current.copy_from_slice(&max.row);
                 }
+                thresholds = self.heap.get_threshold_values(&self.expr)?;
                 more_selective
             } else {
                 // No current thresholds, so update with the new ones
