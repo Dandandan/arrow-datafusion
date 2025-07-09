@@ -25,10 +25,11 @@ use arrow::row::{RowConverter, Rows, SortField};
 use datafusion_common::{internal_datafusion_err, Result};
 use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
-use futures::stream::{Fuse, StreamExt};
+use futures::stream::StreamExt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
+use tokio::sync::mpsc::{channel, Receiver};
 
 /// A [`Stream`](futures::Stream) that has multiple partitions that can
 /// be polled separately but not concurrently
@@ -49,9 +50,11 @@ pub trait PartitionedStream: std::fmt::Debug + Send {
     ) -> Poll<Option<Self::Output>>;
 }
 
+const ROW_CURSOR_STREAM_BUFFER_SIZE: usize = 2;
+
 /// A new type wrapper around a set of fused [`SendableRecordBatchStream`]
 /// that implements debug, and skips over empty [`RecordBatch`]
-struct FusedStreams(Vec<Fuse<SendableRecordBatchStream>>);
+struct FusedStreams(Vec<Receiver<Option<Result<RecordBatch>>>>);
 
 impl std::fmt::Debug for FusedStreams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -67,11 +70,27 @@ impl FusedStreams {
         cx: &mut Context<'_>,
         stream_idx: usize,
     ) -> Poll<Option<Result<RecordBatch>>> {
-        loop {
-            match ready!(self.0[stream_idx].poll_next_unpin(cx)) {
-                Some(Ok(b)) if b.num_rows() == 0 => continue,
-                r => return Poll::Ready(r),
-            }
+        match self.0[stream_idx].poll_recv(cx) {
+            Poll::Ready(Some(Some(r))) => Poll::Ready(Some(r)),
+            Poll::Ready(Some(None)) => Poll::Ready(None), // Stream ended
+            Poll::Ready(None) => Poll::Ready(None), // Channel closed
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T: CursorArray> Drop for FieldCursorStream<T> {
+    fn drop(&mut self) {
+        for handle in &self.task_handles {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for RowCursorStream {
+    fn drop(&mut self) {
+        for handle in &self.task_handles {
+            handle.abort();
         }
     }
 }
@@ -110,19 +129,27 @@ impl ReusableRows {
 /// and computes [`RowValues`] based on the provided [`PhysicalSortExpr`]
 /// Note: the stream returns an error if the consumer buffers more than one RowValues (i.e. holds on to two RowValues
 /// from the same partition at the same time).
+// Tokios MPSC channel is used to send data from spawned tasks to the RowCursorStream.
+// When RowCursorStream is dropped, the receivers are dropped. The spawned tasks will detect this
+// when they try to send data, and they will terminate. However, if a spawned task is idle (e.g.
+// waiting for its input stream to produce a batch), it might not terminate immediately.
+// To ensure prompt termination and resource cleanup, especially for tests like `test_drop_cancel`,
+// we explicitly store and abort the JoinHandles of these tasks in the Drop impl.
 #[derive(Debug)]
 pub struct RowCursorStream {
     /// Converter to convert output of physical expressions
     converter: RowConverter,
     /// The physical expressions to sort by
     column_expressions: Vec<Arc<dyn PhysicalExpr>>,
-    /// Input streams
+    /// Input streams (receivers for data from spawned tasks)
     streams: FusedStreams,
     /// Tracks the memory used by `converter`
     reservation: MemoryReservation,
     /// Allocated rows for each partition, we keep two to allow for buffering one
     /// in the consumer of the stream
     rows: ReusableRows,
+    /// JoinHandles for the tokio tasks polling input streams
+    task_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl RowCursorStream {
@@ -140,10 +167,44 @@ impl RowCursorStream {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let streams: Vec<_> = streams.into_iter().map(|s| s.fuse()).collect();
+        let mut receivers = Vec::with_capacity(streams.len());
+        let mut task_handles = Vec::with_capacity(streams.len());
+        for stream in streams {
+            let (tx, rx) = channel(ROW_CURSOR_STREAM_BUFFER_SIZE);
+            let mut fused_stream = stream.fuse();
+            let handle = tokio::spawn(async move {
+                loop {
+                    match fused_stream.next().await {
+                        Some(Ok(batch)) if batch.num_rows() == 0 => continue,
+                        Some(Ok(batch)) => {
+                            if tx.send(Some(Ok(batch))).await.is_err() {
+                                // Receiver dropped, exiting
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            if tx.send(Some(Err(e))).await.is_err() {
+                                // Receiver dropped, exiting
+                                break;
+                            }
+                        }
+                        None => {
+                            // Stream finished
+                            if tx.send(None).await.is_err() {
+                                // Receiver dropped, exiting
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+            receivers.push(rx);
+            task_handles.push(handle);
+        }
+
         let converter = RowConverter::new(sort_fields)?;
-        let mut rows = Vec::with_capacity(streams.len());
-        for _ in &streams {
+        let mut rows = Vec::with_capacity(receivers.len());
+        for _ in &receivers {
             // Initialize each stream with an empty Rows
             rows.push([
                 Some(Arc::new(converter.empty_rows(0, 0))),
@@ -154,8 +215,9 @@ impl RowCursorStream {
             converter,
             reservation,
             column_expressions: expressions.iter().map(|x| Arc::clone(&x.expr)).collect(),
-            streams: FusedStreams(streams),
+            streams: FusedStreams(receivers),
             rows: ReusableRows { inner: rows },
+            task_handles,
         })
     }
 
@@ -201,24 +263,30 @@ impl PartitionedStream for RowCursorStream {
         cx: &mut Context<'_>,
         stream_idx: usize,
     ) -> Poll<Option<Self::Output>> {
-        Poll::Ready(ready!(self.streams.poll_next(cx, stream_idx)).map(|r| {
-            r.and_then(|batch| {
-                let cursor = self.convert_batch(&batch, stream_idx)?;
-                Ok((cursor, batch))
-            })
-        }))
+        match ready!(self.streams.poll_next(cx, stream_idx)) {
+            Some(Ok(batch)) => {
+                let cursor_result = self.convert_batch(&batch, stream_idx);
+                Poll::Ready(Some(cursor_result.map(|cursor| (cursor, batch))))
+            }
+            Some(Err(e)) => Poll::Ready(Some(Err(e))),
+            None => Poll::Ready(None),
+        }
     }
 }
+
+const FIELD_CURSOR_STREAM_BUFFER_SIZE: usize = 2;
 
 /// Specialized stream for sorts on single primitive columns
 pub struct FieldCursorStream<T: CursorArray> {
     /// The physical expressions to sort by
     sort: PhysicalSortExpr,
-    /// Input streams
+    /// Input streams (receivers for data from spawned tasks)
     streams: FusedStreams,
     /// Create new reservations for each array
     reservation: MemoryReservation,
     phantom: PhantomData<fn(T) -> T>,
+    /// JoinHandles for the tokio tasks polling input streams
+    task_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl<T: CursorArray> std::fmt::Debug for FieldCursorStream<T> {
@@ -235,12 +303,47 @@ impl<T: CursorArray> FieldCursorStream<T> {
         streams: Vec<SendableRecordBatchStream>,
         reservation: MemoryReservation,
     ) -> Self {
-        let streams = streams.into_iter().map(|s| s.fuse()).collect();
+        let mut receivers = Vec::with_capacity(streams.len());
+        let mut task_handles = Vec::with_capacity(streams.len());
+        for stream in streams {
+            let (tx, rx) = channel(FIELD_CURSOR_STREAM_BUFFER_SIZE);
+            let mut fused_stream = stream.fuse();
+            let handle = tokio::spawn(async move {
+                loop {
+                    match fused_stream.next().await {
+                        Some(Ok(batch)) if batch.num_rows() == 0 => continue,
+                        Some(Ok(batch)) => {
+                            if tx.send(Some(Ok(batch))).await.is_err() {
+                                // Receiver dropped, exiting
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            if tx.send(Some(Err(e))).await.is_err() {
+                                // Receiver dropped, exiting
+                                break;
+                            }
+                        }
+                        None => {
+                            // Stream finished
+                            if tx.send(None).await.is_err() {
+                                // Receiver dropped, exiting
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+            receivers.push(rx);
+            task_handles.push(handle);
+        }
+
         Self {
             sort,
-            streams: FusedStreams(streams),
+            streams: FusedStreams(receivers),
             reservation,
             phantom: Default::default(),
+            task_handles,
         }
     }
 
@@ -271,11 +374,13 @@ impl<T: CursorArray> PartitionedStream for FieldCursorStream<T> {
         cx: &mut Context<'_>,
         stream_idx: usize,
     ) -> Poll<Option<Self::Output>> {
-        Poll::Ready(ready!(self.streams.poll_next(cx, stream_idx)).map(|r| {
-            r.and_then(|batch| {
-                let cursor = self.convert_batch(&batch)?;
-                Ok((cursor, batch))
-            })
-        }))
+        match ready!(self.streams.poll_next(cx, stream_idx)) {
+            Some(Ok(batch)) => {
+                let cursor_result = self.convert_batch(&batch);
+                Poll::Ready(Some(cursor_result.map(|cursor| (cursor, batch))))
+            }
+            Some(Err(e)) => Poll::Ready(Some(Err(e))),
+            None => Poll::Ready(None),
+        }
     }
 }
