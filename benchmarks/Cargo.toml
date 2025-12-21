@@ -40,7 +40,19 @@ mimalloc_extended = ["libmimalloc-sys/extended"]
 
 [dependencies]
 arrow = { workspace = true }
-datafusion = { workspace = true, default-features = true }
+datafusion = { workspace = true, default-features = false, features = [
+    "nested_expressions",
+    "crypto_expressions",
+    "datetime_expressions",
+    "encoding_expressions",
+    "regex_expressions",
+    "string_expressions",
+    "unicode_expressions",
+    "compression",
+    "parquet",
+    "recursive_protection",
+    "sql",
+] }
 datafusion-common = { workspace = true, default-features = true }
 env_logger = { workspace = true }
 futures = { workspace = true }

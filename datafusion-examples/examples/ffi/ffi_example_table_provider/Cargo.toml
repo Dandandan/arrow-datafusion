@@ -24,7 +24,7 @@ publish = false
 [dependencies]
 abi_stable = "0.11.3"
 arrow = { workspace = true }
-datafusion = { workspace = true }
+datafusion = { workspace = true, default-features = false }
 datafusion-ffi = { workspace = true }
 ffi_module_interface = { path = "../ffi_module_interface" }
 
