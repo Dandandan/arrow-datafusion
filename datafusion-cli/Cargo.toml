@@ -41,7 +41,7 @@ aws-config = "1.8.11"
 aws-credential-types = "1.2.7"
 chrono = { workspace = true }
 clap = { version = "4.5.53", features = ["cargo", "derive"] }
-datafusion = { workspace = true, features = [
+datafusion = { workspace = true, default-features = false, features = [
     "avro",
     "compression",
     "crypto_expressions",
@@ -52,6 +52,7 @@ datafusion = { workspace = true, features = [
     "parquet_encryption",
     "recursive_protection",
     "regex_expressions",
+    "string_expressions",
     "sql",
     "unicode_expressions",
 ] }

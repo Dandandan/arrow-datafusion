@@ -80,7 +80,14 @@ datafusion = { workspace = true, default-features = false, features = [
     "nested_expressions",
     "unicode_expressions",
 ] }
-datafusion-functions = { workspace = true, default-features = true }
+datafusion-functions = { workspace = true, default-features = false, features = [
+    "datetime_expressions",
+    "encoding_expressions",
+    "math_expressions",
+    "regex_expressions",
+    "string_expressions",
+    "unicode_expressions",
+] }
 datafusion-functions-aggregate = { workspace = true }
 datafusion-functions-window-common = { workspace = true }
 doc-comment = { workspace = true }
