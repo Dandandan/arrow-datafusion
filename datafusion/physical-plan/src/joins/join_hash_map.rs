@@ -254,41 +254,6 @@ impl JoinHashMapType for JoinHashMapU64 {
 // Type of offsets for obtaining indices from JoinHashMap.
 pub(crate) type JoinHashMapOffset = (usize, Option<u64>);
 
-// Macro for traversing chained values with limit.
-// Early returns in case of reaching output tuples limit.
-macro_rules! chain_traverse {
-    (
-        $input_indices:ident, $match_indices:ident,
-        $hash_values:ident, $next_chain:ident,
-        $input_idx:ident, $chain_idx:ident, $remaining_output:ident, $one:ident, $zero:ident
-    ) => {{
-        // now `one` and `zero` are in scope from the outer function
-        let mut match_row_idx = $chain_idx - $one;
-        loop {
-            $match_indices.push(match_row_idx.into());
-            $input_indices.push($input_idx as u32);
-            $remaining_output -= 1;
-
-            let next = $next_chain[match_row_idx.into() as usize];
-
-            if $remaining_output == 0 {
-                // we compare against `zero` (of type T) here too
-                let next_offset = if $input_idx == $hash_values.len() - 1 && next == $zero
-                {
-                    None
-                } else {
-                    Some(($input_idx, Some(next.into())))
-                };
-                return ($input_indices, $match_indices, next_offset);
-            }
-            if next == $zero {
-                break;
-            }
-            match_row_idx = next - $one;
-        }
-    }};
-}
-
 pub fn update_from_iter<'a, T>(
     map: &mut HashTable<(u64, T)>,
     next: &mut [T],
@@ -381,8 +346,8 @@ where
     T: Copy + TryFrom<usize> + PartialOrd + Into<u64> + Sub<Output = T>,
     <T as TryFrom<usize>>::Error: Debug,
 {
-    let mut input_indices = Vec::with_capacity(limit);
-    let mut match_indices = Vec::with_capacity(limit);
+    let mut probe_indices = Vec::with_capacity(limit);
+    let mut build_indices = Vec::with_capacity(limit);
     let zero = T::try_from(0).unwrap();
     let one = T::try_from(1).unwrap();
 
@@ -393,8 +358,8 @@ where
         let end = (start + limit).min(hash_values.len());
         for (i, &hash) in hash_values[start..end].iter().enumerate() {
             if let Some((_, idx)) = map.find(hash, |(h, _)| hash == *h) {
-                input_indices.push(start as u32 + i as u32);
-                match_indices.push((*idx - one).into());
+                probe_indices.push(start as u32 + i as u32);
+                build_indices.push((*idx - one).into());
             }
         }
         let next_off = if end == hash_values.len() {
@@ -402,54 +367,65 @@ where
         } else {
             Some((end, None))
         };
-        return (input_indices, match_indices, next_off);
+        return (probe_indices, build_indices, next_off);
     }
 
-    let mut remaining_output = limit;
+    let mut remaining_limit = limit;
 
-    // Calculate initial `hash_values` index before iterating
-    let to_skip = match offset {
-        // None `initial_next_idx` indicates that `initial_idx` processing has'n been started
-        (idx, None) => idx,
-        // Zero `initial_next_idx` indicates that `initial_idx` has been processed during
-        // previous iteration, and it should be skipped
-        (idx, Some(0)) => idx + 1,
-        // Otherwise, process remaining `initial_idx` matches by traversing `next_chain`,
-        // to start with the next index
-        (idx, Some(next_idx)) => {
-            let next_idx: T = T::try_from(next_idx as usize).unwrap();
-            chain_traverse!(
-                input_indices,
-                match_indices,
-                hash_values,
-                next_chain,
-                idx,
-                next_idx,
-                remaining_output,
-                one,
-                zero
-            );
-            idx + 1
-        }
-    };
+    // `probe_idx` is the index of the row in the probe side,
+    // `next_build_idx` is the next index of the row in the build side that matches.
+    // If `next_build_idx` is `None`, it means we start from the beginning of the chain.
+    let (mut probe_idx, mut next_build_idx) = offset;
 
-    let mut row_idx = to_skip;
-    for &hash in &hash_values[to_skip..] {
-        if let Some((_, idx)) = map.find(hash, |(h, _)| hash == *h) {
-            let idx: T = *idx;
-            chain_traverse!(
-                input_indices,
-                match_indices,
-                hash_values,
-                next_chain,
-                row_idx,
-                idx,
-                remaining_output,
-                one,
-                zero
-            );
+    // Iterate over the hash values of the probe side.
+    while probe_idx < hash_values.len() {
+        let hash = hash_values[probe_idx];
+        let mut build_idx = match next_build_idx.take() {
+            Some(idx) => T::try_from(idx as usize).unwrap(),
+            None => match map.find(hash, |(h, _)| hash == *h) {
+                Some((_, idx)) => *idx,
+                None => {
+                    probe_idx += 1;
+                    continue;
+                }
+            },
+        };
+
+        // If the build_idx is 0, it means we have reached the end of the chain for the previous probe_idx.
+        // So we should move to the next probe_idx.
+        if build_idx == zero {
+            probe_idx += 1;
+            continue;
         }
-        row_idx += 1;
+
+        // Traverse the chain of build side indices.
+        loop {
+            build_indices.push((build_idx - one).into());
+            probe_indices.push(probe_idx as u32);
+
+            remaining_limit -= 1;
+            if remaining_limit == 0 {
+                // We have reached the limit.
+                // We need to store the next build index to continue from, in the next call.
+                let next_build_idx_val =
+                    next_chain[((build_idx - one).into()) as usize];
+
+                if probe_idx == hash_values.len() - 1 && next_build_idx_val == zero {
+                    return (probe_indices, build_indices, None);
+                }
+
+                let next_offset = Some((probe_idx, Some(next_build_idx_val.into())));
+                return (probe_indices, build_indices, next_offset);
+            }
+
+            build_idx = next_chain[((build_idx - one).into()) as usize];
+            if build_idx == zero {
+                // End of the chain.
+                break;
+            }
+        }
+        probe_idx += 1;
     }
-    (input_indices, match_indices, None)
+
+    (probe_indices, build_indices, None)
 }
