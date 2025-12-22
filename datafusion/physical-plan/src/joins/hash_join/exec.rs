@@ -1449,7 +1449,10 @@ async fn collect_left_input(
         Box::new(JoinHashMapU32::with_capacity(num_rows))
     };
 
-    let mut hashes_buffer = Vec::new();
+    // Pre-allocate buffer for hash values to avoid re-allocation during the loop.
+    // This is particularly beneficial when the build side consists of many small batches.
+    let max_rows_per_batch = batches.iter().map(|b| b.num_rows()).max().unwrap_or(0);
+    let mut hashes_buffer = Vec::with_capacity(max_rows_per_batch);
     let mut offset = 0;
 
     // Updating hashmap starting from the last batch
