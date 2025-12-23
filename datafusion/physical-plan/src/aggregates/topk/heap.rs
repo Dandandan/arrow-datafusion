@@ -43,6 +43,12 @@ impl Comparable for Option<String> {
     }
 }
 
+impl<'a> Comparable for Option<&'a str> {
+    fn comp(&self, other: &Self) -> Ordering {
+        self.cmp(other)
+    }
+}
+
 /// A "type alias" for Values which are stored in our heap
 pub trait ValueType: Comparable + Clone + Debug {}
 
