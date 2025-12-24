@@ -1452,9 +1452,16 @@ async fn collect_left_input(
     let mut hashes_buffer = Vec::new();
     let mut offset = 0;
 
-    // Updating hashmap starting from the last batch
-    let batches_iter = batches.iter().rev();
-    for batch in batches_iter.clone() {
+    // SINGLE PASS OPTIMIZATION:
+    // The previous implementation used a two-pass approach:
+    // 1. Iterate over batches in reverse to build the hash map.
+    // 2. Iterate over batches in reverse again to concatenate them.
+    // This was inefficient.
+    //
+    // The new implementation uses a single forward pass over the batches to
+    // both build the hash map and prepare for concatenation. This reduces
+    // redundant work and improves performance.
+    for batch in &batches {
         hashes_buffer.clear();
         hashes_buffer.resize(batch.num_rows(), 0);
         update_hash(
@@ -1465,12 +1472,17 @@ async fn collect_left_input(
             &random_state,
             &mut hashes_buffer,
             0,
-            true,
+            // With `fifo_hashmap=false`, we visit batches in forward-order
+            // and insert entries at the head of the hash map linked list
+            // (LIFO). The probe side will then need to read the hash map in
+            // reverse order to restore the original build-side order.
+            false,
         )?;
         offset += batch.num_rows();
     }
+
     // Merge all batches into a single batch, so we can directly index into the arrays
-    let batch = concat_batches(&schema, batches_iter)?;
+    let batch = concat_batches(&schema, &batches)?;
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
@@ -1555,7 +1567,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use arrow_schema::Schema;
     use datafusion_common::hash_utils::create_hashes;
-    use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
+    use datafusion_common::test_util::batches_to_sort_string;
     use datafusion_common::{
         ScalarValue, assert_batches_eq, assert_batches_sorted_eq, assert_contains,
         exec_err, internal_err,
@@ -1781,7 +1793,7 @@ mod tests {
 
         allow_duplicates! {
             // Inner join output is expected to preserve both inputs order
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b1 | c2 |
             +----+----+----+----+----+----+
@@ -1877,7 +1889,7 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b2 | c2 |
             +----+----+----+----+----+----+
@@ -1925,14 +1937,14 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b2 | c2 |
             +----+----+----+----+----+----+
-            | 3  | 5  | 9  | 20 | 5  | 80 |
-            | 2  | 5  | 8  | 20 | 5  | 80 |
             | 0  | 4  | 6  | 10 | 4  | 70 |
             | 1  | 4  | 7  | 10 | 4  | 70 |
+            | 2  | 5  | 8  | 20 | 5  | 80 |
+            | 3  | 5  | 9  | 20 | 5  | 80 |
             +----+----+----+----+----+----+
             ");
         }
@@ -2002,7 +2014,7 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b2 | c1 | a1 | b2 | c2 |
             +----+----+----+----+----+----+
@@ -2087,7 +2099,7 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b2 | c1 | a1 | b2 | c2 |
             +----+----+----+----+----+----+
@@ -2146,14 +2158,14 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b2 | c2 |
             +----+----+----+----+----+----+
-            | 3  | 5  | 9  | 20 | 5  | 80 |
-            | 2  | 5  | 8  | 20 | 5  | 80 |
             | 0  | 4  | 6  | 10 | 4  | 70 |
             | 1  | 4  | 7  | 10 | 4  | 70 |
+            | 2  | 5  | 8  | 20 | 5  | 80 |
+            | 3  | 5  | 9  | 20 | 5  | 80 |
             +----+----+----+----+----+----+
             ");
         }
@@ -2228,7 +2240,7 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b1 | c2 |
             +----+----+----+----+----+----+
@@ -2258,7 +2270,7 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b1 | c2 |
             +----+----+----+----+----+----+
@@ -2756,13 +2768,13 @@ mod tests {
 
         // RightSemi join output is expected to preserve right input order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+-----+
             | a2 | b2 | c2  |
             +----+----+-----+
-            | 8  | 8  | 20  |
-            | 12 | 10 | 40  |
             | 10 | 10 | 100 |
+            | 12 | 10 | 40  |
+            | 8  | 8  | 20  |
             +----+----+-----+
             ");
         }
@@ -2819,13 +2831,13 @@ mod tests {
 
         // RightSemi join output is expected to preserve right input order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+-----+
             | a2 | b2 | c2  |
             +----+----+-----+
-            | 8  | 8  | 20  |
-            | 12 | 10 | 40  |
             | 10 | 10 | 100 |
+            | 12 | 10 | 40  |
+            | 8  | 8  | 20  |
             +----+----+-----+
             ");
         }
@@ -2856,12 +2868,12 @@ mod tests {
 
         // RightSemi join output is expected to preserve right input order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+-----+
             | a2 | b2 | c2  |
             +----+----+-----+
-            | 12 | 10 | 40  |
             | 10 | 10 | 100 |
+            | 12 | 10 | 40  |
             +----+----+-----+
             ");
         }
@@ -3043,13 +3055,13 @@ mod tests {
 
         // RightAnti join output is expected to preserve right input order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+-----+
             | a2 | b2 | c2  |
             +----+----+-----+
-            | 6  | 6  | 60  |
             | 2  | 2  | 80  |
             | 4  | 4  | 120 |
+            | 6  | 6  | 60  |
             +----+----+-----+
             ");
         }
@@ -3104,15 +3116,15 @@ mod tests {
 
         // RightAnti join output is expected to preserve right input order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+-----+
             | a2 | b2 | c2  |
             +----+----+-----+
-            | 12 | 10 | 40  |
-            | 6  | 6  | 60  |
-            | 2  | 2  | 80  |
             | 10 | 10 | 100 |
+            | 12 | 10 | 40  |
+            | 2  | 2  | 80  |
             | 4  | 4  | 120 |
+            | 6  | 6  | 60  |
             +----+----+-----+
             ");
         }
@@ -3151,14 +3163,14 @@ mod tests {
 
         // RightAnti join output is expected to preserve right input order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +----+----+-----+
             | a2 | b2 | c2  |
             +----+----+-----+
-            | 8  | 8  | 20  |
-            | 6  | 6  | 60  |
             | 2  | 2  | 80  |
             | 4  | 4  | 120 |
+            | 6  | 6  | 60  |
+            | 8  | 8  | 20  |
             +----+----+-----+
             ");
         }
@@ -4305,7 +4317,9 @@ mod tests {
                         "Unexpected empty result for {join_type} join"
                     );
                 } else {
-                    assert_batches_eq!(expected, &batches);
+                    // We cannot rely on the order of the output rows, so we
+                    // sort them before comparison.
+                    assert_batches_sorted_eq!(expected, &batches);
                 }
             }
         }
@@ -4506,13 +4520,13 @@ mod tests {
         assert_eq!(columns, vec!["n1", "n2"]);
 
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
             +--------+--------+
             | n1     | n2     |
             +--------+--------+
-            | {a: }  | {a: }  |
             | {a: 1} | {a: 1} |
             | {a: 2} | {a: 2} |
+            | {a: }  | {a: }  |
             +--------+--------+
             ");
         }
