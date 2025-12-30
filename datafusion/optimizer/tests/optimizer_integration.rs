@@ -132,7 +132,7 @@ fn subquery_filter_with_cast() -> Result<()> {
       Inner Join:  Filter: CAST(test.col_int32 AS Float64) > __scalar_sq_1.avg(test.col_int32)
         TableScan: test projection=[col_int32]
         SubqueryAlias: __scalar_sq_1
-          Projection: sum(test.col_int32) / count(test.col_int32) AS avg(test.col_int32)
+          Projection: sum(test.col_int32) / CAST(count(test.col_int32) AS Float64) AS avg(test.col_int32)
             Aggregate: groupBy=[[]], aggr=[[sum(__common_expr_2 AS test.col_int32), count(__common_expr_2 AS test.col_int32)]]
               Projection: CAST(test.col_int32 AS Float64) AS __common_expr_2
                 Projection: test.col_int32

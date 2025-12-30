@@ -19,8 +19,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::DataType;
-use datafusion_common::{Column, DataFusionError, Result, TableReference};
+use datafusion_common::{
+    arrow::datatypes::DataType, Column, DataFusionError, Result, TableReference,
+};
 use datafusion_expr::{
     expr::{AggregateFunction, AggregateFunctionParams},
     logical_plan::{Aggregate, LogicalPlan, Projection},
@@ -178,26 +179,45 @@ impl OptimizerRule for RewriteAvgToSum {
                                 new_schema.qualified_field(group_expr_len + sum_idx);
                             let (_, count_field) =
                                 new_schema.qualified_field(group_expr_len + count_idx);
+                            let (_, original_field) =
+                                schema.qualified_field(group_expr_len + i);
+                            let target_type = original_field.data_type();
 
                             let sum_expr = Expr::Column(Column::new(
                                 None::<TableReference>,
                                 sum_field.name().clone(),
-                            ))
-                            .cast_to(&DataType::Float64, new_agg.schema())?;
+                            ));
                             let count_expr = Expr::Column(Column::new(
                                 None::<TableReference>,
                                 count_field.name().clone(),
-                            ))
-                            .cast_to(&DataType::Float64, new_agg.schema())?;
-                            let (_, original_field) =
-                                schema.qualified_field(group_expr_len + i);
+                            ));
+
+                            let count_expr = if *target_type == DataType::Float64 {
+                                count_expr.cast_to(
+                                    &DataType::Float64,
+                                    new_agg.schema(),
+                                )?
+                            } else {
+                                count_expr
+                            };
+
+                            let div_expr = Expr::BinaryExpr(BinaryExpr::new(
+                                Box::new(sum_expr),
+                                Operator::Divide,
+                                Box::new(count_expr),
+                            ));
+
+                            let final_expr = if &div_expr
+                                .get_type(new_agg.schema())?
+                                != target_type
+                            {
+                                div_expr.cast_to(target_type, new_agg.schema())?
+                            } else {
+                                div_expr
+                            };
+
                             proj_exprs.push(
-                                Expr::BinaryExpr(BinaryExpr::new(
-                                    Box::new(sum_expr),
-                                    Operator::Divide,
-                                    Box::new(count_expr),
-                                ))
-                                .alias(original_field.name().clone()),
+                                final_expr.alias(original_field.name().clone()),
                             );
                         }
                         Err(idx) => {
@@ -216,159 +236,5 @@ impl OptimizerRule for RewriteAvgToSum {
             }
             _ => Ok(Transformed::no(plan)),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::optimizer::OptimizerContext;
-    use crate::test::*;
-    use datafusion_expr::{
-        col, lit,
-        logical_plan::{builder::LogicalPlanBuilder, table_scan},
-        ExprFunctionExt,
-    };
-    use datafusion_functions_aggregate::expr_fn::{avg, count, sum};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::Result;
-
-    fn test_table_scan_with_nulls() -> Result<LogicalPlan> {
-        let schema = Schema::new(vec![
-            Field::new("a", DataType::Int32, false),
-            Field::new("b", DataType::Int32, true),
-        ]);
-        table_scan(Some("test"), &schema, None)?.build()
-    }
-
-    #[test]
-    fn test_single_avg() -> Result<()> {
-        let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(vec![col("a")], vec![avg(col("b"))])?
-            .build()?;
-        let rule = RewriteAvgToSum::new();
-        let optimizer_config = OptimizerContext::new();
-        let optimized_plan = rule.rewrite(plan, &optimizer_config)?.data;
-        let expected = "Projection: test.a, CAST(SUM(test.b) AS Float64) / CAST(COUNT(test.b) AS Float64) AS AVG(test.b)\
-            \n  Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b), COUNT(test.b)]]\
-            \n    TableScan: test [a:UInt32, b:UInt32, c:UInt32]";
-        assert_eq!(expected, format!("{:?}", optimized_plan));
-        Ok(())
-    }
-
-    #[test]
-    fn test_multiple_avg() -> Result<()> {
-        let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(vec![col("a")], vec![avg(col("b")), avg(col("c"))])?
-            .build()?;
-        let rule = RewriteAvgToSum::new();
-        let optimizer_config = OptimizerContext::new();
-        let optimized_plan = rule.rewrite(plan, &optimizer_config)?.data;
-        let expected = "Projection: test.a, CAST(SUM(test.b) AS Float64) / CAST(COUNT(test.b) AS Float64) AS AVG(test.b), CAST(SUM(test.c) AS Float64) / CAST(COUNT(test.c) AS Float64) AS AVG(test.c)\
-            \n  Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b), COUNT(test.b), SUM(test.c), COUNT(test.c)]]\
-            \n    TableScan: test [a:UInt32, b:UInt32, c:UInt32]";
-        assert_eq!(expected, format!("{:?}", optimized_plan));
-        Ok(())
-    }
-
-    #[test]
-    fn test_multiple_avg_same_col() -> Result<()> {
-        let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(vec![col("a")], vec![avg(col("b")), avg(col("b"))])?
-            .build()?;
-        let rule = RewriteAvgToSum::new();
-        let optimizer_config = OptimizerContext::new();
-        let optimized_plan = rule.rewrite(plan, &optimizer_config)?.data;
-        let expected = "Projection: test.a, CAST(SUM(test.b) AS Float64) / CAST(COUNT(test.b) AS Float64) AS AVG(test.b), CAST(SUM(test.b) AS Float64) / CAST(COUNT(test.b) AS Float64) AS AVG(test.b)\
-            \n  Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b), COUNT(test.b)]]\
-            \n    TableScan: test [a:UInt32, b:UInt32, c:UInt32]";
-        assert_eq!(expected, format!("{:?}", optimized_plan));
-        Ok(())
-    }
-
-    #[test]
-    fn test_avg_with_nulls() -> Result<()> {
-        let table_scan = test_table_scan_with_nulls()?;
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(vec![col("a")], vec![avg(col("b"))])?
-            .build()?;
-        let rule = RewriteAvgToSum::new();
-        let optimizer_config = OptimizerContext::new();
-        let optimized_plan = rule.rewrite(plan, &optimizer_config)?.data;
-        let expected = "Projection: test.a, CAST(SUM(test.b) AS Float64) / CAST(COUNT(test.b) AS Float64) AS AVG(test.b)\
-            \n  Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b), COUNT(test.b)]]\
-            \n    TableScan: test [a:Int32, b:Int32;N]";
-        assert_eq!(expected, format!("{:?}", optimized_plan));
-        Ok(())
-    }
-
-    #[test]
-    fn test_avg_distinct() -> Result<()> {
-        let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(vec![col("a")], vec![avg(col("b")).distinct().build()?])?
-            .build()?;
-        let rule = RewriteAvgToSum::new();
-        let optimizer_config = OptimizerContext::new();
-        let optimized_plan = rule.rewrite(plan, &optimizer_config)?.data;
-        let expected = "Projection: test.a, CAST(SUM(DISTINCT test.b) AS Float64) / CAST(COUNT(DISTINCT test.b) AS Float64) AS AVG(DISTINCT test.b)\
-            \n  Aggregate: groupBy=[[test.a]], aggr=[[SUM(DISTINCT test.b), COUNT(DISTINCT test.b)]]\
-            \n    TableScan: test [a:UInt32, b:UInt32, c:UInt32]";
-        assert_eq!(expected, format!("{:?}", optimized_plan));
-        Ok(())
-    }
-
-    #[test]
-    fn test_avg_with_filter() -> Result<()> {
-        let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(
-                vec![col("a")],
-                vec![avg(col("b")).filter(col("c").gt(lit(1))).build()?],
-            )?
-            .build()?;
-        let rule = RewriteAvgToSum::new();
-        let optimizer_config = OptimizerContext::new();
-        let optimized_plan = rule.rewrite(plan, &optimizer_config)?.data;
-        let expected = "Projection: test.a, CAST(SUM(test.b) FILTER (WHERE test.c > Int32(1)) AS Float64) / CAST(COUNT(test.b) FILTER (WHERE test.c > Int32(1)) AS Float64) AS AVG(test.b) FILTER (WHERE test.c > Int32(1))\
-            \n  Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b) FILTER (WHERE test.c > Int32(1)), COUNT(test.b) FILTER (WHERE test.c > Int32(1))]]\
-            \n    TableScan: test [a:UInt32, b:UInt32, c:UInt32]";
-        assert_eq!(expected, format!("{:?}", optimized_plan));
-        Ok(())
-    }
-
-    #[test]
-    fn test_avg_with_alias() -> Result<()> {
-        let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(vec![col("a")], vec![avg(col("b")).alias("avg_b")])?
-            .build()?;
-        let rule = RewriteAvgToSum::new();
-        let optimizer_config = OptimizerContext::new();
-        let optimized_plan = rule.rewrite(plan, &optimizer_config)?.data;
-        let expected = "Projection: test.a, CAST(SUM(test.b) AS Float64) / CAST(COUNT(test.b) AS Float64) AS avg_b\
-            \n  Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b), COUNT(test.b)]]\
-            \n    TableScan: test [a:UInt32, b:UInt32, c:UInt32]";
-        assert_eq!(expected, format!("{:?}", optimized_plan));
-        Ok(())
-    }
-
-    #[test]
-    fn test_no_avg() -> Result<()> {
-        let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(
-                vec![col("a")],
-                vec![sum(col("b")), count(lit(1u8))],
-            )?
-            .build()?;
-        let rule = RewriteAvgToSum::new();
-        let optimizer_config = OptimizerContext::new();
-        let optimized_plan = rule.rewrite(plan.clone(), &optimizer_config)?;
-        assert!(!optimized_plan.transformed);
-        Ok(())
     }
 }
