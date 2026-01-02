@@ -19,6 +19,7 @@
 //! is used to store the mapping between hash values based on the build side
 //! ["on" values] to a list of indices with this key's value.
 
+use std::any::Any;
 use std::fmt::{self, Debug};
 use std::ops::Sub;
 
@@ -129,6 +130,15 @@ pub trait JoinHashMapType: Send + Sync {
 
     /// Returns the number of entries in the join hash map.
     fn len(&self) -> usize;
+
+    /// Returns `true` if this hash map uses `u32` for indices.
+    fn is_u32(&self) -> bool;
+
+    /// Returns the capacity of the hash map.
+    fn capacity(&self) -> usize;
+
+    /// Returns this as `Any` so that it can be downcast to a specific implementation.
+    fn as_any(&self) -> &dyn Any;
 }
 
 pub struct JoinHashMapU32 {
@@ -147,7 +157,7 @@ impl JoinHashMapU32 {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             map: HashTable::with_capacity(cap),
-            next: vec![0; cap],
+            next: Vec::new(),
         }
     }
 }
@@ -159,7 +169,9 @@ impl Debug for JoinHashMapU32 {
 }
 
 impl JoinHashMapType for JoinHashMapU32 {
-    fn extend_zero(&mut self, _: usize) {}
+    fn extend_zero(&mut self, len: usize) {
+        self.next.resize(self.next.len() + len, 0)
+    }
 
     fn update_from_iter<'a>(
         &mut self,
@@ -203,6 +215,18 @@ impl JoinHashMapType for JoinHashMapU32 {
     fn len(&self) -> usize {
         self.map.len()
     }
+
+    fn is_u32(&self) -> bool {
+        true
+    }
+
+    fn capacity(&self) -> usize {
+        self.map.capacity()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 pub struct JoinHashMapU64 {
@@ -221,8 +245,19 @@ impl JoinHashMapU64 {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             map: HashTable::with_capacity(cap),
-            next: vec![0; cap],
+            next: Vec::new(),
         }
+    }
+
+    /// Merges the contents of a `JoinHashMapU32` into this `JoinHashMapU64`.
+    /// This is used when upgrading from `u32` to `u64` indices.
+    pub fn merge(&mut self, other: &JoinHashMapU32) {
+        self.map = HashTable::with_capacity(other.map.capacity());
+        for &(hash, index) in other.map.iter() {
+            self.map
+                .insert_unique(hash, (hash, index as u64), |(h, _)| *h);
+        }
+        self.next = other.next.iter().map(|&idx| idx as u64).collect();
     }
 }
 
@@ -233,7 +268,9 @@ impl Debug for JoinHashMapU64 {
 }
 
 impl JoinHashMapType for JoinHashMapU64 {
-    fn extend_zero(&mut self, _: usize) {}
+    fn extend_zero(&mut self, len: usize) {
+        self.next.resize(self.next.len() + len, 0);
+    }
 
     fn update_from_iter<'a>(
         &mut self,
@@ -276,6 +313,18 @@ impl JoinHashMapType for JoinHashMapU64 {
 
     fn len(&self) -> usize {
         self.map.len()
+    }
+
+    fn is_u32(&self) -> bool {
+        false
+    }
+
+    fn capacity(&self) -> usize {
+        self.map.capacity()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

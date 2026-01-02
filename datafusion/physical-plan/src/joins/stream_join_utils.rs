@@ -18,6 +18,7 @@
 //! This file contains common subroutines for symmetric hash join
 //! related functionality, used both in join calculations and optimization rules.
 
+use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::mem::size_of;
 use std::sync::Arc;
@@ -100,6 +101,18 @@ impl JoinHashMapType for PruningJoinHashMap {
 
     fn len(&self) -> usize {
         self.map.len()
+    }
+
+    fn is_u32(&self) -> bool {
+        false
+    }
+
+    fn capacity(&self) -> usize {
+        self.map.capacity()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
