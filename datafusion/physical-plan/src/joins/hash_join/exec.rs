@@ -59,7 +59,6 @@ use crate::{
 };
 
 use arrow::array::{ArrayRef, BooleanBufferBuilder};
-use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
@@ -1449,28 +1448,45 @@ async fn collect_left_input(
         Box::new(JoinHashMapU32::with_capacity(num_rows))
     };
 
-    let mut hashes_buffer = Vec::new();
-    let mut offset = 0;
+    // In a single pass, build the hash map and concatenate the batches into a single RecordBatch.
+    // This avoids a second pass over the data and a costly call to `concat_batches`.
+    let batch = if batches.is_empty() {
+        RecordBatch::new_empty(Arc::clone(&schema))
+    } else {
+        let mut hashes_buffer = Vec::new();
+        let mut offset = 0;
+        let num_columns = schema.fields().len();
+        let mut columns: Vec<Vec<ArrayRef>> =
+            vec![Vec::with_capacity(batches.len()); num_columns];
 
-    // Updating hashmap starting from the last batch
-    let batches_iter = batches.iter().rev();
-    for batch in batches_iter.clone() {
-        hashes_buffer.clear();
-        hashes_buffer.resize(batch.num_rows(), 0);
-        update_hash(
-            &on_left,
-            batch,
-            &mut *hashmap,
-            offset,
-            &random_state,
-            &mut hashes_buffer,
-            0,
-            true,
-        )?;
-        offset += batch.num_rows();
-    }
-    // Merge all batches into a single batch, so we can directly index into the arrays
-    let batch = concat_batches(&schema, batches_iter)?;
+        for batch in batches.iter().rev() {
+            hashes_buffer.clear();
+            hashes_buffer.resize(batch.num_rows(), 0);
+            update_hash(
+                &on_left,
+                batch,
+                &mut *hashmap,
+                offset,
+                &random_state,
+                &mut hashes_buffer,
+                0,
+                true,
+            )?;
+            offset += batch.num_rows();
+            for i in 0..num_columns {
+                columns[i].push(batch.column(i).clone());
+            }
+        }
+
+        let concatenated_columns = columns
+            .into_iter()
+            .map(|arrays| {
+                let arrays_to_concat: Vec<_> = arrays.iter().map(|a| a.as_ref()).collect();
+                arrow::compute::concat(&arrays_to_concat).map_err(Into::into)
+            })
+            .collect::<Result<Vec<ArrayRef>>>()?;
+        RecordBatch::try_new(Arc::clone(&schema), concatenated_columns)?
+    };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
