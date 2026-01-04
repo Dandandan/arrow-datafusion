@@ -58,12 +58,12 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{ArrayRef, BooleanBufferBuilder};
-use arrow::compute::concat_batches;
+use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
+use arrow::compute::concat;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
-use arrow_schema::DataType;
+use arrow_schema::{ArrowError, DataType};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
@@ -1451,10 +1451,8 @@ async fn collect_left_input(
 
     let mut hashes_buffer = Vec::new();
     let mut offset = 0;
-
-    // Updating hashmap starting from the last batch
-    let batches_iter = batches.iter().rev();
-    for batch in batches_iter.clone() {
+    // Build hash map from batches in reverse order
+    for batch in batches.iter().rev() {
         hashes_buffer.clear();
         hashes_buffer.resize(batch.num_rows(), 0);
         update_hash(
@@ -1469,8 +1467,24 @@ async fn collect_left_input(
         )?;
         offset += batch.num_rows();
     }
+
     // Merge all batches into a single batch, so we can directly index into the arrays
-    let batch = concat_batches(&schema, batches_iter)?;
+    let batch = if batches.is_empty() {
+        RecordBatch::new_empty(Arc::clone(&schema))
+    } else if batches.len() == 1 {
+        // Hitting this case means we can avoid a copy
+        batches.into_iter().next().unwrap()
+    } else {
+        let arrays = (0..schema.fields().len())
+            .map(|i| {
+                let arrays: Vec<&dyn Array> =
+                    batches.iter().rev().map(|b| b.column(i).as_ref()).collect();
+                concat(&arrays)
+            })
+            .collect::<Result<Vec<_>, ArrowError>>()?;
+        RecordBatch::try_new(Arc::clone(&schema), arrays)?
+    };
+
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
