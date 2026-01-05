@@ -1449,29 +1449,51 @@ async fn collect_left_input(
         Box::new(JoinHashMapU32::with_capacity(num_rows))
     };
 
-    let mut hashes_buffer = Vec::new();
-    let mut offset = 0;
-
-    // Updating hashmap starting from the last batch
-    let batches_iter = batches.iter().rev();
-    for batch in batches_iter.clone() {
-        hashes_buffer.clear();
-        hashes_buffer.resize(batch.num_rows(), 0);
+    let (batch, left_values) = if batches.is_empty() {
+        let batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+        (batch, left_values)
+    } else if batches.len() == 1 {
+        // FAST PATH for a single batch, avoids concat_batches call
+        let batch = batches.into_iter().next().unwrap();
+        let mut hashes_buffer = vec![0; batch.num_rows()];
         update_hash(
             &on_left,
-            batch,
+            &batch,
             &mut *hashmap,
-            offset,
+            0,
             &random_state,
             &mut hashes_buffer,
             0,
             true,
         )?;
-        offset += batch.num_rows();
-    }
-    // Merge all batches into a single batch, so we can directly index into the arrays
-    let batch = concat_batches(&schema, batches_iter)?;
-
+        let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+        (batch, left_values)
+    } else {
+        let mut hashes_buffer = Vec::new();
+        let mut offset = 0;
+        // Updating hashmap starting from the last batch
+        let batches_iter = batches.iter().rev();
+        for batch in batches_iter.clone() {
+            hashes_buffer.clear();
+            hashes_buffer.resize(batch.num_rows(), 0);
+            update_hash(
+                &on_left,
+                batch,
+                &mut *hashmap,
+                offset,
+                &random_state,
+                &mut hashes_buffer,
+                0,
+                true,
+            )?;
+            offset += batch.num_rows();
+        }
+        // Merge all batches into a single batch, so we can directly index into the arrays
+        let batch = concat_batches(&schema, batches_iter)?;
+        let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+        (batch, left_values)
+    };
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
         let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
@@ -1484,8 +1506,6 @@ async fn collect_left_input(
     } else {
         BooleanBufferBuilder::new(0)
     };
-
-    let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
 
     // Compute bounds for dynamic filter if enabled
     let bounds = match bounds_accumulators {
