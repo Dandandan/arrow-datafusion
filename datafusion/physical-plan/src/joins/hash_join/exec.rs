@@ -1474,28 +1474,56 @@ async fn collect_left_input(
         Box::new(JoinHashMapU32::with_capacity(num_rows))
     };
 
-    let mut hashes_buffer = Vec::new();
-    let mut offset = 0;
-
-    // Updating hashmap starting from the last batch
-    let batches_iter = batches.iter().rev();
-    for batch in batches_iter.clone() {
-        hashes_buffer.clear();
-        hashes_buffer.resize(batch.num_rows(), 0);
+    // Create a single batch and hash map of the build-side.
+    //
+    // If there is a single batch, we can create the hash map directly from it.
+    // This is a common case and this fast-path avoids the overhead of
+    // concatenating a single batch.
+    //
+    // If there are multiple batches, we must concatenate them into a single
+    // batch, and then create the hash map. The hash map stores indices
+    // into this single batch.
+    let batch = if batches.is_empty() {
+        RecordBatch::new_empty(Arc::clone(&schema))
+    } else if batches.len() == 1 {
+        // Fast path for a single batch, no need to concatenate
+        let single_batch = batches.into_iter().next().unwrap();
+        let mut hashes_buffer = vec![0; single_batch.num_rows()];
         update_hash(
             &on_left,
-            batch,
+            &single_batch,
             &mut *hashmap,
-            offset,
+            0, // offset
             &random_state,
             &mut hashes_buffer,
             0,
             true,
         )?;
-        offset += batch.num_rows();
-    }
-    // Merge all batches into a single batch, so we can directly index into the arrays
-    let batch = concat_batches(&schema, batches_iter)?;
+        single_batch
+    } else {
+        let mut hashes_buffer = Vec::new();
+        let mut offset = 0;
+
+        // Updating hashmap starting from the last batch
+        let batches_iter = batches.iter().rev();
+        for batch in batches_iter.clone() {
+            hashes_buffer.clear();
+            hashes_buffer.resize(batch.num_rows(), 0);
+            update_hash(
+                &on_left,
+                batch,
+                &mut *hashmap,
+                offset,
+                &random_state,
+                &mut hashes_buffer,
+                0,
+                true,
+            )?;
+            offset += batch.num_rows();
+        }
+        // Merge all batches into a single batch, so we can directly index into the arrays
+        concat_batches(&schema, batches_iter)?
+    };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
