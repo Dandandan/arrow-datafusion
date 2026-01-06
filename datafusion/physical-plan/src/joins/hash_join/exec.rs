@@ -1474,13 +1474,15 @@ async fn collect_left_input(
         Box::new(JoinHashMapU32::with_capacity(num_rows))
     };
 
-    let mut hashes_buffer = Vec::new();
+    // Pre-allocate a single buffer for hash calculations to avoid re-allocating
+    // in the loop
+    let max_rows = batches.iter().map(|b| b.num_rows()).max().unwrap_or(0);
+    let mut hashes_buffer = Vec::with_capacity(max_rows);
     let mut offset = 0;
 
     // Updating hashmap starting from the last batch
     let batches_iter = batches.iter().rev();
     for batch in batches_iter.clone() {
-        hashes_buffer.clear();
         hashes_buffer.resize(batch.num_rows(), 0);
         update_hash(
             &on_left,
