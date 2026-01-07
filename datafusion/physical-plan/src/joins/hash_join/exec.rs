@@ -83,8 +83,9 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 use ahash::RandomState;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
-use futures::TryStreamExt;
+use futures::{future::try_join_all, TryStreamExt};
 use parking_lot::Mutex;
+use tokio::task;
 
 use super::partitioned_hash_eval::SeededRandomState;
 
@@ -1474,28 +1475,45 @@ async fn collect_left_input(
         Box::new(JoinHashMapU32::with_capacity(num_rows))
     };
 
-    let mut hashes_buffer = Vec::new();
-    let mut offset = 0;
+    // `spawn_blocking` is used to compute hashes in parallel on a separate thread pool
+    // to avoid blocking the tokio thread pool.
+    let mut tasks = Vec::with_capacity(batches.len());
+    for batch in &batches {
+        let on_left_clone = on_left.clone();
+        let random_state_clone = random_state.clone();
+        let batch_clone = batch.clone();
+        tasks.push(task::spawn_blocking(move || {
+            let mut hashes_buffer = vec![0; batch_clone.num_rows()];
+            let on_left_values =
+                evaluate_expressions_to_arrays(&on_left_clone, &batch_clone)?;
+            datafusion_common::hash_utils::create_hashes(
+                &on_left_values,
+                &random_state_clone,
+                &mut hashes_buffer,
+            )?;
+            Ok(hashes_buffer)
+        }));
+    }
 
+    let hashes = try_join_all(tasks)
+        .await
+        .map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Hash join build failed: {e}"
+            ))
+        })?
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut offset = 0;
     // Updating hashmap starting from the last batch
-    let batches_iter = batches.iter().rev();
-    for batch in batches_iter.clone() {
-        hashes_buffer.clear();
-        hashes_buffer.resize(batch.num_rows(), 0);
-        update_hash(
-            &on_left,
-            batch,
-            &mut *hashmap,
-            offset,
-            &random_state,
-            &mut hashes_buffer,
-            0,
-            true,
-        )?;
+    for (batch, hashes_buffer) in batches.iter().rev().zip(hashes.into_iter().rev()) {
+        hashmap.write_hashes(hashes_buffer, offset)?;
         offset += batch.num_rows();
     }
+
     // Merge all batches into a single batch, so we can directly index into the arrays
-    let batch = concat_batches(&schema, batches_iter)?;
+    let batch = concat_batches(&schema, batches.iter().rev())?;
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
