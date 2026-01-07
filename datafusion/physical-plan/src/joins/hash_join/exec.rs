@@ -1452,6 +1452,26 @@ async fn collect_left_input(
         bounds_accumulators,
     } = state;
 
+    // A fast path for the case where there is only one batch on the build side,
+    // which is common in optimized plans.
+    if batches.len() == 1 {
+        let batch = batches.into_iter().next().unwrap();
+        let hash_map =
+            build_hash_map(&on_left, &batch, &random_state, &mut reservation, &metrics)?;
+        return build_join_left_data(
+            hash_map,
+            batch,
+            &on_left,
+            with_visited_indices_bitmap,
+            probe_threads_count,
+            reservation,
+            bounds_accumulators,
+            max_inlist_size,
+            max_inlist_distinct_values,
+            &metrics,
+        );
+    }
+
     // Estimation of memory size, required for hashtable, prior to allocation.
     // Final result can be verified using `RawTable.allocation_info()`
     let fixed_size_u32 = size_of::<JoinHashMapU32>();
@@ -1497,24 +1517,89 @@ async fn collect_left_input(
     // Merge all batches into a single batch, so we can directly index into the arrays
     let batch = concat_batches(&schema, batches_iter)?;
 
+    build_join_left_data(
+        hashmap.into(),
+        batch,
+        &on_left,
+        with_visited_indices_bitmap,
+        probe_threads_count,
+        reservation,
+        bounds_accumulators,
+        max_inlist_size,
+        max_inlist_distinct_values,
+        &metrics,
+    )
+}
+
+fn build_hash_map(
+    on_left: &[PhysicalExprRef],
+    batch: &RecordBatch,
+    random_state: &RandomState,
+    reservation: &mut MemoryReservation,
+    metrics: &BuildProbeJoinMetrics,
+) -> Result<Arc<dyn JoinHashMapType>> {
+    let num_rows = batch.num_rows();
+    let fixed_size_u32 = size_of::<JoinHashMapU32>();
+    let fixed_size_u64 = size_of::<JoinHashMapU64>();
+
+    let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
+        let estimated_hashtable_size =
+            estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+        reservation.try_grow(estimated_hashtable_size)?;
+        metrics.build_mem_used.add(estimated_hashtable_size);
+        Box::new(JoinHashMapU64::with_capacity(num_rows))
+    } else {
+        let estimated_hashtable_size =
+            estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+        reservation.try_grow(estimated_hashtable_size)?;
+        metrics.build_mem_used.add(estimated_hashtable_size);
+        Box::new(JoinHashMapU32::with_capacity(num_rows))
+    };
+
+    let mut hashes_buffer = vec![0; num_rows];
+    update_hash(
+        on_left,
+        batch,
+        &mut *hashmap,
+        0,
+        random_state,
+        &mut hashes_buffer,
+        0,
+        true,
+    )?;
+    Ok(hashmap.into())
+}
+
+#[expect(clippy::too_many_arguments)]
+fn build_join_left_data(
+    hash_map: Arc<dyn JoinHashMapType>,
+    batch: RecordBatch,
+    on_left: &[PhysicalExprRef],
+    with_visited_indices_bitmap: bool,
+    probe_threads_count: usize,
+    mut reservation: MemoryReservation,
+    bounds_accumulators: Option<Vec<CollectLeftAccumulator>>,
+    max_inlist_size: usize,
+    max_inlist_distinct_values: usize,
+    metrics: &BuildProbeJoinMetrics,
+) -> Result<JoinLeftData> {
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
         let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
         reservation.try_grow(bitmap_size)?;
         metrics.build_mem_used.add(bitmap_size);
-
         let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
-        bitmap_buffer.append_n(num_rows, false);
+        bitmap_buffer.append_n(batch.num_rows(), false);
         bitmap_buffer
     } else {
         BooleanBufferBuilder::new(0)
     };
 
-    let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+    let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
     // Compute bounds for dynamic filter if enabled
     let bounds = match bounds_accumulators {
-        Some(accumulators) if num_rows > 0 => {
+        Some(accumulators) if batch.num_rows() > 0 => {
             let bounds = accumulators
                 .into_iter()
                 .map(CollectLeftAccumulator::evaluate)
@@ -1524,8 +1609,7 @@ async fn collect_left_input(
         _ => None,
     };
 
-    // Convert Box to Arc for sharing with SharedBuildAccumulator
-    let hash_map: Arc<dyn JoinHashMapType> = hashmap.into();
+    let num_rows = batch.num_rows();
 
     let membership = if num_rows == 0 {
         PushdownStrategy::Empty
