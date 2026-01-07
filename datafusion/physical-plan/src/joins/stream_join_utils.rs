@@ -63,6 +63,10 @@ impl JoinHashMapType for PruningJoinHashMap {
         update_from_iter::<u64>(&mut self.map, slice, iter, deleted_offset);
     }
 
+    fn write_hashes(&mut self, _hashes: Vec<u64>, _offset: usize) -> Result<()> {
+        unimplemented!("write_hashes is not implemented for PruningJoinHashMap used in streaming joins")
+    }
+
     fn get_matched_indices<'a>(
         &self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,

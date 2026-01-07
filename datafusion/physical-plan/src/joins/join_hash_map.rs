@@ -23,6 +23,7 @@ use std::fmt::{self, Debug};
 use std::ops::Sub;
 
 use arrow::datatypes::ArrowNativeType;
+use datafusion_common::Result;
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry::{Occupied, Vacant};
 
@@ -109,6 +110,8 @@ pub trait JoinHashMapType: Send + Sync {
         deleted_offset: usize,
     );
 
+    fn write_hashes(&mut self, hashes: Vec<u64>, offset: usize) -> Result<()>;
+
     fn get_matched_indices<'a>(
         &self,
         iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
@@ -167,6 +170,10 @@ impl JoinHashMapType for JoinHashMapU32 {
         deleted_offset: usize,
     ) {
         update_from_iter::<u32>(&mut self.map, &mut self.next, iter, deleted_offset);
+    }
+
+    fn write_hashes(&mut self, hashes: Vec<u64>, offset: usize) -> Result<()> {
+        write_hashes(&mut self.map, &mut self.next, hashes, offset)
     }
 
     fn get_matched_indices<'a>(
@@ -241,6 +248,10 @@ impl JoinHashMapType for JoinHashMapU64 {
         deleted_offset: usize,
     ) {
         update_from_iter::<u64>(&mut self.map, &mut self.next, iter, deleted_offset);
+    }
+
+    fn write_hashes(&mut self, hashes: Vec<u64>, offset: usize) -> Result<()> {
+        write_hashes(&mut self.map, &mut self.next, hashes, offset)
     }
 
     fn get_matched_indices<'a>(
@@ -359,6 +370,41 @@ pub fn update_from_iter<'a, T>(
             }
         }
     }
+}
+
+pub fn write_hashes<T>(
+    map: &mut HashTable<(u64, T)>,
+    next: &mut [T],
+    hashes: Vec<u64>,
+    offset: usize,
+) -> Result<()>
+where
+    T: Copy + TryFrom<usize> + PartialOrd,
+    <T as TryFrom<usize>>::Error: Debug,
+{
+    for (row, hash_value) in hashes.iter().enumerate().rev() {
+        let entry = map.entry(
+            *hash_value,
+            |&(hash, _)| *hash_value == hash,
+            |&(hash, _)| hash,
+        );
+
+        match entry {
+            Occupied(mut occupied_entry) => {
+                // Already exists: add index to next array
+                let (_, index) = occupied_entry.get_mut();
+                let prev_index = *index;
+                // Store new value inside hashmap
+                *index = T::try_from(row + offset + 1).unwrap();
+                // Update chained Vec at `row` with previous value
+                next[row + offset] = prev_index;
+            }
+            Vacant(vacant_entry) => {
+                vacant_entry.insert((*hash_value, T::try_from(row + offset + 1).unwrap()));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn get_matched_indices<'a, T>(
