@@ -19,7 +19,8 @@
 //! is used to store the mapping between hash values based on the build side
 //! ["on" values] to a list of indices with this key's value.
 
-use std::fmt::{self, Debug};
+use std::any::Any;
+use std::fmt::Debug;
 use std::ops::Sub;
 
 use arrow::datatypes::ArrowNativeType;
@@ -129,13 +130,15 @@ pub trait JoinHashMapType: Send + Sync {
 
     /// Returns the number of entries in the join hash map.
     fn len(&self) -> usize;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 pub struct JoinHashMapU32 {
     // Stores hash value to last row index
-    map: HashTable<(u64, u32)>,
+    pub(crate) map: HashTable<(u64, u32)>,
     // Stores indices in chained list data structure
-    next: Vec<u32>,
+    pub(crate) next: Vec<u32>,
 }
 
 impl JoinHashMapU32 {
@@ -149,12 +152,6 @@ impl JoinHashMapU32 {
             map: HashTable::with_capacity(cap),
             next: vec![0; cap],
         }
-    }
-}
-
-impl Debug for JoinHashMapU32 {
-    fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
-        Ok(())
     }
 }
 
@@ -203,13 +200,17 @@ impl JoinHashMapType for JoinHashMapU32 {
     fn len(&self) -> usize {
         self.map.len()
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 pub struct JoinHashMapU64 {
     // Stores hash value to last row index
-    map: HashTable<(u64, u64)>,
+    pub(crate) map: HashTable<(u64, u64)>,
     // Stores indices in chained list data structure
-    next: Vec<u64>,
+    pub(crate) next: Vec<u64>,
 }
 
 impl JoinHashMapU64 {
@@ -223,12 +224,6 @@ impl JoinHashMapU64 {
             map: HashTable::with_capacity(cap),
             next: vec![0; cap],
         }
-    }
-}
-
-impl Debug for JoinHashMapU64 {
-    fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
-        Ok(())
     }
 }
 
@@ -277,8 +272,46 @@ impl JoinHashMapType for JoinHashMapU64 {
     fn len(&self) -> usize {
         self.map.len()
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
+pub fn write_hashes<T>(
+    map: &mut HashTable<(u64, T)>,
+    next: &mut [T],
+    hashes: &[u64],
+    offset: usize,
+) where
+    T: Copy + TryFrom<usize> + PartialOrd,
+    <T as TryFrom<usize>>::Error: Debug,
+{
+    for i in (0..hashes.len()).rev() {
+        let hash_value = hashes[i];
+        let row = offset + i;
+        let entry = map.entry(
+            hash_value,
+            |&(hash, _)| hash_value == hash,
+            |&(hash, _)| hash,
+        );
+
+        match entry {
+            Occupied(mut occupied_entry) => {
+                // Already exists: add index to next array
+                let (_, index) = occupied_entry.get_mut();
+                let prev_index = *index;
+                // Store new value inside hashmap
+                *index = T::try_from(row + 1).unwrap();
+                // Update chained Vec at `row` with previous value
+                next[row] = prev_index;
+            }
+            Vacant(vacant_entry) => {
+                vacant_entry.insert((hash_value, T::try_from(row + 1).unwrap()));
+            }
+        }
+    }
+}
 // Type of offsets for obtaining indices from JoinHashMap.
 pub(crate) type JoinHashMapOffset = (usize, Option<u64>);
 
