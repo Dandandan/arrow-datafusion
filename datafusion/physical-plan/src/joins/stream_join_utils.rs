@@ -46,6 +46,7 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
 
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use hashbrown::HashTable;
+use std::any::Any;
 
 /// Implementation of `JoinHashMapType` for `PruningJoinHashMap`.
 impl JoinHashMapType for PruningJoinHashMap {
@@ -100,6 +101,10 @@ impl JoinHashMapType for PruningJoinHashMap {
 
     fn len(&self) -> usize {
         self.map.len()
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

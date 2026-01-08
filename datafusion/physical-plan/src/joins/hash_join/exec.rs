@@ -34,10 +34,10 @@ use crate::joins::hash_join::shared_bounds::{
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
-use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
+use crate::joins::join_hash_map::{self, JoinHashMapU32, JoinHashMapU64};
 use crate::joins::utils::{
     OnceAsync, OnceFut, asymmetric_join_output_partitioning, reorder_output_after_swap,
-    swap_join_projection, update_hash,
+    swap_join_projection,
 };
 use crate::joins::{JoinOn, JoinOnRef, PartitionMode, SharedBitmapBuilder};
 use crate::projection::{
@@ -65,6 +65,7 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
 use arrow_schema::DataType;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, assert_or_internal_err, plan_err,
@@ -1331,7 +1332,10 @@ impl CollectLeftAccumulator {
 
 /// State for collecting the build-side data during hash join
 struct BuildSideState {
+    /// The batches from the build side
     batches: Vec<RecordBatch>,
+    /// The hashes for each batch
+    hashes: Vec<Vec<u64>>,
     num_rows: usize,
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
@@ -1343,20 +1347,23 @@ impl BuildSideState {
     fn try_new(
         metrics: BuildProbeJoinMetrics,
         reservation: MemoryReservation,
-        on_left: Vec<Arc<dyn PhysicalExpr>>,
+        on_left: &[Arc<dyn PhysicalExpr>],
         schema: &SchemaRef,
         should_compute_dynamic_filters: bool,
     ) -> Result<Self> {
         Ok(Self {
-            batches: Vec::new(),
+            batches: vec![],
+            hashes: vec![],
             num_rows: 0,
             metrics,
             reservation,
             bounds_accumulators: should_compute_dynamic_filters
                 .then(|| {
                     on_left
-                        .into_iter()
-                        .map(|expr| CollectLeftAccumulator::try_new(expr, schema))
+                        .iter()
+                        .map(|expr| {
+                            CollectLeftAccumulator::try_new(Arc::clone(expr), schema)
+                        })
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?,
@@ -1413,39 +1420,43 @@ async fn collect_left_input(
     let initial = BuildSideState::try_new(
         metrics,
         reservation,
-        on_left.clone(),
+        &on_left,
         &schema,
         should_compute_dynamic_filters,
     )?;
 
     let state = left_stream
-        .try_fold(initial, |mut state, batch| async move {
+        .try_fold(initial, |mut state, batch| async {
+            let batch_size = get_record_batch_memory_size(&batch);
+            // Reserve memory for incoming batch
+            state.reservation.try_grow(batch_size)?;
+            let values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+            // REVIEW: `hashes_buffer` will be re-allocated on each batch.
+            // We should analyze the cost of this against passing a buffer.
+            let mut hashes_buffer = vec![0; batch.num_rows()];
+            create_hashes(&values, &random_state, &mut hashes_buffer)?;
             // Update accumulators if computing bounds
             if let Some(ref mut accumulators) = state.bounds_accumulators {
                 for accumulator in accumulators {
                     accumulator.update_batch(&batch)?;
                 }
             }
-
-            // Decide if we spill or not
-            let batch_size = get_record_batch_memory_size(&batch);
-            // Reserve memory for incoming batch
-            state.reservation.try_grow(batch_size)?;
             // Update metrics
             state.metrics.build_mem_used.add(batch_size);
             state.metrics.build_input_batches.add(1);
             state.metrics.build_input_rows.add(batch.num_rows());
             // Update row count
             state.num_rows += batch.num_rows();
-            // Push batch to output
+            // Push batch and hashes to output
             state.batches.push(batch);
+            state.hashes.push(hashes_buffer);
             Ok(state)
         })
         .await?;
-
     // Extract fields from state
     let BuildSideState {
         batches,
+        hashes,
         num_rows,
         metrics,
         mut reservation,
@@ -1456,7 +1467,6 @@ async fn collect_left_input(
     // Final result can be verified using `RawTable.allocation_info()`
     let fixed_size_u32 = size_of::<JoinHashMapU32>();
     let fixed_size_u64 = size_of::<JoinHashMapU64>();
-
     // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
     // `u64` indice variant
     // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
@@ -1473,29 +1483,36 @@ async fn collect_left_input(
         metrics.build_mem_used.add(estimated_hashtable_size);
         Box::new(JoinHashMapU32::with_capacity(num_rows))
     };
-
-    let mut hashes_buffer = Vec::new();
     let mut offset = 0;
-
-    // Updating hashmap starting from the last batch
-    let batches_iter = batches.iter().rev();
-    for batch in batches_iter.clone() {
-        hashes_buffer.clear();
-        hashes_buffer.resize(batch.num_rows(), 0);
-        update_hash(
-            &on_left,
-            batch,
-            &mut *hashmap,
-            offset,
-            &random_state,
-            &mut hashes_buffer,
-            0,
-            true,
-        )?;
+    // Build a hash map from the batches collected.
+    // Build the hash map from the back to the front.
+    // This is to ensure the first row with a given key is joined in case of duplicated keys.
+    for (batch, hashes) in batches.iter().rev().zip(hashes.iter().rev()) {
+        // `write_hashes` will append to the existing hash map.
+        let hash_map_ref = hashmap.as_any_mut();
+        if let Some(hash_map_ref) = hash_map_ref.downcast_mut::<JoinHashMapU32>() {
+            join_hash_map::write_hashes(
+                &mut hash_map_ref.map,
+                &mut hash_map_ref.next,
+                hashes,
+                offset,
+            );
+        } else if let Some(hash_map_ref) =
+            hash_map_ref.downcast_mut::<JoinHashMapU64>()
+        {
+            join_hash_map::write_hashes(
+                &mut hash_map_ref.map,
+                &mut hash_map_ref.next,
+                hashes,
+                offset,
+            );
+        } else {
+            unreachable!();
+        }
         offset += batch.num_rows();
     }
     // Merge all batches into a single batch, so we can directly index into the arrays
-    let batch = concat_batches(&schema, batches_iter)?;
+    let batch = concat_batches(&schema, batches.iter().rev())?;
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
