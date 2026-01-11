@@ -1343,7 +1343,7 @@ impl BuildSideState {
     fn try_new(
         metrics: BuildProbeJoinMetrics,
         reservation: MemoryReservation,
-        on_left: Vec<Arc<dyn PhysicalExpr>>,
+        on_left: &[Arc<dyn PhysicalExpr>],
         schema: &SchemaRef,
         should_compute_dynamic_filters: bool,
     ) -> Result<Self> {
@@ -1355,8 +1355,10 @@ impl BuildSideState {
             bounds_accumulators: should_compute_dynamic_filters
                 .then(|| {
                     on_left
-                        .into_iter()
-                        .map(|expr| CollectLeftAccumulator::try_new(expr, schema))
+                        .iter()
+                        .map(|expr| {
+                            CollectLeftAccumulator::try_new(Arc::clone(expr), schema)
+                        })
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?,
@@ -1395,7 +1397,7 @@ impl BuildSideState {
 #[expect(clippy::too_many_arguments)]
 async fn collect_left_input(
     random_state: RandomState,
-    left_stream: SendableRecordBatchStream,
+    mut left_stream: SendableRecordBatchStream,
     on_left: Vec<PhysicalExprRef>,
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
@@ -1411,9 +1413,9 @@ async fn collect_left_input(
     // 1. creates a [JoinHashMap] of all batches from the stream
     // 2. stores the batches in a vector.
     let initial = BuildSideState::try_new(
-        metrics,
+        metrics.clone(),
         reservation,
-        on_left.clone(),
+        &on_left,
         &schema,
         should_compute_dynamic_filters,
     )?;
@@ -1447,9 +1449,9 @@ async fn collect_left_input(
     let BuildSideState {
         batches,
         num_rows,
-        metrics,
         mut reservation,
         bounds_accumulators,
+        ..
     } = state;
 
     // Estimation of memory size, required for hashtable, prior to allocation.
@@ -1478,8 +1480,7 @@ async fn collect_left_input(
     let mut offset = 0;
 
     // Updating hashmap starting from the last batch
-    let batches_iter = batches.iter().rev();
-    for batch in batches_iter.clone() {
+    for batch in batches.iter().rev() {
         hashes_buffer.clear();
         hashes_buffer.resize(batch.num_rows(), 0);
         update_hash(
@@ -1494,8 +1495,16 @@ async fn collect_left_input(
         )?;
         offset += batch.num_rows();
     }
-    // Merge all batches into a single batch, so we can directly index into the arrays
-    let batch = concat_batches(&schema, batches_iter)?;
+
+    // Merge all batches into a single batch, so we can directly index into the arrays.
+    // If there is a single batch, we can avoid the concatenation.
+    let batch = if batches.is_empty() {
+        RecordBatch::new_empty(Arc::clone(&schema))
+    } else if batches.len() == 1 {
+        batches.into_iter().next().unwrap()
+    } else {
+        concat_batches(&schema, batches.iter().rev())?
+    };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
