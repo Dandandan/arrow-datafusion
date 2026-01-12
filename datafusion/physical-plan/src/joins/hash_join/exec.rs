@@ -50,9 +50,9 @@ use crate::projection::{
 use crate::repartition::REPARTITION_RANDOM_STATE;
 use crate::spill::get_record_batch_memory_size;
 use crate::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
-    PlanProperties, SendableRecordBatchStream, Statistics,
-    common::can_project,
+    common::can_project, DisplayAs, DisplayFormatType, Distribution,
+    EmptyRecordBatchStream, ExecutionPlan, Partitioning, PlanProperties,
+    RecordBatchStream, SendableRecordBatchStream, Statistics,
     joins::utils::{
         BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinHashMapType,
         build_join_schema, check_join_is_valid, estimate_join_statistics,
@@ -87,9 +87,42 @@ use ahash::RandomState;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::TryStreamExt;
+use futures::stream::select_all;
+use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use super::partitioned_hash_eval::SeededRandomState;
+
+struct MergedStream {
+    streams: futures::stream::SelectAll<SendableRecordBatchStream>,
+}
+
+impl MergedStream {
+    fn new(streams: Vec<SendableRecordBatchStream>) -> Self {
+        Self {
+            streams: select_all(streams),
+        }
+    }
+}
+
+impl Stream for MergedStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.streams.poll_next_unpin(cx)
+    }
+}
+
+impl RecordBatchStream for MergedStream {
+    fn schema(&self) -> SchemaRef {
+        self.streams.iter().next().unwrap().schema()
+    }
+}
 
 /// Hard-coded seed to ensure hash values from the hash join differ from `RepartitionExec`, avoiding collisions.
 pub(crate) const HASH_JOIN_SEED: SeededRandomState =
@@ -918,7 +951,7 @@ impl ExecutionPlan for HashJoinExec {
     fn required_input_distribution(&self) -> Vec<Distribution> {
         match self.mode {
             PartitionMode::CollectLeft => vec![
-                Distribution::SinglePartition,
+                Distribution::UnspecifiedDistribution,
                 Distribution::UnspecifiedDistribution,
             ],
             PartitionMode::Partitioned => {
@@ -1042,12 +1075,6 @@ impl ExecutionPlan for HashJoinExec {
              consider using RepartitionExec"
         );
 
-        assert_or_internal_err!(
-            self.mode != PartitionMode::CollectLeft || left_partitions == 1,
-            "Invalid HashJoinExec, the output partition count of the left child must be 1 in CollectLeft mode,\
-             consider using CoalescePartitionsExec or the EnforceDistribution rule"
-        );
-
         // Only enable dynamic filter pushdown if:
         // - The session config enables dynamic filter pushdown
         // - A dynamic filter exists
@@ -1071,7 +1098,34 @@ impl ExecutionPlan for HashJoinExec {
 
         let left_fut = match self.mode {
             PartitionMode::CollectLeft => self.left_fut.try_once(|| {
-                let left_stream = self.left.execute(0, Arc::clone(&context))?;
+                let left_schema = self.left.schema();
+                // If there are no partitions on the left side, return an empty stream
+                if self.left.output_partitioning().partition_count() == 0 {
+                    let reservation = MemoryConsumer::new("HashJoinInput")
+                        .register(context.memory_pool());
+                    return Ok(collect_left_input(
+                        self.random_state.random_state().clone(),
+                        Box::pin(EmptyRecordBatchStream::new(left_schema)),
+                        on_left,
+                        join_metrics.clone(),
+                        reservation,
+                        need_produce_result_in_final(self.join_type),
+                        self.right().output_partitioning().partition_count(),
+                        enable_dynamic_filter_pushdown,
+                        Arc::clone(context.session_config().options()),
+                        self.null_equality,
+                        array_map_created_count,
+                    ));
+                };
+
+                // Execute all partitions and merge them into a single stream
+                let left_partitions =
+                    self.left.output_partitioning().partition_count();
+                let mut streams = Vec::with_capacity(left_partitions);
+                for i in 0..left_partitions {
+                    streams.push(self.left.execute(i, Arc::clone(&context))?);
+                }
+                let left_stream = Box::pin(MergedStream::new(streams));
 
                 let reservation =
                     MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
@@ -1175,7 +1229,7 @@ impl ExecutionPlan for HashJoinExec {
             self.join_type,
             right_stream,
             self.random_state.random_state().clone(),
-            join_metrics,
+            join_metrics.clone(),
             column_indices_after_projection,
             self.null_equality,
             HashJoinStreamState::WaitBuildSide,
@@ -2617,7 +2671,7 @@ mod tests {
             ("b2", &vec![4, 5, 6]),
             ("c2", &vec![70, 80, 90]),
         );
-        let on = vec![(
+        let on: JoinOn = vec![(
             Arc::new(Column::new_with_schema("b1", &left.schema()).unwrap()) as _,
             Arc::new(Column::new_with_schema("b2", &right.schema()).unwrap()) as _,
         )];
@@ -2720,7 +2774,7 @@ mod tests {
             ("c1", &vec![7, 8, 9]),
         );
         let right = build_table_i32(("a2", &vec![]), ("b2", &vec![]), ("c2", &vec![]));
-        let on = vec![(
+        let on: JoinOn = vec![(
             Arc::new(Column::new_with_schema("b1", &left.schema()).unwrap()) as _,
             Arc::new(Column::new_with_schema("b2", &right.schema()).unwrap()) as _,
         )];
@@ -3644,7 +3698,7 @@ mod tests {
             ("b2", &vec![4, 5, 6]),
             ("c2", &vec![70, 80, 90]),
         );
-        let on = vec![(
+        let on: JoinOn = vec![(
             Arc::new(Column::new_with_schema("b1", &left.schema()).unwrap()) as _,
             Arc::new(Column::new_with_schema("b2", &right.schema()).unwrap()) as _,
         )];
@@ -4351,7 +4405,7 @@ mod tests {
             ("b2", &vec![4, 5, 6]),
             ("c2", &vec![70, 80, 90]),
         );
-        let on = vec![(
+        let on: JoinOn = vec![(
             Arc::new(Column::new_with_schema("b1", &left.schema()).unwrap()) as _,
             Arc::new(Column::new_with_schema("b2", &right.schema()).unwrap()) as _,
         )];
@@ -5317,6 +5371,161 @@ mod tests {
         );
 
         assert_phj_used(&metrics, false);
+
+        Ok(())
+    }
+
+    /// Test for parallelized HashJoinExec with PartitionMode::CollectLeft and multi-partitioned left input
+    #[tokio::test]
+    async fn test_collect_left_multiple_partitions_join_no_coalesce() -> Result<()> {
+        let task_ctx = Arc::new(TaskContext::default());
+        let batch1 = build_table_i32(
+            ("a1", &vec![1, 2]),
+            ("b1", &vec![4, 5]),
+            ("c1", &vec![7, 8]),
+        );
+        let batch2 =
+            build_table_i32(("a1", &vec![3]), ("b1", &vec![7]), ("c1", &vec![9]));
+        let schema = batch1.schema();
+        let left: Arc<dyn ExecutionPlan> = Arc::new(
+            TestMemoryExec::try_new(&[vec![batch1], vec![batch2]], schema, None)
+                .unwrap(),
+        );
+
+        let right = build_table(
+            ("a2", &vec![10, 20, 30]),
+            ("b2", &vec![4, 5, 6]),
+            ("c2", &vec![70, 80, 90]),
+        );
+        let on: JoinOn = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema()).unwrap()) as _,
+            Arc::new(Column::new_with_schema("b2", &right.schema()).unwrap()) as _,
+        )];
+
+        let expected_inner = vec![
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 1  | 4  | 7  | 10 | 4  | 70 |",
+            "| 2  | 5  | 8  | 20 | 5  | 80 |",
+            "+----+----+----+----+----+----+",
+        ];
+        let expected_left = vec![
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 1  | 4  | 7  | 10 | 4  | 70 |",
+            "| 2  | 5  | 8  | 20 | 5  | 80 |",
+            "| 3  | 7  | 9  |    |    |    |",
+            "+----+----+----+----+----+----+",
+        ];
+        let expected_right = vec![
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "|    |    |    | 30 | 6  | 90 |",
+            "| 1  | 4  | 7  | 10 | 4  | 70 |",
+            "| 2  | 5  | 8  | 20 | 5  | 80 |",
+            "+----+----+----+----+----+----+",
+        ];
+        let expected_full = vec![
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "|    |    |    | 30 | 6  | 90 |",
+            "| 1  | 4  | 7  | 10 | 4  | 70 |",
+            "| 2  | 5  | 8  | 20 | 5  | 80 |",
+            "| 3  | 7  | 9  |    |    |    |",
+            "+----+----+----+----+----+----+",
+        ];
+        let expected_left_semi = vec![
+            "+----+----+----+",
+            "| a1 | b1 | c1 |",
+            "+----+----+----+",
+            "| 1  | 4  | 7  |",
+            "| 2  | 5  | 8  |",
+            "+----+----+----+",
+        ];
+        let expected_left_anti = vec![
+            "+----+----+----+",
+            "| a1 | b1 | c1 |",
+            "+----+----+----+",
+            "| 3  | 7  | 9  |",
+            "+----+----+----+",
+        ];
+        let expected_right_semi = vec![
+            "+----+----+----+",
+            "| a2 | b2 | c2 |",
+            "+----+----+----+",
+            "| 10 | 4  | 70 |",
+            "| 20 | 5  | 80 |",
+            "+----+----+----+",
+        ];
+        let expected_right_anti = vec![
+            "+----+----+----+",
+            "| a2 | b2 | c2 |",
+            "+----+----+----+",
+            "| 30 | 6  | 90 |",
+            "+----+----+----+",
+        ];
+        let expected_left_mark = vec![
+            "+----+----+----+-------+",
+            "| a1 | b1 | c1 | mark  |",
+            "+----+----+----+-------+",
+            "| 1  | 4  | 7  | true  |",
+            "| 2  | 5  | 8  | true  |",
+            "| 3  | 7  | 9  | false |",
+            "+----+----+----+-------+",
+        ];
+        let expected_right_mark = vec![
+            "+----+----+----+-------+",
+            "| a2 | b2 | c2 | mark  |",
+            "+----+----+----+-------+",
+            "| 10 | 4  | 70 | true  |",
+            "| 20 | 5  | 80 | true  |",
+            "| 30 | 6  | 90 | false |",
+            "+----+----+----+-------+",
+        ];
+
+        let test_cases = vec![
+            (JoinType::Inner, expected_inner),
+            (JoinType::Left, expected_left),
+            (JoinType::Right, expected_right),
+            (JoinType::Full, expected_full),
+            (JoinType::LeftSemi, expected_left_semi),
+            (JoinType::LeftAnti, expected_left_anti),
+            (JoinType::RightSemi, expected_right_semi),
+            (JoinType::RightAnti, expected_right_anti),
+            (JoinType::LeftMark, expected_left_mark),
+            (JoinType::RightMark, expected_right_mark),
+        ];
+
+        for (join_type, expected) in test_cases {
+            let partition_count = 2;
+            let right_repartitioned: Arc<dyn ExecutionPlan> =
+                Arc::new(RepartitionExec::try_new(
+                    right.clone(),
+                    Partitioning::Hash(vec![on[0].1.clone()], partition_count),
+                )?);
+            let join = HashJoinExec::try_new(
+                Arc::clone(&left),
+                right_repartitioned,
+                on.clone(),
+                None,
+                &join_type,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+            )?;
+
+            let mut batches = vec![];
+            for i in 0..join.properties().output_partitioning().partition_count() {
+                let stream = join.execute(i, Arc::clone(&task_ctx))?;
+                let more_batches = common::collect(stream).await?;
+                batches.extend(more_batches.into_iter().filter(|b| b.num_rows() > 0));
+            }
+            assert_batches_sorted_eq!(expected, &batches);
+        }
 
         Ok(())
     }
