@@ -1478,8 +1478,7 @@ async fn collect_left_input(
     let mut offset = 0;
 
     // Updating hashmap starting from the last batch
-    let batches_iter = batches.iter().rev();
-    for batch in batches_iter.clone() {
+    for batch in batches.iter().rev() {
         hashes_buffer.clear();
         hashes_buffer.resize(batch.num_rows(), 0);
         update_hash(
@@ -1494,8 +1493,23 @@ async fn collect_left_input(
         )?;
         offset += batch.num_rows();
     }
-    // Merge all batches into a single batch, so we can directly index into the arrays
-    let batch = concat_batches(&schema, batches_iter)?;
+
+    // Merge all batches into a single batch, so we can directly index into the arrays.
+    // Note that we are processing build batches in reverse order.
+    //
+    // ⚡🗑️: This avoids creating a new single `RecordBatch` from a `Vec` of `RecordBatch`es
+    // which has a significant cost.
+    let batch = match batches.len() {
+        0 => {
+            // `concat_batches` panics if slices is empty, so we need to handle this case
+            RecordBatch::new_empty(Arc::clone(&schema))
+        }
+        1 => {
+            // If there is only one batch, we can avoid the cost of `concat_batches`
+            batches.into_iter().next().unwrap()
+        }
+        _ => concat_batches(&schema, batches.iter().rev())?,
+    };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
