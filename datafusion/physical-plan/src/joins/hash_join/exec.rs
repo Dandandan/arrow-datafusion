@@ -919,7 +919,7 @@ impl ExecutionPlan for HashJoinExec {
     fn required_input_distribution(&self) -> Vec<Distribution> {
         match self.mode {
             PartitionMode::CollectLeft => vec![
-                Distribution::UnspecifiedDistribution,
+                Distribution::SinglePartition,
                 Distribution::UnspecifiedDistribution,
             ],
             PartitionMode::Partitioned => {
