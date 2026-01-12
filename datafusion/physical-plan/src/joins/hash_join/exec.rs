@@ -201,14 +201,14 @@ impl JoinLeftData {
 ///    Resulting hash table stores hashed join-key fields for each row as a key, and
 ///    indices of corresponding rows in concatenated batch.
 ///
-/// Hash join uses LIFO data structure as a hash table, and in order to retain
-/// original build-side input order while obtaining data during probe phase, hash
-/// table is updated by iterating batch sequence in reverse order -- it allows to
-/// keep rows with smaller indices "on the top" of hash table, and still maintain
-/// correct indexing for concatenated build-side data batch.
+/// The hash table is built by iterating through the batches in the order they
+/// arrive from the input. Within each batch, rows are processed in reverse order.
+/// For duplicate keys, this means the first row encountered in the input will be
+/// the first one found during probing. After populating the hash map, the build-side
+/// batches are concatenated into a single `RecordBatch` to allow for efficient
+/// row access.
 ///
 /// Example of build phase for 3 record batches:
-///
 ///
 /// ```text
 ///
@@ -216,23 +216,23 @@ impl JoinLeftData {
 ///                                                                         ┌───────────────────────────┐
 ///                             hashmap.insert(row-hash, row-idx + offset)  │                      idx  │
 ///            ┌───────┐                                                    │          ┌───────┐        │
-///            │ Row 1 │        1) update_hash for batch 3 with offset 0    │          │ Row 6 │    0   │
-///   Batch 1  │       │           - hashmap.insert(Row 7, idx 1)           │ Batch 3  │       │        │
-///            │ Row 2 │           - hashmap.insert(Row 6, idx 0)           │          │ Row 7 │    1   │
+///            │ Row 1 │        1) update_hash for batch 1 with offset 0    │          │ Row 1 │    0   │
+///   Batch 1  │       │           - hashmap.insert(Row 1, idx 0)           │ Batch 1  │       │        │
+///            │ Row 2 │           - hashmap.insert(Row 2, idx 1)           │          │ Row 2 │    1   │
 ///            └───────┘                                                    │          └───────┘        │
 ///                                                                         │                           │
 ///            ┌───────┐                                                    │          ┌───────┐        │
 ///            │ Row 3 │        2) update_hash for batch 2 with offset 2    │          │ Row 3 │    2   │
-///            │       │           - hashmap.insert(Row 5, idx 4)           │          │       │        │
-///   Batch 2  │ Row 4 │           - hashmap.insert(Row 4, idx 3)           │ Batch 2  │ Row 4 │    3   │
 ///            │       │           - hashmap.insert(Row 3, idx 2)           │          │       │        │
+///   Batch 2  │ Row 4 │           - hashmap.insert(Row 4, idx 3)           │ Batch 2  │ Row 4 │    3   │
+///            │       │           - hashmap.insert(Row 5, idx 4)           │          │       │        │
 ///            │ Row 5 │                                                    │          │ Row 5 │    4   │
 ///            └───────┘                                                    │          └───────┘        │
 ///                                                                         │                           │
 ///            ┌───────┐                                                    │          ┌───────┐        │
-///            │ Row 6 │        3) update_hash for batch 1 with offset 5    │          │ Row 1 │    5   │
-///   Batch 3  │       │           - hashmap.insert(Row 2, idx 6)           │ Batch 1  │       │        │
-///            │ Row 7 │           - hashmap.insert(Row 1, idx 5)           │          │ Row 2 │    6   │
+///            │ Row 6 │        3) update_hash for batch 3 with offset 5    │          │ Row 6 │    5   │
+///   Batch 3  │       │           - hashmap.insert(Row 6, idx 5)           │ Batch 3  │       │        │
+///            │ Row 7 │           - hashmap.insert(Row 7, idx 6)           │          │ Row 7 │    6   │
 ///            └───────┘                                                    │          └───────┘        │
 ///                                                                         │                           │
 ///                                                                         └───────────────────────────┘
@@ -1330,36 +1330,57 @@ impl CollectLeftAccumulator {
 }
 
 /// State for collecting the build-side data during hash join
-struct BuildSideState {
+struct BuildSideState<'a> {
+    /// Holds batches for future processing
     batches: Vec<RecordBatch>,
+    /// Number of rows in all batches
     num_rows: usize,
+    /// Join metrics
     metrics: BuildProbeJoinMetrics,
+    /// Memory reservation
     reservation: MemoryReservation,
+    /// Accumulators for bounds computation
     bounds_accumulators: Option<Vec<CollectLeftAccumulator>>,
+    /// Hash map for the join
+    hashmap: Box<dyn JoinHashMapType>,
+    /// Buffer for hash values
+    hashes_buffer: Vec<u64>,
+    /// Random state for hashing
+    random_state: &'a RandomState,
+    /// Join key columns
+    on_left: &'a [Arc<dyn PhysicalExpr>],
 }
 
-impl BuildSideState {
+impl<'a> BuildSideState<'a> {
     /// Create a new BuildSideState with optional accumulators for bounds computation
     fn try_new(
         metrics: BuildProbeJoinMetrics,
         reservation: MemoryReservation,
-        on_left: Vec<Arc<dyn PhysicalExpr>>,
+        on_left: &'a [Arc<dyn PhysicalExpr>],
         schema: &SchemaRef,
         should_compute_dynamic_filters: bool,
+        random_state: &'a RandomState,
     ) -> Result<Self> {
+        let bounds_accumulators = if should_compute_dynamic_filters {
+            Some(
+                on_left
+                    .iter()
+                    .map(|expr| CollectLeftAccumulator::try_new(Arc::clone(expr), schema))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             batches: Vec::new(),
             num_rows: 0,
             metrics,
             reservation,
-            bounds_accumulators: should_compute_dynamic_filters
-                .then(|| {
-                    on_left
-                        .into_iter()
-                        .map(|expr| CollectLeftAccumulator::try_new(expr, schema))
-                        .collect::<Result<Vec<_>>>()
-                })
-                .transpose()?,
+            bounds_accumulators,
+            hashmap: Box::new(JoinHashMapU32::with_capacity(0)),
+            hashes_buffer: Vec::new(),
+            random_state,
+            on_left,
         })
     }
 }
@@ -1406,103 +1427,96 @@ async fn collect_left_input(
     max_inlist_distinct_values: usize,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
-
-    // This operation performs 2 steps at once:
-    // 1. creates a [JoinHashMap] of all batches from the stream
-    // 2. stores the batches in a vector.
     let initial = BuildSideState::try_new(
         metrics,
         reservation,
-        on_left.clone(),
+        &on_left,
         &schema,
         should_compute_dynamic_filters,
+        &random_state,
     )?;
 
     let state = left_stream
         .try_fold(initial, |mut state, batch| async move {
-            // Update accumulators if computing bounds
+            let batch_size = get_record_batch_memory_size(&batch);
+            state.reservation.try_grow(batch_size)?;
+            state.metrics.build_mem_used.add(batch_size);
+            state.metrics.build_input_batches.add(1);
+            state.metrics.build_input_rows.add(batch.num_rows());
+
             if let Some(ref mut accumulators) = state.bounds_accumulators {
                 for accumulator in accumulators {
                     accumulator.update_batch(&batch)?;
                 }
             }
-
-            // Decide if we spill or not
-            let batch_size = get_record_batch_memory_size(&batch);
-            // Reserve memory for incoming batch
-            state.reservation.try_grow(batch_size)?;
-            // Update metrics
-            state.metrics.build_mem_used.add(batch_size);
-            state.metrics.build_input_batches.add(1);
-            state.metrics.build_input_rows.add(batch.num_rows());
-            // Update row count
+            let offset = state.num_rows;
             state.num_rows += batch.num_rows();
-            // Push batch to output
+
+            if state.num_rows > u32::MAX as usize && state.hashmap.is_u32() {
+                let fixed_size_u64 = size_of::<JoinHashMapU64>();
+                let estimated_hashtable_size =
+                    estimate_memory_size::<(u64, u64)>(state.num_rows, fixed_size_u64)?;
+                state.reservation.try_grow(estimated_hashtable_size)?;
+                state
+                    .metrics
+                    .build_mem_used
+                    .add(estimated_hashtable_size);
+                let mut new_hash_map =
+                    JoinHashMapU64::with_capacity(state.hashmap.capacity());
+                new_hash_map.merge(
+                    state
+                        .hashmap
+                        .as_any()
+                        .downcast_ref::<JoinHashMapU32>()
+                        .unwrap(),
+                );
+                state.hashmap = Box::new(new_hash_map);
+            } else if state.hashmap.capacity() == 0 {
+                let fixed_size_u32 = size_of::<JoinHashMapU32>();
+                let estimated_hashtable_size =
+                    estimate_memory_size::<(u32, u64)>(state.num_rows, fixed_size_u32)?;
+                state.reservation.try_grow(estimated_hashtable_size)?;
+                state
+                    .metrics
+                    .build_mem_used
+                    .add(estimated_hashtable_size);
+                state.hashmap = Box::new(JoinHashMapU32::with_capacity(state.num_rows));
+            }
+            state.hashmap.extend_zero(batch.num_rows());
+            state.hashes_buffer.clear();
+            state.hashes_buffer.resize(batch.num_rows(), 0);
+
+            update_hash(
+                state.on_left,
+                &batch,
+                &mut *state.hashmap,
+                offset,
+                state.random_state,
+                &mut state.hashes_buffer,
+                0,
+                true,
+            )?;
+
             state.batches.push(batch);
             Ok(state)
         })
         .await?;
 
-    // Extract fields from state
     let BuildSideState {
         batches,
         num_rows,
-        metrics,
         mut reservation,
         bounds_accumulators,
+        hashmap,
+        ..
     } = state;
 
-    // Estimation of memory size, required for hashtable, prior to allocation.
-    // Final result can be verified using `RawTable.allocation_info()`
-    let fixed_size_u32 = size_of::<JoinHashMapU32>();
-    let fixed_size_u64 = size_of::<JoinHashMapU64>();
+    let batch = concat_batches(&schema, &batches)?;
 
-    // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
-    // `u64` indice variant
-    // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
-    let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
-        let estimated_hashtable_size =
-            estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-        reservation.try_grow(estimated_hashtable_size)?;
-        metrics.build_mem_used.add(estimated_hashtable_size);
-        Box::new(JoinHashMapU64::with_capacity(num_rows))
-    } else {
-        let estimated_hashtable_size =
-            estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-        reservation.try_grow(estimated_hashtable_size)?;
-        metrics.build_mem_used.add(estimated_hashtable_size);
-        Box::new(JoinHashMapU32::with_capacity(num_rows))
-    };
-
-    let mut hashes_buffer = Vec::new();
-    let mut offset = 0;
-
-    // Updating hashmap starting from the last batch
-    let batches_iter = batches.iter().rev();
-    for batch in batches_iter.clone() {
-        hashes_buffer.clear();
-        hashes_buffer.resize(batch.num_rows(), 0);
-        update_hash(
-            &on_left,
-            batch,
-            &mut *hashmap,
-            offset,
-            &random_state,
-            &mut hashes_buffer,
-            0,
-            true,
-        )?;
-        offset += batch.num_rows();
-    }
-    // Merge all batches into a single batch, so we can directly index into the arrays
-    let batch = concat_batches(&schema, batches_iter)?;
-
-    // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
         let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
         reservation.try_grow(bitmap_size)?;
-        metrics.build_mem_used.add(bitmap_size);
-
+        state.metrics.build_mem_used.add(bitmap_size);
         let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
         bitmap_buffer.append_n(num_rows, false);
         bitmap_buffer
@@ -1806,13 +1820,13 @@ mod tests {
 
         allow_duplicates! {
             // Inner join output is expected to preserve both inputs order
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_string(&batches), @"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b1 | c2 |
             +----+----+----+----+----+----+
             | 1  | 4  | 7  | 10 | 4  | 70 |
-            | 2  | 5  | 8  | 20 | 5  | 80 |
             | 3  | 5  | 9  | 20 | 5  | 80 |
+            | 2  | 5  | 8  | 20 | 5  | 80 |
             +----+----+----+----+----+----+
             ");
         }
@@ -1902,13 +1916,13 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_string(&batches), @"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b2 | c2 |
             +----+----+----+----+----+----+
             | 1  | 4  | 7  | 10 | 4  | 70 |
-            | 2  | 5  | 8  | 20 | 5  | 80 |
             | 3  | 5  | 9  | 20 | 5  | 80 |
+            | 2  | 5  | 8  | 20 | 5  | 80 |
             +----+----+----+----+----+----+
             ");
         }
@@ -1950,14 +1964,14 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_string(&batches), @"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b2 | c2 |
             +----+----+----+----+----+----+
-            | 3  | 5  | 9  | 20 | 5  | 80 |
             | 2  | 5  | 8  | 20 | 5  | 80 |
-            | 0  | 4  | 6  | 10 | 4  | 70 |
+            | 3  | 5  | 9  | 20 | 5  | 80 |
             | 1  | 4  | 7  | 10 | 4  | 70 |
+            | 0  | 4  | 6  | 10 | 4  | 70 |
             +----+----+----+----+----+----+
             ");
         }
@@ -2027,13 +2041,13 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_string(&batches), @"
             +----+----+----+----+----+----+
             | a1 | b2 | c1 | a1 | b2 | c2 |
             +----+----+----+----+----+----+
             | 1  | 1  | 7  | 1  | 1  | 70 |
-            | 2  | 2  | 8  | 2  | 2  | 80 |
             | 2  | 2  | 9  | 2  | 2  | 80 |
+            | 2  | 2  | 8  | 2  | 2  | 80 |
             +----+----+----+----+----+----+
             ");
         }
@@ -2112,13 +2126,13 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_string(&batches), @"
             +----+----+----+----+----+----+
             | a1 | b2 | c1 | a1 | b2 | c2 |
             +----+----+----+----+----+----+
             | 1  | 1  | 7  | 1  | 1  | 70 |
-            | 2  | 2  | 8  | 2  | 2  | 80 |
             | 2  | 2  | 9  | 2  | 2  | 80 |
+            | 2  | 2  | 8  | 2  | 2  | 80 |
             +----+----+----+----+----+----+
             ");
         }
@@ -2171,14 +2185,14 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_string(&batches), @"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b2 | c2 |
             +----+----+----+----+----+----+
-            | 3  | 5  | 9  | 20 | 5  | 80 |
             | 2  | 5  | 8  | 20 | 5  | 80 |
-            | 0  | 4  | 6  | 10 | 4  | 70 |
+            | 3  | 5  | 9  | 20 | 5  | 80 |
             | 1  | 4  | 7  | 10 | 4  | 70 |
+            | 0  | 4  | 6  | 10 | 4  | 70 |
             +----+----+----+----+----+----+
             ");
         }
@@ -2283,12 +2297,12 @@ mod tests {
 
         // Inner join output is expected to preserve both inputs order
         allow_duplicates! {
-            assert_snapshot!(batches_to_string(&batches), @r"
+            assert_snapshot!(batches_to_string(&batches), @"
             +----+----+----+----+----+----+
             | a1 | b1 | c1 | a2 | b1 | c2 |
             +----+----+----+----+----+----+
-            | 2  | 5  | 8  | 30 | 5  | 90 |
             | 3  | 5  | 9  | 30 | 5  | 90 |
+            | 2  | 5  | 8  | 30 | 5  | 90 |
             +----+----+----+----+----+----+
             ");
         }
