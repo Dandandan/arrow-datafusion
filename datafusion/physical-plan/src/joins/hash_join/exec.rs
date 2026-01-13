@@ -1540,6 +1540,10 @@ async fn collect_left_input(
 
     let state = left_stream
         .try_fold(initial, |mut state, batch| async move {
+            // Optimization: Skip processing for empty batches
+            if batch.num_rows() == 0 {
+                return Ok(state);
+            }
             // Update accumulators if computing bounds
             if let Some(ref mut accumulators) = state.bounds_accumulators {
                 for accumulator in accumulators {
