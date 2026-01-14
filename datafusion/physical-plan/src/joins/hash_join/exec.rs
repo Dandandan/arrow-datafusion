@@ -172,7 +172,11 @@ fn try_create_array_map(
     let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, num_row);
     reservation.try_grow(mem_size)?;
 
-    let batch = concat_batches(schema, batches)?;
+    let batch = if batches.len() == 1 {
+        batches[0].clone()
+    } else {
+        concat_batches(schema, batches)?
+    };
     let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
     let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
@@ -1600,56 +1604,80 @@ async fn collect_left_input(
 
             (Map::ArrayMap(array_map), batch, left_value)
         } else {
-            // Estimation of memory size, required for hashtable, prior to allocation.
-            // Final result can be verified using `RawTable.allocation_info()`
-            let fixed_size_u32 = size_of::<JoinHashMapU32>();
-            let fixed_size_u64 = size_of::<JoinHashMapU64>();
-
-            // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
-            // `u64` indice variant
-            // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
-            let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
-                let estimated_hashtable_size =
-                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-                reservation.try_grow(estimated_hashtable_size)?;
-                metrics.build_mem_used.add(estimated_hashtable_size);
-                Box::new(JoinHashMapU64::with_capacity(num_rows))
+            // When the build side is empty, `concat_batches` will panic.
+            if batches.is_empty() {
+                let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
+                let left_values =
+                    evaluate_expressions_to_arrays(&on_left, &empty_batch)?;
+                let hashmap = Box::new(JoinHashMapU32::with_capacity(0));
+                (Map::HashMap(hashmap), empty_batch, left_values)
             } else {
-                let estimated_hashtable_size =
-                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-                reservation.try_grow(estimated_hashtable_size)?;
-                metrics.build_mem_used.add(estimated_hashtable_size);
-                Box::new(JoinHashMapU32::with_capacity(num_rows))
-            };
+                // Estimation of memory size for hash table
+                let fixed_size_u32 = size_of::<JoinHashMapU32>();
+                let fixed_size_u64 = size_of::<JoinHashMapU64>();
 
-            let mut hashes_buffer = Vec::new();
-            let mut offset = 0;
+                let mut hashmap: Box<dyn JoinHashMapType> =
+                    if num_rows > u32::MAX as usize {
+                        let estimated_hashtable_size =
+                            estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+                        reservation.try_grow(estimated_hashtable_size)?;
+                        metrics.build_mem_used.add(estimated_hashtable_size);
+                        Box::new(JoinHashMapU64::with_capacity(num_rows))
+                    } else {
+                        let estimated_hashtable_size =
+                            estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+                        reservation.try_grow(estimated_hashtable_size)?;
+                        metrics.build_mem_used.add(estimated_hashtable_size);
+                        Box::new(JoinHashMapU32::with_capacity(num_rows))
+                    };
 
-            let batches_iter = batches.iter().rev();
+                let (batch, left_values) = if batches.len() == 1 {
+                    // Fast path for a single batch: no need to concat_batches or iterate in reverse
+                    let batch = batches[0].clone();
+                    let mut hashes_buffer = vec![0; batch.num_rows()];
+                    update_hash(
+                        &on_left,
+                        &batch,
+                        &mut *hashmap,
+                        0, // offset
+                        &random_state,
+                        &mut hashes_buffer,
+                        0,
+                        true,
+                    )?;
+                    let left_values =
+                        evaluate_expressions_to_arrays(&on_left, &batch)?;
+                    (batch, left_values)
+                } else {
+                    // Default path for multiple batches: iterate in reverse and concat
+                    let mut hashes_buffer = Vec::new();
+                    let mut offset = 0;
+                    let batches_iter = batches.iter().rev();
 
-            // Updating hashmap starting from the last batch
-            for batch in batches_iter.clone() {
-                hashes_buffer.clear();
-                hashes_buffer.resize(batch.num_rows(), 0);
-                update_hash(
-                    &on_left,
-                    batch,
-                    &mut *hashmap,
-                    offset,
-                    &random_state,
-                    &mut hashes_buffer,
-                    0,
-                    true,
-                )?;
-                offset += batch.num_rows();
+                    for batch in batches_iter.clone() {
+                        hashes_buffer.clear();
+                        hashes_buffer.resize(batch.num_rows(), 0);
+                        update_hash(
+                            &on_left,
+                            batch,
+                            &mut *hashmap,
+                            offset,
+                            &random_state,
+                            &mut hashes_buffer,
+                            0,
+                            true,
+                        )?;
+                        offset += batch.num_rows();
+                    }
+
+                    // Merge batches in reverse order to match hash map indices
+                    let batch = concat_batches(&schema, batches_iter)?;
+                    let left_values =
+                        evaluate_expressions_to_arrays(&on_left, &batch)?;
+                    (batch, left_values)
+                };
+                (Map::HashMap(hashmap), batch, left_values)
             }
-
-            // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
-
-            let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
-
-            (Map::HashMap(hashmap), batch, left_values)
         };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
