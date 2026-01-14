@@ -213,10 +213,13 @@ impl Partitioning {
                 PartitioningSatisfaction::Exact
             }
             // When partition count is 1, hash requirement is satisfied.
-            Distribution::HashPartitioned(_) if self.partition_count() == 1 => {
+            Distribution::HashPartitioned(_) | Distribution::IndexedHashPartitioned(_)
+                if self.partition_count() == 1 =>
+            {
                 PartitioningSatisfaction::Exact
             }
-            Distribution::HashPartitioned(required_exprs) => match self {
+            Distribution::HashPartitioned(required_exprs)
+            | Distribution::IndexedHashPartitioned(required_exprs) => match self {
                 // Here we do not check the partition count for hash partitioning and assumes the partition count
                 // and hash functions in the system are the same. In future if we plan to support storage partition-wise joins,
                 // then we need to have the partition count and hash functions validation.
@@ -322,6 +325,9 @@ pub enum Distribution {
     /// Requires children to be distributed in such a way that the same
     /// values of the keys end up in the same partition
     HashPartitioned(Vec<Arc<dyn PhysicalExpr>>),
+    /// A stream of `IndexedBatch` is distributed amongst partitions based on the hash of the expressions.
+    /// This is a special case of `HashPartitioned` that is used to avoid copying data.
+    IndexedHashPartitioned(Vec<Arc<dyn PhysicalExpr>>),
 }
 
 impl Distribution {
@@ -335,6 +341,10 @@ impl Distribution {
             Distribution::HashPartitioned(expr) => {
                 Partitioning::Hash(expr, partition_count)
             }
+            Distribution::IndexedHashPartitioned(expr) => {
+                // This is a special case that RepartitionExec knows how to handle
+                Partitioning::Hash(expr, partition_count)
+            }
         }
     }
 }
@@ -346,6 +356,13 @@ impl Display for Distribution {
             Distribution::SinglePartition => write!(f, "SinglePartition"),
             Distribution::HashPartitioned(exprs) => {
                 write!(f, "HashPartitioned[{}])", format_physical_expr_list(exprs))
+            }
+            Distribution::IndexedHashPartitioned(exprs) => {
+                write!(
+                    f,
+                    "IndexedHashPartitioned[{}])",
+                    format_physical_expr_list(exprs)
+                )
             }
         }
     }

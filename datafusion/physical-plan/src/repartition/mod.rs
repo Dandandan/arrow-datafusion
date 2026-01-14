@@ -35,13 +35,14 @@ use crate::execution_plan::{CardinalityEffect, EvaluationType, SchedulingType};
 use crate::hash_utils::create_hashes;
 use crate::metrics::{BaselineMetrics, SpillMetrics};
 use crate::projection::{ProjectionExec, all_columns, make_with_child, update_expr};
+use crate::repartition::indexed_batch::IndexedBatch;
 use crate::sorts::streaming_merge::StreamingMergeBuilder;
 use crate::spill::spill_manager::SpillManager;
 use crate::spill::spill_pool::{self, SpillPoolWriter};
 use crate::stream::RecordBatchStreamAdapter;
 use crate::{DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, Statistics};
 
-use arrow::array::{PrimitiveArray, RecordBatch, RecordBatchOptions};
+use arrow::array::{ArrayRef, PrimitiveArray, RecordBatch, RecordBatchOptions};
 use arrow::compute::take_arrays;
 use arrow::datatypes::{SchemaRef, UInt32Type};
 use datafusion_common::config::ConfigOptions;
@@ -54,7 +55,7 @@ use datafusion_common::{Result, not_impl_err};
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryConsumer;
-use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion_physical_expr::{Distribution, EquivalenceProperties, PhysicalExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
 use crate::filter_pushdown::{
@@ -70,63 +71,26 @@ use futures::{FutureExt, StreamExt, TryStreamExt, ready};
 use log::trace;
 use parking_lot::Mutex;
 
+pub mod indexed_batch;
 mod distributor_channels;
 use distributor_channels::{
     DistributionReceiver, DistributionSender, channels, partition_aware_channels,
 };
 
-/// A batch in the repartition queue - either in memory or spilled to disk.
+/// A payload to be sent to a partition.
 ///
 /// This enum represents the two states a batch can be in during repartitioning.
 /// The decision to spill is made based on memory availability when sending a batch
 /// to an output partition.
 ///
-/// # Batch Flow with Spilling
-///
-/// ```text
-/// Input Stream ──▶ Partition Logic ──▶ try_grow()
-///                                            │
-///                            ┌───────────────┴────────────────┐
-///                            │                                │
-///                            ▼                                ▼
-///                   try_grow() succeeds            try_grow() fails
-///                   (Memory Available)              (Memory Pressure)
-///                            │                                │
-///                            ▼                                ▼
-///                  RepartitionBatch::Memory         spill_writer.push_batch()
-///                  (batch held in memory)           (batch written to disk)
-///                            │                                │
-///                            │                                ▼
-///                            │                      RepartitionBatch::Spilled
-///                            │                      (marker - no batch data)
-///                            │                                │
-///                            └────────┬───────────────────────┘
-///                                     │
-///                                     ▼
-///                              Send to channel
-///                                     │
-///                                     ▼
-///                            Output Stream (poll)
-///                                     │
-///                      ┌──────────────┴─────────────┐
-///                      │                            │
-///                      ▼                            ▼
-///         RepartitionBatch::Memory      RepartitionBatch::Spilled
-///         Return batch immediately       Poll spill_stream (blocks)
-///                      │                            │
-///                      └────────┬───────────────────┘
-///                               │
-///                               ▼
-///                          Return batch
-///                    (FIFO order preserved)
-/// ```
-///
 /// See [`RepartitionExec`] for overall architecture and [`StreamState`] for
 /// the state machine that handles reading these batches.
 #[derive(Debug)]
-enum RepartitionBatch {
+enum RepartitionPayload {
     /// Batch held in memory (counts against memory reservation)
-    Memory(RecordBatch),
+    RecordBatch(RecordBatch),
+    /// Indexed batch held in memory (counts against memory reservation)
+    IndexedBatch(IndexedBatch),
     /// Marker indicating a batch was spilled to the partition's SpillPool.
     /// The actual batch can be retrieved by reading from the SpillPoolStream.
     /// This variant contains no data itself - it's just a signal to the reader
@@ -134,13 +98,13 @@ enum RepartitionBatch {
     Spilled,
 }
 
-type MaybeBatch = Option<Result<RepartitionBatch>>;
-type InputPartitionsToCurrentPartitionSender = Vec<DistributionSender<MaybeBatch>>;
-type InputPartitionsToCurrentPartitionReceiver = Vec<DistributionReceiver<MaybeBatch>>;
+type MaybePayload = Option<Result<RepartitionPayload>>;
+type InputPartitionsToCurrentPartitionSender = Vec<DistributionSender<MaybePayload>>;
+type InputPartitionsToCurrentPartitionReceiver = Vec<DistributionReceiver<MaybePayload>>;
 
 /// Output channel with its associated memory reservation and spill writer
 struct OutputChannel {
-    sender: DistributionSender<MaybeBatch>,
+    sender: DistributionSender<MaybePayload>,
     reservation: SharedMemoryReservation,
     spill_writer: SpillPoolWriter,
 }
@@ -529,14 +493,42 @@ impl BatchPartitioner {
     ///
     /// The time spent repartitioning, not including time spent in `f` will be recorded
     /// to the [`metrics::Time`] provided on construction
-    pub fn partition<F>(&mut self, batch: RecordBatch, mut f: F) -> Result<()>
-    where
-        F: FnMut(usize, RecordBatch) -> Result<()>,
-    {
-        self.partition_iter(batch)?.try_for_each(|res| match res {
-            Ok((partition, batch)) => f(partition, batch),
-            Err(e) => Err(e),
+    pub fn partition(
+        &mut self,
+        batch: Arc<RecordBatch>,
+        mut f: impl FnMut(usize, RecordBatch) -> Result<()>,
+    ) -> Result<()> {
+        if let BatchPartitionerState::RoundRobin { .. } = self.state {
+            let (partition, batch) = self.partition_iter(batch)?.next().unwrap()?;
+            return f(partition, batch);
+        }
+
+        let it = self.partition_iter(batch)?;
+        it.try_for_each(|res| {
+            let (partition, batch) = res?;
+            f(partition, batch)
         })
+    }
+
+    /// Partition the provided [`RecordBatch`] into one or more partitioned [`RecordBatch`]
+    /// based on the [`Partitioning`] specified on construction
+    ///
+    /// `f` will be called for each partitioned [`RecordBatch`] with the corresponding
+    /// partition index. Any error returned by `f` will be immediately returned by this
+    /// function without attempting to publish further [`RecordBatch`]
+    ///
+    /// The time spent repartitioning, not including time spent in `f` will be recorded
+    /// to the [`metrics::Time`] provided on construction
+    pub fn partition_indexed(
+        &mut self,
+        batch: Arc<RecordBatch>,
+        mut f: impl FnMut(usize, PrimitiveArray<UInt32Type>) -> Result<()>,
+    ) -> Result<()> {
+        self.partition_indexed_iter(batch)?
+            .try_for_each(|res| match res {
+                Ok((partition, indices)) => f(partition, indices),
+                Err(e) => Err(e),
+            })
     }
 
     /// Actual implementation of [`partition`](Self::partition).
@@ -546,7 +538,7 @@ impl BatchPartitioner {
     /// this (so we don't need to clone the entire implementation).
     fn partition_iter(
         &mut self,
-        batch: RecordBatch,
+        batch: Arc<RecordBatch>,
     ) -> Result<impl Iterator<Item = Result<(usize, RecordBatch)>> + Send + '_> {
         let it: Box<dyn Iterator<Item = Result<(usize, RecordBatch)>> + Send> =
             match &mut self.state {
@@ -556,6 +548,8 @@ impl BatchPartitioner {
                 } => {
                     let idx = *next_idx;
                     *next_idx = (*next_idx + 1) % *num_partitions;
+                    let batch = Arc::try_unwrap(batch)
+                        .map_err(|_| internal_err!("should be able to unwrap Arc"))?;
                     Box::new(std::iter::once(Ok((idx, batch))))
                 }
                 BatchPartitionerState::Hash {
@@ -620,6 +614,67 @@ impl BatchPartitioner {
                     Box::new(it)
                 }
             };
+
+        Ok(it)
+    }
+
+    /// to the [`metrics::Time`] provided on construction
+    fn partition_indexed_iter(
+        &mut self,
+        batch: Arc<RecordBatch>,
+    ) -> Result<
+        impl Iterator<Item = Result<(usize, PrimitiveArray<UInt32Type>)>> + Send + '_,
+    > {
+        let it: Box<
+            dyn Iterator<Item = Result<(usize, PrimitiveArray<UInt32Type>)>> + Send,
+        > = match &mut self.state {
+            BatchPartitionerState::RoundRobin { .. } => {
+                return not_impl_err!(
+                    "RoundRobinBatch doesn't support indexed partitioning"
+                );
+            }
+            BatchPartitionerState::Hash {
+                exprs,
+                num_partitions: partitions,
+                hash_buffer,
+            } => {
+                // Tracking time required for distributing indexes across output partitions
+                let timer = self.timer.timer();
+
+                let arrays =
+                    evaluate_expressions_to_arrays(exprs.as_slice(), &batch)?;
+
+                hash_buffer.clear();
+                hash_buffer.resize(batch.num_rows(), 0);
+
+                create_hashes(
+                    &arrays,
+                    REPARTITION_RANDOM_STATE.random_state(),
+                    hash_buffer,
+                )?;
+
+                let mut indices: Vec<_> = (0..*partitions)
+                    .map(|_| Vec::with_capacity(batch.num_rows()))
+                    .collect();
+
+                for (index, hash) in hash_buffer.iter().enumerate() {
+                    indices[(*hash % *partitions as u64) as usize]
+                        .push(index as u32);
+                }
+
+                // Finished building index-arrays for output partitions
+                timer.done();
+
+                let it = indices.into_iter().enumerate().filter_map(
+                    |(partition, indices)| {
+                        let indices: PrimitiveArray<UInt32Type> = indices.into();
+                        (!indices.is_empty()).then_some(Ok((partition, indices)))
+                    },
+                );
+
+                Box::new(it)
+            }
+        };
 
         Ok(it)
     }
@@ -1342,38 +1397,78 @@ impl RepartitionExec {
                 continue;
             }
 
-            for res in partitioner.partition_iter(batch)? {
-                let (partition, batch) = res?;
-                let size = batch.get_array_memory_size();
+            let batch = Arc::new(batch);
 
-                let timer = metrics.send_time[partition].timer();
-                // if there is still a receiver, send to it
-                if let Some(channel) = output_channels.get_mut(&partition) {
-                    let (batch_to_send, is_memory_batch) =
-                        match channel.reservation.lock().try_grow(size) {
-                            Ok(_) => {
-                                // Memory available - send in-memory batch
-                                (RepartitionBatch::Memory(batch), true)
-                            }
-                            Err(_) => {
-                                // We're memory limited - spill to SpillPool
-                                // SpillPool handles file handle reuse and rotation
-                                channel.spill_writer.push_batch(&batch)?;
-                                // Send marker indicating batch was spilled
-                                (RepartitionBatch::Spilled, false)
-                            }
+            if let Partitioning::Hash(..) = &partitioning {
+                let iter = partitioner.partition_indexed_iter(Arc::clone(&batch))?;
+                for res in iter {
+                    let (partition, indices) = res?;
+                    let size = indices.get_array_memory_size();
+                    let timer = metrics.send_time[partition].timer();
+                    if let Some(channel) = output_channels.get_mut(&partition) {
+                        let indexed_batch = IndexedBatch {
+                            batch: Arc::clone(&batch),
+                            indices,
                         };
+                        let (batch_to_send, is_memory_batch) =
+                            match channel.reservation.lock().try_grow(size) {
+                                Ok(_) => (
+                                    RepartitionPayload::IndexedBatch(indexed_batch),
+                                    true,
+                                ),
+                                Err(_) => {
+                                    return not_impl_err!(
+                                        "Spilling not supported for indexed partitioning"
+                                    );
+                                }
+                            };
 
-                    if channel.sender.send(Some(Ok(batch_to_send))).await.is_err() {
-                        // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
-                        // Only shrink memory if it was a memory batch
-                        if is_memory_batch {
-                            channel.reservation.lock().shrink(size);
+                        if channel.sender.send(Some(Ok(batch_to_send))).await.is_err()
+                        {
+                            if is_memory_batch {
+                                channel.reservation.lock().shrink(size);
+                            }
+                            output_channels.remove(&partition);
                         }
-                        output_channels.remove(&partition);
                     }
+                    timer.done();
                 }
-                timer.done();
+            } else {
+                let iter = partitioner.partition_iter(batch)?;
+                for res in iter {
+                    let (partition, batch) = res?;
+                    let size = batch.get_array_memory_size();
+
+                    let timer = metrics.send_time[partition].timer();
+                    // if there is still a receiver, send to it
+                    if let Some(channel) = output_channels.get_mut(&partition) {
+                        let (batch_to_send, is_memory_batch) =
+                            match channel.reservation.lock().try_grow(size) {
+                                Ok(_) => {
+                                    // Memory available - send in-memory batch
+                                    (RepartitionPayload::RecordBatch(batch), true)
+                                }
+                                Err(_) => {
+                                    // We're memory limited - spill to SpillPool
+                                    // SpillPool handles file handle reuse and rotation
+                                    channel.spill_writer.push_batch(&batch)?;
+                                    // Send marker indicating batch was spilled
+                                    (RepartitionPayload::Spilled, false)
+                                }
+                            };
+
+                        if channel.sender.send(Some(Ok(batch_to_send))).await.is_err()
+                        {
+                            // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
+                            // Only shrink memory if it was a memory batch
+                            if is_memory_batch {
+                                channel.reservation.lock().shrink(size);
+                            }
+                            output_channels.remove(&partition);
+                        }
+                    }
+                    timer.done();
+                }
             }
 
             // If the input stream is endless, we may spin forever and
@@ -1412,7 +1507,7 @@ impl RepartitionExec {
     /// channels.
     async fn wait_for_task(
         input_task: SpawnedTask<Result<()>>,
-        txs: HashMap<usize, DistributionSender<MaybeBatch>>,
+        txs: HashMap<usize, DistributionSender<MaybePayload>>,
     ) {
         // wait for completion, and propagate error
         // note we ignore errors on send (.ok) as that means the receiver has already shutdown.
@@ -1505,12 +1600,18 @@ enum StreamState {
 
 /// This struct converts a receiver to a stream.
 /// Receiver receives data on an SPSC channel.
+pub trait IndexedRecordBatchStream: Stream<Item = Result<IndexedBatch>> + Send {}
+
+impl<T> IndexedRecordBatchStream for T where T: Stream<Item = Result<IndexedBatch>> + Send {}
+
+pub type SendableIndexedRecordBatchStream = Pin<Box<dyn IndexedRecordBatchStream>>;
+
 struct PerPartitionStream {
     /// Schema wrapped by Arc
     schema: SchemaRef,
 
     /// channel containing the repartitioned batches
-    receiver: DistributionReceiver<MaybeBatch>,
+    receiver: DistributionReceiver<MaybePayload>,
 
     /// Handle to ensure background tasks are killed when no longer needed.
     _drop_helper: Arc<Vec<SpawnedTask<()>>>,
@@ -1540,7 +1641,7 @@ impl PerPartitionStream {
     #[expect(clippy::too_many_arguments)]
     fn new(
         schema: SchemaRef,
-        receiver: DistributionReceiver<MaybeBatch>,
+        receiver: DistributionReceiver<MaybePayload>,
         drop_helper: Arc<Vec<SpawnedTask<()>>>,
         reservation: SharedMemoryReservation,
         spill_stream: SendableRecordBatchStream,
@@ -1566,7 +1667,7 @@ impl PerPartitionStream {
     fn poll_next_inner(
         self: &mut Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<RecordBatch>>> {
+    ) -> Poll<Option<Result<RepartitionPayload>>> {
         use futures::StreamExt;
         let cloned_time = self.baseline_metrics.elapsed_compute().clone();
         let _timer = cloned_time.timer();
@@ -1584,25 +1685,7 @@ impl PerPartitionStream {
                     };
 
                     match value {
-                        Some(Some(v)) => match v {
-                            Ok(RepartitionBatch::Memory(batch)) => {
-                                // Release memory and return batch
-                                self.reservation
-                                    .lock()
-                                    .shrink(batch.get_array_memory_size());
-                                return Poll::Ready(Some(Ok(batch)));
-                            }
-                            Ok(RepartitionBatch::Spilled) => {
-                                // Batch was spilled, transition to reading from spill stream
-                                // We must block on spill stream until we get the batch
-                                // to preserve ordering
-                                self.state = StreamState::ReadingSpilled;
-                                continue;
-                            }
-                            Err(e) => {
-                                return Poll::Ready(Some(Err(e)));
-                            }
-                        },
+                        Some(Some(v)) => return Poll::Ready(Some(v)),
                         Some(None) => {
                             // One input partition finished
                             self.remaining_partitions -= 1;
@@ -1624,7 +1707,9 @@ impl PerPartitionStream {
                     match self.spill_stream.poll_next_unpin(cx) {
                         Poll::Ready(Some(Ok(batch))) => {
                             self.state = StreamState::ReadingMemory;
-                            return Poll::Ready(Some(Ok(batch)));
+                            return Poll::Ready(Some(Ok(RepartitionPayload::RecordBatch(
+                                batch,
+                            ))));
                         }
                         Poll::Ready(Some(Err(e))) => {
                             return Poll::Ready(Some(Err(e)));
@@ -1683,20 +1768,13 @@ impl PerPartitionStream {
 }
 
 impl Stream for PerPartitionStream {
-    type Item = Result<RecordBatch>;
+    type Item = Result<RepartitionPayload>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        let poll;
-        if let Some(mut coalescer) = self.batch_coalescer.take() {
-            poll = self.poll_next_and_coalesce(cx, &mut coalescer);
-            self.batch_coalescer = Some(coalescer);
-        } else {
-            poll = self.poll_next_inner(cx);
-        }
-        self.baseline_metrics.record_poll(poll)
+        self.poll_next_inner(cx)
     }
 }
 
