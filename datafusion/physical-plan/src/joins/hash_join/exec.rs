@@ -47,6 +47,8 @@ use crate::projection::{
     EmbeddedProjection, JoinData, ProjectionExec, try_embed_projection,
     try_pushdown_through_join,
 };
+
+use arrow::array::Array;
 use crate::repartition::REPARTITION_RANDOM_STATE;
 use crate::spill::get_record_batch_memory_size;
 use crate::{
@@ -1656,27 +1658,55 @@ async fn collect_left_input(
             let mut hashes_buffer = Vec::new();
             let mut offset = 0;
 
-            let batches_iter = batches.iter().rev();
+            // In a single pass, build the hash map and concatenate the batches. This
+            // is more efficient than iterating over the batches twice.
+            let batch = if batches.is_empty() {
+                RecordBatch::new_empty(Arc::clone(&schema))
+            } else {
+                let num_columns = schema.fields().len();
+                // A vector of columns, where each column is a vector of arrays from the batches
+                let mut columns: Vec<Vec<ArrayRef>> =
+                    vec![Vec::with_capacity(batches.len()); num_columns];
 
-            // Updating hashmap starting from the last batch
-            for batch in batches_iter.clone() {
-                hashes_buffer.clear();
-                hashes_buffer.resize(batch.num_rows(), 0);
-                update_hash(
-                    &on_left,
-                    batch,
-                    &mut *hashmap,
-                    offset,
-                    &random_state,
-                    &mut hashes_buffer,
-                    0,
-                    true,
-                )?;
-                offset += batch.num_rows();
-            }
+                // Build the hash map and collect arrays for concatenation in a single reverse pass.
+                // The reverse order is important for deterministic test outputs.
+                for batch in batches.iter().rev() {
+                    hashes_buffer.clear();
+                    hashes_buffer.resize(batch.num_rows(), 0);
+                    update_hash(
+                        &on_left,
+                        batch,
+                        &mut *hashmap,
+                        offset,
+                        &random_state,
+                        &mut hashes_buffer,
+                        0,
+                        true,
+                    )?;
+                    offset += batch.num_rows();
 
-            // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
+                    // Collect arrays from the batch
+                    batch
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .for_each(|(i, array)| {
+                            columns[i].push(array.clone());
+                        });
+                }
+
+                // Manually concatenate the arrays for each column to form a single RecordBatch
+                let concatenated_columns = columns
+                    .into_iter()
+                    .map(|arrays| {
+                        let arrays_ref: Vec<&dyn Array> =
+                            arrays.iter().map(|a| a.as_ref()).collect();
+                        arrow::compute::concat(&arrays_ref)
+                    })
+                    .collect::<arrow::error::Result<Vec<ArrayRef>>>()?;
+
+                RecordBatch::try_new(Arc::clone(&schema), concatenated_columns)?
+            };
 
             let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
 
