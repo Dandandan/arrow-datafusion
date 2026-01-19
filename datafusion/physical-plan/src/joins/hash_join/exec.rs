@@ -172,7 +172,13 @@ fn try_create_array_map(
     let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, num_row);
     reservation.try_grow(mem_size)?;
 
-    let batch = concat_batches(schema, batches)?;
+    // If there is only one batch on the build side, we can avoid a
+    // costly `concat_batches` operation.
+    let batch = if batches.len() == 1 {
+        batches[0].clone()
+    } else {
+        concat_batches(schema, batches)?
+    };
     let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
     let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
