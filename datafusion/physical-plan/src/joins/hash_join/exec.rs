@@ -1675,11 +1675,20 @@ async fn collect_left_input(
                 offset += batch.num_rows();
             }
 
-            // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
+            // Determine the `RecordBatch` to use.
+            let batch = if batches.len() == 1 {
+                // --- Fast path for a single batch from the build side ---
+                // This avoids the overhead of `concat_batches`, which allocates a new `RecordBatch`
+                // and copies schema and column data. By working on the batch directly, we reduce
+                // memory allocation and CPU usage.
+                batches.into_iter().next().unwrap()
+            } else {
+                // --- General case for multiple batches ---
+                // Merge all batches into a single `RecordBatch` to allow direct indexing.
+                concat_batches(&schema, batches_iter.clone())?
+            };
 
             let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
-
             (Map::HashMap(hashmap), batch, left_values)
         };
 
