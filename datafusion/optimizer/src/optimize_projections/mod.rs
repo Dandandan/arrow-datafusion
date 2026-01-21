@@ -25,13 +25,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion_common::{
-    Column, DFSchema, HashMap, JoinType, Result, assert_eq_or_internal_err,
-    get_required_group_by_exprs_indices, internal_datafusion_err, internal_err,
+    assert_eq_or_internal_err, get_required_group_by_exprs_indices,
+    internal_datafusion_err, internal_err, Column, DFSchema, HashMap, JoinType, Result,
 };
 use datafusion_expr::expr::Alias;
 use datafusion_expr::{
-    Aggregate, Distinct, EmptyRelation, Expr, Projection, TableScan, Unnest, Window,
-    logical_plan::LogicalPlan,
+    logical_plan::LogicalPlan, Aggregate, Distinct, EmptyRelation, Expr, Projection,
+    TableScan, Unnest, Window,
 };
 
 use crate::optimize_projections::required_indices::RequiredIndices;
@@ -132,9 +132,16 @@ fn optimize_projections(
     config: &dyn OptimizerConfig,
     indices: RequiredIndices,
 ) -> Result<Transformed<LogicalPlan>> {
+    // The traversal of the plan is top-down. It's important to optimize any
+    // subqueries in the current plan's expressions before proceeding with the
+    // rest of the projection pushdown logic for the plan itself.
+    let plan_with_optimized_subqueries = optimize_exists_subqueries(plan, config)?;
+    let transformed_from_subqueries = plan_with_optimized_subqueries.transformed;
+    let plan = plan_with_optimized_subqueries.data;
+
     // Recursively rewrite any nodes that may be able to avoid computation given
     // their parents' required indices.
-    match plan {
+    let transformed_plan = match plan {
         LogicalPlan::Projection(proj) => {
             return merge_consecutive_projections(proj)?.transform_data(|proj| {
                 rewrite_projection_given_requirements(proj, config, &indices)
@@ -459,11 +466,50 @@ fn optimize_projections(
     })?;
 
     // If any of the children are transformed, we need to potentially update the plan's schema
-    if transformed_plan.transformed {
-        transformed_plan.map_data(|plan| plan.recompute_schema())
+    let transformed_plan = if transformed_plan.transformed {
+        transformed_plan.map_data(|plan| plan.recompute_schema())?
     } else {
-        Ok(transformed_plan)
+        transformed_plan
+    };
+
+    let plan = transformed_plan.data;
+    let transformed = transformed_from_subqueries || transformed_plan.transformed;
+    if transformed {
+        Ok(Transformed::yes(plan))
+    } else {
+        Ok(Transformed::no(plan))
     }
+}
+
+/// This function traverses the expressions in a `LogicalPlan` and optimizes
+/// any `EXISTS` subqueries it finds. This is done by recursively calling
+/// `optimize_projections` on the subquery plan, with the information that no
+/// columns are required from it. This allows the optimizer to prune unneeded
+/// columns from the subquery.
+fn optimize_exists_subqueries(
+    plan: LogicalPlan,
+    config: &dyn OptimizerConfig,
+) -> Result<Transformed<LogicalPlan>> {
+    plan.map_expressions(&mut |expr: Expr| {
+        expr.transform_down(&|expr| {
+            if let Expr::Exists(ref exists) = expr {
+                let optimized_subquery_plan = optimize_projections(
+                    (*exists.subquery.subquery).clone(),
+                    config,
+                    // No columns are required from the subquery, it is only used to check for the existence of rows.
+                    RequiredIndices::new(),
+                )?;
+
+                if optimized_subquery_plan.transformed {
+                    let mut new_exists = exists.clone();
+                    new_exists.subquery.subquery =
+                        Arc::new(optimized_subquery_plan.data);
+                    return Ok(Transformed::yes(Expr::Exists(new_exists)));
+                }
+            }
+            Ok(Transformed::no(expr))
+        })
+    })
 }
 
 /// Merges consecutive projections.
@@ -947,11 +993,11 @@ mod tests {
     use crate::{OptimizerContext, OptimizerRule};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::{
-        Column, DFSchema, DFSchemaRef, JoinType, Result, TableReference,
+        Column, DFSchema, DFSchemaRef, JoinType, Result, Spans, TableReference,
     };
     use datafusion_expr::ExprFunctionExt;
     use datafusion_expr::{
-        BinaryExpr, Expr, Extension, Like, LogicalPlan, Operator, Projection,
+        BinaryExpr, Expr, Extension, Like, LogicalPlan, Operator, Projection, Subquery,
         UserDefinedLogicalNodeCore, WindowFunctionDefinition, binary_expr,
         build_join_schema,
         builder::table_scan_with_filters,
@@ -2312,5 +2358,39 @@ mod tests {
         let optimized_plan =
             optimizer.optimize(plan, &OptimizerContext::new(), observe)?;
         Ok(optimized_plan)
+    }
+
+    #[test]
+    fn exists_subquery_projection_pushdown() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
+
+        let subquery_plan = LogicalPlanBuilder::from(t2)
+            .project(vec![col("t2.a"), col("t2.b"), col("t2.c")])?
+            .filter(col("t2.c").eq(col("t1.c")))?
+            .build()?;
+
+        let subquery = Subquery {
+            subquery: Arc::new(subquery_plan),
+            outer_ref_columns: vec![col("t1.c")],
+            spans: Spans::new(),
+        };
+
+        let plan = LogicalPlanBuilder::from(t1)
+            .project(vec![col("t1.a"), col("t1.b"), col("t1.c")])?
+            .filter(Expr::Exists(expr::Exists::new(subquery, false)))?
+            .project(vec![col("t1.a")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @"
+        Filter: EXISTS (<subquery>)
+          Subquery:
+            Filter: t2.c = t1.c
+              TableScan: t2 projection=[c]
+          TableScan: t1 projection=[a]
+        "
+        )
     }
 }
