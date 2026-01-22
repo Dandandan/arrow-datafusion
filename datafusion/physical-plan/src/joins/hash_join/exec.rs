@@ -1602,6 +1602,7 @@ async fn collect_left_input(
         mut reservation,
         bounds_accumulators,
     } = state;
+    let mut batches = batches;
 
     // Compute bounds
     let mut bounds = match bounds_accumulators {
@@ -1676,7 +1677,14 @@ async fn collect_left_input(
             }
 
             // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
+            // ⚡ TODO: this can be fused with the hash map creation, but this is a separate optimization
+            let batch = if batches.len() == 1 {
+                // Here we can avoid the expensive concat_batches call if there is only one batch.
+                // This is a common case when the build side is coalesced.
+                batches.remove(0)
+            } else {
+                concat_batches(&schema, batches_iter.clone())?
+            };
 
             let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
 
