@@ -19,15 +19,28 @@
 //! This allows the user to extend DataFusion with different storage systems such as S3 or HDFS
 //! and query data inside these systems.
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use datafusion_common::{
     DataFusionError, Result, exec_err, internal_datafusion_err, not_impl_err,
 };
-use object_store::ObjectStore;
+use futures::stream::BoxStream;
 #[cfg(not(target_arch = "wasm32"))]
 use object_store::local::LocalFileSystem;
-use std::sync::Arc;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutOptions, PutPayload, PutResult,
+};
+use std::cell::RefCell;
+use std::{
+    fmt::{Display, Formatter}, path::PathBuf, sync::Arc
+};
 use url::Url;
+
+thread_local! {
+    /// A single element cache to avoid constant PathBuf hashing/map lookups
+    static LAST_FILE: RefCell<Option<(object_store::path::Path, Arc<std::fs::File>)>> = RefCell::new(None);
+}
 
 /// A parsed URL identifying a particular [`ObjectStore`] instance
 ///
@@ -101,8 +114,8 @@ impl AsRef<Url> for ObjectStoreUrl {
     }
 }
 
-impl std::fmt::Display for ObjectStoreUrl {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+impl Display for ObjectStoreUrl {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         self.as_str().fmt(f)
     }
 }
@@ -184,7 +197,7 @@ pub struct DefaultObjectStoreRegistry {
 }
 
 impl std::fmt::Debug for DefaultObjectStoreRegistry {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         f.debug_struct("DefaultObjectStoreRegistry")
             .field(
                 "schemes",
@@ -204,12 +217,172 @@ impl Default for DefaultObjectStoreRegistry {
     }
 }
 
+pub(crate) async fn maybe_spawn_blocking<F, T>(
+    f: F,
+) -> std::result::Result<T, object_store::Error>
+where
+    F: FnOnce() -> std::result::Result<T, object_store::Error> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => runtime.spawn_blocking(f).await?,
+        Err(_) => f(),
+    }
+}
+
+#[derive(Debug)]
+struct CachedFileDescriptorLocalFileSystem {
+    inner: LocalFileSystem,
+}
+
+impl CachedFileDescriptorLocalFileSystem {
+    pub fn new() -> Self {
+        Self {
+            inner: LocalFileSystem::new(),
+        }
+    }
+}
+
+impl Display for CachedFileDescriptorLocalFileSystem {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CachedFileDescriptorLocalFileSystem")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for CachedFileDescriptorLocalFileSystem {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> std::result::Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> std::result::Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: GetOptions,
+    ) -> std::result::Result<GetResult, object_store::Error> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        _location: &object_store::path::Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> std::result::Result<Vec<Bytes>, object_store::Error> {
+        use std::os::unix::fs::FileExt;
+
+        let file = LAST_FILE.with(|last| {
+            let mut last = last.borrow_mut();
+            if let Some((path, file)) = last.as_ref() {
+                if path == _location {
+                    return Ok(Arc::clone(file));
+                }
+            }
+
+            let cf: PathBuf = self.inner.path_to_filesystem(_location)?;
+            let std_path = cf.as_path();
+            match std::fs::File::open(std_path) {
+                Ok(file) => {
+                    let file = Arc::new(file);
+                    *last = Some((_location.clone(), Arc::clone(&file)));
+                    Ok(file)
+                }
+                Err(e) => Err(object_store::Error::Generic {
+                    store: "LocalFileSystemOneFile",
+                    source: Box::new(e),
+                }),
+            }
+        })?;
+
+        let ranges = ranges.to_owned();
+        maybe_spawn_blocking(move || {
+            let mut result = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                let mut buf = vec![0u8; (range.end - range.start) as usize];
+
+                file.read_at(&mut buf, range.start).map_err(|e| {
+                    object_store::Error::Generic {
+                        store: "LocalFileSystemOneFile",
+                        source: Box::new(e),
+                    }
+                })?;
+                result.push(buf.into());
+            }
+            Ok(result)
+        })
+        .await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> BoxStream<'static, std::result::Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> std::result::Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    fn delete_stream<'a>(
+        &'a self,
+        paths: BoxStream<
+            'a,
+            std::result::Result<object_store::path::Path, object_store::Error>,
+        >,
+    ) -> BoxStream<'a, std::result::Result<object_store::path::Path, object_store::Error>>
+    {
+        self.inner.delete_stream(paths)
+    }
+
+    async fn delete(
+        &self,
+        location: &object_store::path::Path,
+    ) -> std::result::Result<(), object_store::Error> {
+        self.inner.delete(location).await
+    }
+
+    async fn copy(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+    ) -> std::result::Result<(), object_store::Error> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+    ) -> std::result::Result<(), object_store::Error> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
 impl DefaultObjectStoreRegistry {
     /// This will register [`LocalFileSystem`] to handle `file://` paths
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Self {
         let object_stores: DashMap<String, Arc<dyn ObjectStore>> = DashMap::new();
-        object_stores.insert("file://".to_string(), Arc::new(LocalFileSystem::new()));
+        object_stores.insert(
+            "file://".to_string(),
+            Arc::new(CachedFileDescriptorLocalFileSystem::new()),
+        );
         Self { object_stores }
     }
 
