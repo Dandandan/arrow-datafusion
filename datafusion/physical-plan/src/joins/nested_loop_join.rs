@@ -30,6 +30,7 @@ use super::utils::{
 };
 use crate::common::can_project;
 use crate::execution_plan::{EmissionType, boundedness_from_children};
+use crate::joins::atomic_bit_set::AtomicBitSet;
 use crate::joins::SharedBitmapBuilder;
 use crate::joins::utils::{
     BuildProbeJoinMetrics, ColumnIndex, JoinFilter, OnceAsync, OnceFut,
@@ -73,7 +74,6 @@ use datafusion_physical_expr::equivalence::{
 
 use futures::{Stream, StreamExt, TryStreamExt};
 use log::debug;
-use parking_lot::Mutex;
 
 #[expect(rustdoc::private_intra_doc_links)]
 /// NestedLoopJoinExec is a build-probe join operator designed for joins that
@@ -709,16 +709,14 @@ async fn collect_left_input(
         reservation.try_grow(buffer_size)?;
         metrics.build_mem_used.add(buffer_size);
 
-        let mut buffer = BooleanBufferBuilder::new(n_rows);
-        buffer.append_n(n_rows, false);
-        buffer
+        AtomicBitSet::new(n_rows)
     } else {
-        BooleanBufferBuilder::new(0)
+        AtomicBitSet::new(0)
     };
 
     Ok(JoinLeftData::new(
         merged_batch,
-        Mutex::new(visited_left_side),
+        Arc::new(visited_left_side),
         AtomicUsize::new(probe_threads_count),
         reservation,
     ))
@@ -1426,8 +1424,8 @@ impl NestedLoopJoinStream {
         // -----------------------------------------------------------
 
         // None means we don't have to update left bitmap for this join type
-        let mut left_bitmap = if need_produce_result_in_final(self.join_type) {
-            Some(left_data.bitmap().lock())
+        let left_bitmap = if need_produce_result_in_final(self.join_type) {
+            Some(left_data.bitmap())
         } else {
             None
         };
@@ -1453,17 +1451,17 @@ impl NestedLoopJoinStream {
             let l_index = l_start_index + i / right_rows;
             let r_index = i % right_rows;
 
-            if let Some(bitmap) = left_bitmap.as_mut()
+            if let Some(l_bitmap) = left_bitmap
                 && is_matched
             {
                 // Map local index back to absolute left index within the batch
-                bitmap.set_bit(l_index, true);
+                l_bitmap.set_bit(l_index, true);
             }
 
-            if let Some(bitmap) = local_right_bitmap.as_mut()
+            if let Some(r_bitmap) = local_right_bitmap.as_mut()
                 && is_matched
             {
-                bitmap.set_bit(r_index, true);
+                r_bitmap.set_bit(r_index, true);
             }
         }
 
@@ -1663,16 +1661,10 @@ impl NestedLoopJoinStream {
         let left_batch = left_data.batch();
         let left_batch_sliced = left_batch.slice(start_idx, end_idx - start_idx);
 
-        // Can this be more efficient?
+        let bitmap = left_data.bitmap();
         let mut bitmap_sliced = BooleanBufferBuilder::new(end_idx - start_idx);
-        bitmap_sliced.append_n(end_idx - start_idx, false);
-        let bitmap = left_data.bitmap().lock();
         for i in start_idx..end_idx {
-            assert!(
-                i - start_idx < bitmap_sliced.capacity(),
-                "DBG: {start_idx}, {end_idx}"
-            );
-            bitmap_sliced.set_bit(i - start_idx, bitmap.get_bit(i));
+            bitmap_sliced.append(bitmap.get_bit(i));
         }
         let bitmap_sliced = BooleanArray::new(bitmap_sliced.finish(), None);
 
@@ -1771,7 +1763,7 @@ impl NestedLoopJoinStream {
 
         // 1. Maybe update the left bitmap
         if need_produce_result_in_final(self.join_type) && (joined_len > 0) {
-            let mut bitmap = left_data.bitmap().lock();
+            let bitmap = left_data.bitmap();
             bitmap.set_bit(l_index, true);
         }
 

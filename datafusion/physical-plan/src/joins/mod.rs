@@ -17,12 +17,12 @@
 
 //! DataFusion Join implementations
 
-use arrow::array::BooleanBufferBuilder;
+use std::sync::Arc;
+
 pub use cross_join::CrossJoinExec;
 use datafusion_physical_expr::PhysicalExprRef;
 pub use hash_join::{HashExpr, HashJoinExec, HashTableLookupExpr, SeededRandomState};
 pub use nested_loop_join::NestedLoopJoinExec;
-use parking_lot::Mutex;
 // Note: SortMergeJoin is not used in plans yet
 pub use piecewise_merge_join::PiecewiseMergeJoinExec;
 pub use sort_merge_join::SortMergeJoinExec;
@@ -43,9 +43,11 @@ mod join_filter;
 ///
 /// Note: This module is public for internal testing purposes only
 /// and is not guaranteed to be stable across versions.
+pub mod atomic_bit_set;
 pub mod join_hash_map;
 
 use array_map::ArrayMap;
+use atomic_bit_set::AtomicBitSet;
 use utils::JoinHashMapType;
 
 pub enum Map {
@@ -101,4 +103,4 @@ pub enum StreamJoinPartitionMode {
 }
 
 /// Shared bitmap for visited left-side indices
-type SharedBitmapBuilder = Mutex<BooleanBufferBuilder>;
+pub type SharedBitmapBuilder = Arc<AtomicBitSet>;

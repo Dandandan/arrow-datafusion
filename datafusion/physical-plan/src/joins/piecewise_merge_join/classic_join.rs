@@ -599,7 +599,7 @@ fn build_matched_indices_and_set_buffered_bitmap(
 ) -> Result<RecordBatch> {
     // Mark the buffered indices as visited
     if need_produce_result_in_final(join_type) {
-        let mut bitmap = buffered_side.buffered_data.visited_indices_bitmap.lock();
+        let bitmap = &buffered_side.buffered_data.visited_indices_bitmap;
         for i in buffered_range.0..buffered_range.0 + buffered_range.1 {
             bitmap.set_bit(i, true);
         }

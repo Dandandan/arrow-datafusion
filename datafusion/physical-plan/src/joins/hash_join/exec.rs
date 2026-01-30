@@ -36,6 +36,7 @@ use crate::joins::hash_join::shared_bounds::{
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
+use crate::joins::atomic_bit_set::AtomicBitSet;
 use crate::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
 use crate::joins::utils::{
     OnceAsync, OnceFut, asymmetric_join_output_partitioning, reorder_output_after_swap,
@@ -61,7 +62,7 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{ArrayRef, BooleanBufferBuilder};
+use arrow::array::ArrayRef;
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -87,7 +88,6 @@ use ahash::RandomState;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::TryStreamExt;
-use parking_lot::Mutex;
 
 use super::partitioned_hash_eval::SeededRandomState;
 
@@ -1689,11 +1689,9 @@ async fn collect_left_input(
         reservation.try_grow(bitmap_size)?;
         metrics.build_mem_used.add(bitmap_size);
 
-        let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
-        bitmap_buffer.append_n(num_rows, false);
-        bitmap_buffer
+        AtomicBitSet::new(batch.num_rows())
     } else {
-        BooleanBufferBuilder::new(0)
+        AtomicBitSet::new(0)
     };
 
     let map = Arc::new(join_hash_map);
@@ -1732,7 +1730,7 @@ async fn collect_left_input(
         map,
         batch,
         values: left_values,
-        visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
+        visited_indices_bitmap: Arc::new(visited_indices_bitmap),
         probe_threads_counter: AtomicUsize::new(probe_threads_count),
         _reservation: reservation,
         bounds,
