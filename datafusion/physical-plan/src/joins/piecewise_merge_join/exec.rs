@@ -17,7 +17,7 @@
 
 use arrow::array::Array;
 use arrow::{
-    array::{ArrayRef, BooleanBufferBuilder, RecordBatch},
+    array::{ArrayRef, RecordBatch},
     compute::concat_batches,
     util::bit_util,
 };
@@ -36,7 +36,6 @@ use datafusion_physical_expr::{
 };
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use futures::TryStreamExt;
-use parking_lot::Mutex;
 use std::fmt::Formatter;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -46,6 +45,7 @@ use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::joins::piecewise_merge_join::classic_join::{
     ClassicPWMJStream, PiecewiseMergeJoinStreamState,
 };
+use crate::joins::atomic_bit_set::AtomicBitSet;
 use crate::joins::piecewise_merge_join::utils::{
     build_visited_indices_map, is_existence_join, is_right_existence_join,
 };
@@ -620,7 +620,7 @@ async fn build_buffered_data(
 
     // Combine batches and record number of rows
     let initial = (Vec::new(), 0, metrics, reservation);
-    let (batches, num_rows, metrics, mut reservation) = buffered
+    let (batches, _num_rows, metrics, mut reservation) = buffered
         .try_fold(initial, |mut acc, batch| async {
             let batch_size = get_record_batch_memory_size(&batch);
             acc.3.try_grow(batch_size)?;
@@ -655,17 +655,15 @@ async fn build_buffered_data(
         reservation.try_grow(bitmap_size)?;
         metrics.build_mem_used.add(bitmap_size);
 
-        let mut bitmap_buffer = BooleanBufferBuilder::new(single_batch.num_rows());
-        bitmap_buffer.append_n(num_rows, false);
-        bitmap_buffer
+        AtomicBitSet::new(single_batch.num_rows())
     } else {
-        BooleanBufferBuilder::new(0)
+        AtomicBitSet::new(0)
     };
 
     let buffered_data = BufferedSideData::new(
         single_batch,
         buffered_values,
-        Mutex::new(visited_indices_bitmap),
+        Arc::new(visited_indices_bitmap),
         remaining_partitions,
         reservation,
     );

@@ -26,6 +26,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::joins::atomic_bit_set::AtomicBitSet;
 use crate::joins::SharedBitmapBuilder;
 use crate::metrics::{
     self, BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricType,
@@ -860,8 +861,7 @@ pub(crate) fn get_final_indices_from_shared_bitmap(
     join_type: JoinType,
     piecewise: bool,
 ) -> (UInt64Array, UInt32Array) {
-    let bitmap = shared_bitmap.lock();
-    get_final_indices_from_bit_map(&bitmap, join_type, piecewise)
+    get_final_indices_from_bit_map(shared_bitmap, join_type, piecewise)
 }
 
 /// In the end of join execution, need to use bit map of the matched
@@ -874,7 +874,7 @@ pub(crate) fn get_final_indices_from_shared_bitmap(
 ///
 /// The result is: `([1,4], [null, null])`
 pub(crate) fn get_final_indices_from_bit_map(
-    left_bit_map: &BooleanBufferBuilder,
+    left_bit_map: &AtomicBitSet,
     join_type: JoinType,
     // We add a flag for whether this is being passed from the `PiecewiseMergeJoin`
     // because the bitmap can be for left + right `JoinType`s

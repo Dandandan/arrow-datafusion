@@ -719,7 +719,7 @@ impl HashJoinStream {
 
         // mark joined left-side indices as visited, if required by join type
         if need_produce_result_in_final(self.join_type) {
-            let mut bitmap = build_side.left_data.visited_indices_bitmap().lock();
+            let bitmap = build_side.left_data.visited_indices_bitmap();
             left_indices.iter().flatten().for_each(|x| {
                 bitmap.set_bit(x as usize, true);
             });
