@@ -15,10 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::Array;
 use arrow::{
     array::{ArrayRef, BooleanBufferBuilder, RecordBatch},
-    compute::concat_batches,
     util::bit_util,
 };
 use arrow_schema::{SchemaRef, SortOptions};
@@ -616,8 +614,6 @@ async fn build_buffered_data(
     build_map: bool,
     remaining_partitions: usize,
 ) -> Result<BufferedSideData> {
-    let schema = buffered.schema();
-
     // Combine batches and record number of rows
     let initial = (Vec::new(), 0, metrics, reservation);
     let (batches, num_rows, metrics, mut reservation) = buffered
@@ -635,27 +631,26 @@ async fn build_buffered_data(
         })
         .await?;
 
-    let single_batch = concat_batches(&schema, batches.iter())?;
-
-    // Evaluate physical expression on the buffered side.
-    let buffered_values = on_buffered
-        .evaluate(&single_batch)?
-        .into_array(single_batch.num_rows())?;
-
-    // We add the single batch size + the memory of the join keys
-    // size of the size estimation
-    let size_estimation = get_record_batch_memory_size(&single_batch)
-        + buffered_values.get_array_memory_size();
-    reservation.try_grow(size_estimation)?;
-    metrics.build_mem_used.add(size_estimation);
+    let mut cumulative_rows = Vec::with_capacity(batches.len() + 1);
+    cumulative_rows.push(0);
+    let mut current_cumulative = 0;
+    let mut buffered_values = Vec::with_capacity(batches.len());
+    for batch in &batches {
+        current_cumulative += batch.num_rows();
+        cumulative_rows.push(current_cumulative);
+        let values = on_buffered
+            .evaluate(batch)?
+            .into_array(batch.num_rows())?;
+        buffered_values.push(values);
+    }
 
     // Created visited indices bitmap only if the join type requires it
     let visited_indices_bitmap = if build_map {
-        let bitmap_size = bit_util::ceil(single_batch.num_rows(), 8);
+        let bitmap_size = bit_util::ceil(num_rows, 8);
         reservation.try_grow(bitmap_size)?;
         metrics.build_mem_used.add(bitmap_size);
 
-        let mut bitmap_buffer = BooleanBufferBuilder::new(single_batch.num_rows());
+        let mut bitmap_buffer = BooleanBufferBuilder::new(num_rows);
         bitmap_buffer.append_n(num_rows, false);
         bitmap_buffer
     } else {
@@ -663,7 +658,8 @@ async fn build_buffered_data(
     };
 
     let buffered_data = BufferedSideData::new(
-        single_batch,
+        batches,
+        cumulative_rows,
         buffered_values,
         Mutex::new(visited_indices_bitmap),
         remaining_partitions,
@@ -674,8 +670,9 @@ async fn build_buffered_data(
 }
 
 pub(super) struct BufferedSideData {
-    pub(super) batch: RecordBatch,
-    values: ArrayRef,
+    pub(super) batches: Vec<RecordBatch>,
+    pub(super) cumulative_rows: Vec<usize>,
+    pub(super) values: Vec<ArrayRef>,
     pub(super) visited_indices_bitmap: SharedBitmapBuilder,
     pub(super) remaining_partitions: AtomicUsize,
     _reservation: MemoryReservation,
@@ -683,27 +680,21 @@ pub(super) struct BufferedSideData {
 
 impl BufferedSideData {
     pub(super) fn new(
-        batch: RecordBatch,
-        values: ArrayRef,
+        batches: Vec<RecordBatch>,
+        cumulative_rows: Vec<usize>,
+        values: Vec<ArrayRef>,
         visited_indices_bitmap: SharedBitmapBuilder,
         remaining_partitions: usize,
         reservation: MemoryReservation,
     ) -> Self {
         Self {
-            batch,
+            batches,
+            cumulative_rows,
             values,
             visited_indices_bitmap,
             remaining_partitions: AtomicUsize::new(remaining_partitions),
             _reservation: reservation,
         }
-    }
-
-    pub(super) fn batch(&self) -> &RecordBatch {
-        &self.batch
-    }
-
-    pub(super) fn values(&self) -> &ArrayRef {
-        &self.values
     }
 }
 

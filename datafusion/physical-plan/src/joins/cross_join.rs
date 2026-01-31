@@ -38,7 +38,6 @@ use crate::{
 };
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
-use arrow::compute::concat_batches;
 use arrow::datatypes::{Fields, Schema, SchemaRef};
 use datafusion_common::stats::Precision;
 use datafusion_common::{
@@ -54,9 +53,11 @@ use futures::{Stream, StreamExt, TryStreamExt, ready};
 /// Data of the left side that is buffered into memory
 #[derive(Debug)]
 struct JoinLeftData {
-    /// Single RecordBatch with all rows from the left side
-    merged_batch: RecordBatch,
-    /// Track memory reservation for merged_batch. Relies on drop
+    /// Batches from the left side
+    batches: Vec<RecordBatch>,
+    /// The cumulative number of rows in the build side batches
+    cumulative_rows: Vec<usize>,
+    /// Track memory reservation for batches. Relies on drop
     /// semantics to release reservation when JoinLeftData is dropped.
     _reservation: MemoryReservation,
 }
@@ -200,8 +201,6 @@ async fn load_left_input(
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
 ) -> Result<JoinLeftData> {
-    let left_schema = stream.schema();
-
     // Load all batches and count the rows
     let (batches, _metrics, reservation) = stream
         .try_fold(
@@ -221,10 +220,17 @@ async fn load_left_input(
         )
         .await?;
 
-    let merged_batch = concat_batches(&left_schema, &batches)?;
+    let mut cumulative_rows = Vec::with_capacity(batches.len() + 1);
+    cumulative_rows.push(0);
+    let mut current_cumulative = 0;
+    for batch in &batches {
+        current_cumulative += batch.num_rows();
+        cumulative_rows.push(current_cumulative);
+    }
 
     Ok(JoinLeftData {
-        merged_batch,
+        batches,
+        cumulative_rows,
         _reservation: reservation,
     })
 }
@@ -339,7 +345,8 @@ impl ExecutionPlan for CrossJoinExec {
                 left_index: 0,
                 join_metrics,
                 state: CrossJoinStreamState::WaitBuildSide,
-                left_data: RecordBatch::new_empty(self.left().schema()),
+                left_data: Vec::new(),
+                left_cumulative_rows: Vec::new(),
                 batch_transformer: BatchSplitter::new(batch_size),
             }))
         } else {
@@ -350,7 +357,8 @@ impl ExecutionPlan for CrossJoinExec {
                 left_index: 0,
                 join_metrics,
                 state: CrossJoinStreamState::WaitBuildSide,
-                left_data: RecordBatch::new_empty(self.left().schema()),
+                left_data: Vec::new(),
+                left_cumulative_rows: Vec::new(),
                 batch_transformer: NoopBatchTransformer::new(),
             }))
         }
@@ -494,8 +502,10 @@ struct CrossJoinStream<T> {
     join_metrics: BuildProbeJoinMetrics,
     /// State of the stream
     state: CrossJoinStreamState,
-    /// Left data (copy of the entire buffered left side)
-    left_data: RecordBatch,
+    /// Left data (copy of the buffered left side batches)
+    left_data: Vec<RecordBatch>,
+    /// Cumulative rows in left side batches
+    left_cumulative_rows: Vec<usize>,
     /// Batch transformer
     batch_transformer: T,
 }
@@ -601,11 +611,12 @@ impl<T: BatchTransformer> CrossJoinStream<T> {
         };
         build_timer.done();
 
-        let left_data = left_data.merged_batch.clone();
-        let result = if left_data.num_rows() == 0 {
+        let num_rows = left_data.cumulative_rows.last().copied().unwrap_or(0);
+        let result = if num_rows == 0 {
             StatefulStreamResult::Ready(None)
         } else {
-            self.left_data = left_data;
+            self.left_data = left_data.batches.clone();
+            self.left_cumulative_rows = left_data.cumulative_rows.clone();
             self.state = CrossJoinStreamState::FetchProbeBatch;
             StatefulStreamResult::Continue
         };
@@ -635,14 +646,17 @@ impl<T: BatchTransformer> CrossJoinStream<T> {
     /// If all the results are produced, the state is set to fetch new probe batch.
     fn build_batches(&mut self) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
         let right_batch = self.state.try_as_record_batch()?;
-        if self.left_index < self.left_data.num_rows() {
+        let num_left_rows = self.left_cumulative_rows.last().copied().unwrap_or(0);
+        if self.left_index < num_left_rows {
             match self.batch_transformer.next() {
                 None => {
                     let join_timer = self.join_metrics.join_time.timer();
+                    let (batch_idx, local_idx) =
+                        super::utils::find_batch_idx(&self.left_cumulative_rows, self.left_index);
                     let result = build_batch(
-                        self.left_index,
+                        local_idx,
                         right_batch,
-                        &self.left_data,
+                        &self.left_data[batch_idx],
                         &self.schema,
                     );
                     join_timer.done();

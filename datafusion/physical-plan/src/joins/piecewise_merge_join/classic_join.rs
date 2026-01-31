@@ -21,7 +21,7 @@ use arrow::array::{Array, PrimitiveBuilder, new_null_array};
 use arrow::compute::{BatchCoalescer, take};
 use arrow::datatypes::UInt32Type;
 use arrow::{
-    array::{ArrayRef, RecordBatch, UInt32Array},
+    array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array},
     compute::{sort_to_indices, take_record_batch},
 };
 use arrow_schema::{Schema, SchemaRef, SortOptions};
@@ -350,8 +350,27 @@ impl ClassicPWMJStream {
             true,
         );
 
-        let new_buffered_batch =
-            take_record_batch(buffered_data.batch(), &buffered_indices)?;
+        let dummy_streamed_indices = UInt32Array::from_value(0, buffered_indices.len());
+        let new_buffered_batch = crate::joins::utils::build_batch_from_indices_multi(
+            &buffered_data.batches[0].schema(),
+            &buffered_data.batches,
+            &[RecordBatch::new_empty(Arc::new(Schema::empty()))],
+            &buffered_indices,
+            &dummy_streamed_indices,
+            &buffered_data.batches[0]
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, _)| crate::joins::utils::ColumnIndex {
+                    index: i,
+                    side: datafusion_common::JoinSide::Left,
+                })
+                .collect::<Vec<_>>(),
+            datafusion_common::JoinSide::Left,
+            &buffered_data.cumulative_rows,
+            &[0, 0],
+        )?;
         let mut buffered_columns = new_buffered_batch.columns().to_vec();
 
         let streamed_columns: Vec<ArrayRef> = self
@@ -457,16 +476,26 @@ fn resolve_classic_join(
     join_type: JoinType,
     batch_process_state: &mut BatchProcessState,
 ) -> Result<RecordBatch> {
-    let buffered_len = buffered_side.buffered_data.values().len();
+    let buffered_len = buffered_side
+        .buffered_data
+        .cumulative_rows
+        .last()
+        .copied()
+        .unwrap_or(0);
     let stream_values = stream_batch.compare_key_values();
 
     let mut buffer_idx = batch_process_state.start_buffer_idx;
     let mut stream_idx = batch_process_state.start_stream_idx;
 
     if !batch_process_state.processed_null_count {
-        let buffered_null_idx = buffered_side.buffered_data.values().null_count();
+        let buffered_null_count: usize = buffered_side
+            .buffered_data
+            .values
+            .iter()
+            .map(|v| v.null_count())
+            .sum();
         let stream_null_idx = stream_values[0].null_count();
-        buffer_idx = buffered_null_idx;
+        buffer_idx = buffered_null_count;
         stream_idx = stream_null_idx;
         batch_process_state.processed_null_count = true;
     }
@@ -476,12 +505,16 @@ fn resolve_classic_join(
     for row_idx in stream_idx..stream_batch.batch.num_rows() {
         while buffer_idx < buffered_len {
             let compare = {
-                let buffered_values = buffered_side.buffered_data.values();
+                let (batch_idx, local_idx) = crate::joins::utils::find_batch_idx(
+                    &buffered_side.buffered_data.cumulative_rows,
+                    buffer_idx,
+                );
+                let buffered_values = &buffered_side.buffered_data.values[batch_idx];
                 compare_join_arrays(
                     &[Arc::clone(&stream_values[0])],
                     row_idx,
                     &[Arc::clone(buffered_values)],
-                    buffer_idx,
+                    local_idx,
                     &[sort_options],
                     NullEquality::NullEqualsNothing,
                 )?
@@ -605,10 +638,32 @@ fn build_matched_indices_and_set_buffered_bitmap(
         }
     }
 
-    let new_buffered_batch = buffered_side
-        .buffered_data
-        .batch()
-        .slice(buffered_range.0, buffered_range.1);
+    let buffered_indices = UInt64Array::from_iter_values(
+        (buffered_range.0..buffered_range.0 + buffered_range.1).map(|i| i as u64),
+    );
+    let dummy_streamed_indices = UInt32Array::from_value(0, buffered_range.1);
+
+    let new_buffered_batch = crate::joins::utils::build_batch_from_indices_multi(
+        &buffered_side.buffered_data.batches[0].schema(), // Hack: assumes all batches have same schema
+        &buffered_side.buffered_data.batches,
+        &[RecordBatch::new_empty(Arc::new(Schema::empty()))],
+        &buffered_indices,
+        &dummy_streamed_indices,
+        &buffered_side.buffered_data.batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, _)| crate::joins::utils::ColumnIndex {
+                index: i,
+                side: datafusion_common::JoinSide::Left,
+            })
+            .collect::<Vec<_>>(),
+        datafusion_common::JoinSide::Left,
+        &buffered_side.buffered_data.cumulative_rows,
+        &[0, 0],
+    )?;
+
     let mut buffered_columns = new_buffered_batch.columns().to_vec();
 
     let indices = UInt32Array::from_value(streamed_range.0 as u32, streamed_range.1);
