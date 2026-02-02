@@ -68,6 +68,7 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
 use arrow_schema::DataType;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, assert_or_internal_err, internal_err,
@@ -112,7 +113,9 @@ fn try_create_array_map(
         return Ok(None);
     }
 
-    if null_equality == NullEquality::NullEqualsNull {
+    // If there is more than one batch, we check for nulls early to avoid unnecessary
+    // work. For a single batch, we defer this check to avoid redundant evaluations.
+    if batches.len() > 1 && null_equality == NullEquality::NullEqualsNull {
         for batch in batches.iter() {
             let arrays = evaluate_expressions_to_arrays(on_left, batch)?;
             if arrays[0].null_count() > 0 {
@@ -172,8 +175,22 @@ fn try_create_array_map(
     let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, num_row);
     reservation.try_grow(mem_size)?;
 
-    let batch = concat_batches(schema, batches)?;
-    let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+    // If there is only one batch, we can evaluate the expressions once and reuse them.
+    // This avoids redundant evaluations and concat_batches.
+    let (batch, left_values) = if batches.len() == 1 {
+        let batch = batches[0].clone();
+        let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+        if null_equality == NullEquality::NullEqualsNull
+            && left_values[0].null_count() > 0
+        {
+            return Ok(None);
+        }
+        (batch, left_values)
+    } else {
+        let batch = concat_batches(schema, batches)?;
+        let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+        (batch, left_values)
+    };
 
     let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
 
@@ -1658,27 +1675,52 @@ async fn collect_left_input(
 
             let batches_iter = batches.iter().rev();
 
-            // Updating hashmap starting from the last batch
-            for batch in batches_iter.clone() {
+            // If there is only one batch, we can evaluate the expressions once and reuse them.
+            // This avoids redundant evaluations and concat_batches.
+            let (batch, left_values) = if batches.len() == 1 {
+                let batch = batches[0].clone();
+                let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+
                 hashes_buffer.clear();
                 hashes_buffer.resize(batch.num_rows(), 0);
-                update_hash(
-                    &on_left,
-                    batch,
-                    &mut *hashmap,
-                    offset,
-                    &random_state,
-                    &mut hashes_buffer,
-                    0,
-                    true,
-                )?;
-                offset += batch.num_rows();
-            }
 
-            // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
+                // calculate the hash values
+                create_hashes(&left_values, &random_state, &mut hashes_buffer)?;
 
-            let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+                // For usual JoinHashmap, the implementation is void.
+                hashmap.extend_zero(batch.num_rows());
+
+                // Updating JoinHashMap from hash values iterator
+                let hash_values_iter = hashes_buffer.iter().enumerate();
+
+                // Always use fifo_hashmap=true for HashJoinExec to maintain deterministic behavior
+                hashmap.update_from_iter(Box::new(hash_values_iter.rev()), 0);
+
+                (batch, left_values)
+            } else {
+                // Updating hashmap starting from the last batch
+                for batch in batches_iter.clone() {
+                    hashes_buffer.clear();
+                    hashes_buffer.resize(batch.num_rows(), 0);
+                    update_hash(
+                        &on_left,
+                        batch,
+                        &mut *hashmap,
+                        offset,
+                        &random_state,
+                        &mut hashes_buffer,
+                        0,
+                        true,
+                    )?;
+                    offset += batch.num_rows();
+                }
+
+                // Merge all batches into a single batch, so we can directly index into the arrays
+                let batch = concat_batches(&schema, batches_iter.clone())?;
+
+                let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+                (batch, left_values)
+            };
 
             (Map::HashMap(hashmap), batch, left_values)
         };
