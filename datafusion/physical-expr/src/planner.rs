@@ -23,11 +23,11 @@ use crate::{
     expressions::{self, Column, Literal, binary, like, similar_to},
 };
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::SchemaRef;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::{
-    DFSchema, Result, ScalarValue, ToDFSchema, exec_err, not_impl_err, plan_err,
+    DFSchema, Result, ScalarValue, exec_err, not_impl_err, plan_err,
 };
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::expr::{Alias, Cast, InList, Placeholder, ScalarFunction};
@@ -406,9 +406,9 @@ where
 }
 
 /// Convert a logical expression to a physical expression (without any simplification, etc)
-pub fn logical2physical(expr: &Expr, schema: &Schema) -> Arc<dyn PhysicalExpr> {
-    // TODO this makes a deep copy of the Schema. Should take SchemaRef instead and avoid deep copy
-    let df_schema = schema.clone().to_dfschema().unwrap();
+pub fn logical2physical(expr: &Expr, schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
+    // This avoids a deep copy of the Schema by taking a SchemaRef (Arc<Schema>)
+    let df_schema = DFSchema::try_from(Arc::clone(schema)).unwrap();
     let execution_props = ExecutionProps::new();
     create_physical_expr(expr, &df_schema, &execution_props).unwrap()
 }
@@ -416,7 +416,7 @@ pub fn logical2physical(expr: &Expr, schema: &Schema) -> Arc<dyn PhysicalExpr> {
 #[cfg(test)]
 mod tests {
     use arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray};
-    use arrow::datatypes::{DataType, Field};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     use datafusion_expr::{Operator, col, lit};
 

@@ -692,13 +692,11 @@ mod test {
         let metadata = reader.metadata();
 
         let table_schema =
-            parquet_to_arrow_schema(metadata.file_metadata().schema_descr(), None)
-                .expect("parsing schema");
+            Arc::new(parquet_to_arrow_schema(metadata.file_metadata().schema_descr(), None)
+                .expect("parsing schema"));
 
         let expr = col("int64_list").is_not_null();
         let expr = logical2physical(&expr, &table_schema);
-
-        let table_schema = Arc::new(table_schema.clone());
 
         let list_index = table_schema
             .index_of("int64_list")
@@ -725,11 +723,11 @@ mod test {
 
         // This is the schema we would like to coerce to,
         // which is different from the physical schema of the file.
-        let table_schema = Schema::new(vec![Field::new(
+        let table_schema = Arc::new(Schema::new(vec![Field::new(
             "timestamp_col",
             DataType::Timestamp(Nanosecond, Some(Arc::from("UTC"))),
             false,
-        )]);
+        )]));
 
         // Test all should fail
         let expr = col("timestamp_col").lt(Expr::Literal(
@@ -738,7 +736,7 @@ mod test {
         ));
         let expr = logical2physical(&expr, &table_schema);
         let expr = DefaultPhysicalExprAdapterFactory {}
-            .create(Arc::new(table_schema.clone()), Arc::clone(&file_schema))
+            .create(Arc::clone(&table_schema), Arc::clone(&file_schema))
             .rewrite(expr)
             .expect("rewriting expression");
         let candidate = FilterCandidateBuilder::new(expr, file_schema.clone())
@@ -777,7 +775,7 @@ mod test {
         let expr = logical2physical(&expr, &table_schema);
         // Rewrite the expression to add CastExpr for type coercion
         let expr = DefaultPhysicalExprAdapterFactory {}
-            .create(Arc::new(table_schema), Arc::clone(&file_schema))
+            .create(Arc::clone(&table_schema), Arc::clone(&file_schema))
             .rewrite(expr)
             .expect("rewriting expression");
         let candidate = FilterCandidateBuilder::new(expr, file_schema)
@@ -807,6 +805,7 @@ mod test {
             ),
             true,
         )]));
+        let table_schema: SchemaRef = table_schema;
 
         let expr = col("struct_col").is_not_null();
         let expr = logical2physical(&expr, &table_schema);
@@ -829,6 +828,7 @@ mod test {
             ),
             Field::new("int_col", DataType::Int32, false),
         ]));
+        let table_schema: SchemaRef = table_schema;
 
         // Expression: (struct_col IS NOT NULL) AND (int_col = 5)
         // Even though int_col is primitive, the presence of struct_col in the
@@ -853,7 +853,7 @@ mod test {
 
     #[test]
     fn nested_lists_allow_pushdown_checks() {
-        let table_schema = Arc::new(get_lists_table_schema());
+        let table_schema = get_lists_table_schema();
 
         let expr = col("utf8_list").is_not_null();
         let expr = logical2physical(&expr, &table_schema);
@@ -1060,7 +1060,7 @@ mod test {
         assert!(can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
     }
 
-    fn get_basic_table_schema() -> Schema {
+    fn get_basic_table_schema() -> SchemaRef {
         let testdata = datafusion_common::test_util::parquet_test_data();
         let file = std::fs::File::open(format!("{testdata}/alltypes_plain.parquet"))
             .expect("opening file");
@@ -1069,11 +1069,13 @@ mod test {
 
         let metadata = reader.metadata();
 
-        parquet_to_arrow_schema(metadata.file_metadata().schema_descr(), None)
-            .expect("parsing schema")
+        Arc::new(
+            parquet_to_arrow_schema(metadata.file_metadata().schema_descr(), None)
+                .expect("parsing schema"),
+        )
     }
 
-    fn get_lists_table_schema() -> Schema {
+    fn get_lists_table_schema() -> SchemaRef {
         let testdata = datafusion_common::test_util::parquet_test_data();
         let file = std::fs::File::open(format!("{testdata}/list_columns.parquet"))
             .expect("opening file");
@@ -1082,8 +1084,10 @@ mod test {
 
         let metadata = reader.metadata();
 
-        parquet_to_arrow_schema(metadata.file_metadata().schema_descr(), None)
-            .expect("parsing schema")
+        Arc::new(
+            parquet_to_arrow_schema(metadata.file_metadata().schema_descr(), None)
+                .expect("parsing schema"),
+        )
     }
 
     /// Sanity check that the given expression could be evaluated against the given schema without any errors.
