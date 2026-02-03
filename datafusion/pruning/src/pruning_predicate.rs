@@ -4784,8 +4784,8 @@ mod tests {
 
     #[test]
     fn test_rewrite_expr_to_prunable() {
-        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
-        let df_schema = DFSchema::try_from(schema.clone()).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let df_schema = DFSchema::try_from(Arc::clone(&schema)).unwrap();
 
         // column op lit
         let left_input = col("a");
@@ -4853,6 +4853,8 @@ mod tests {
         let rewriter = PredicateRewriter::new()
             .with_unhandled_hook(Arc::new(CustomUnhandledHook {}));
 
+        let schema = Arc::new(schema);
+        let schema_with_b = Arc::new(schema_with_b);
         let transform_expr = |expr| {
             let expr = logical2physical(&expr, &schema_with_b);
             rewriter.rewrite_predicate_to_statistics_predicate(&expr, &schema)
@@ -4903,8 +4905,8 @@ mod tests {
     fn test_rewrite_expr_to_prunable_error() {
         // cast string value to numeric value
         // this cast is not supported
-        let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
-        let df_schema = DFSchema::try_from(schema.clone()).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
+        let df_schema = DFSchema::try_from(Arc::clone(&schema)).unwrap();
         let left_input = cast(col("a"), DataType::Int64);
         let left_input = logical2physical(&left_input, &schema);
         let right_input = lit(ScalarValue::Int64(Some(12)));
@@ -5401,11 +5403,12 @@ mod tests {
         schema: &Schema,
         required_columns: &mut RequiredColumns,
     ) -> Arc<dyn PhysicalExpr> {
-        let expr = logical2physical(expr, schema);
+        let schema_ref = Arc::new(schema.clone());
+        let expr = logical2physical(expr, &schema_ref);
         let unhandled_hook = Arc::new(ConstantUnhandledPredicateHook::default()) as _;
         build_predicate_expression(
             &expr,
-            &Arc::new(schema.clone()),
+            &schema_ref,
             required_columns,
             &unhandled_hook,
         )
@@ -5414,7 +5417,7 @@ mod tests {
     #[test]
     fn test_build_predicate_expression_with_false() {
         let expr = lit(ScalarValue::Boolean(Some(false)));
-        let schema = Schema::empty();
+        let schema = Arc::new(Schema::empty());
         let res =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         let expected = logical2physical(&expr, &schema);
@@ -5423,7 +5426,7 @@ mod tests {
 
     #[test]
     fn test_build_predicate_expression_with_and_false() {
-        let schema = Schema::new(vec![Field::new("c1", DataType::Utf8View, false)]);
+        let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Utf8View, false)]));
         let expr = and(
             col("c1").eq(lit("a")),
             lit(ScalarValue::Boolean(Some(false))),
@@ -5436,7 +5439,7 @@ mod tests {
 
     #[test]
     fn test_build_predicate_expression_with_or_false() {
-        let schema = Schema::new(vec![Field::new("c1", DataType::Utf8View, false)]);
+        let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Utf8View, false)]));
         let left_expr = col("c1").eq(lit("a"));
         let right_expr = lit(ScalarValue::Boolean(Some(false)));
         let res = test_build_predicate_expression(

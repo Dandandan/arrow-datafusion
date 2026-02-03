@@ -1498,7 +1498,7 @@ mod tests {
         let data = bytes::Bytes::from(std::fs::read(path).unwrap());
 
         // generate pruning predicate
-        let schema = Schema::new(vec![Field::new("String", DataType::Utf8, false)]);
+        let schema = Arc::new(Schema::new(vec![Field::new("String", DataType::Utf8, false)]));
 
         let expr = col(r#""String""#).in_list(
             (1..25)
@@ -1508,7 +1508,7 @@ mod tests {
         );
         let expr = logical2physical(&expr, &schema);
         let pruning_predicate =
-            PruningPredicate::try_new(expr, Arc::new(schema)).unwrap();
+            PruningPredicate::try_new(expr, Arc::clone(&schema)).unwrap();
 
         let pruned_row_groups = test_row_group_bloom_filter_pruning_predicate(
             file_name,
@@ -1729,9 +1729,10 @@ mod tests {
             let path = format!("{testdata}/{file_name}");
             let data = bytes::Bytes::from(std::fs::read(path).unwrap());
 
+            let schema = Arc::new(schema);
             let expr = logical2physical(&expr, &schema);
             let pruning_predicate =
-                PruningPredicate::try_new(expr, Arc::new(schema)).unwrap();
+                PruningPredicate::try_new(expr, Arc::clone(&schema)).unwrap();
 
             let pruned_row_groups = test_row_group_bloom_filter_pruning_predicate(
                 &file_name,
