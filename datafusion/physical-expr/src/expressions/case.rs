@@ -23,8 +23,7 @@ use crate::expressions::{lit, try_cast};
 use arrow::array::*;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{
-    FilterBuilder, FilterPredicate, interleave, is_not_null, not, nullif,
-    prep_null_mask_filter,
+    FilterBuilder, FilterPredicate, is_not_null, not, nullif, prep_null_mask_filter,
 };
 use arrow::datatypes::{DataType, Schema, UInt32Type, UnionMode};
 use arrow::error::ArrowError;
@@ -1222,12 +1221,11 @@ impl CaseExpr {
         let num_rows = batch.num_rows();
         let evaluated_array = evaluated_expression.into_array(num_rows)?;
 
-        // Map evaluated case expression to when indices
-
-        // TODO: avoid allocating intermediate `Vecs` here
         let lookup_indices = lookup
             .lookup
             .map_to_when_indices(&evaluated_array, lookup.else_index)?;
+
+        let mut result_builder = ResultBuilder::new(&return_type, num_rows);
 
         let mut rows_per_branch: Vec<Vec<u32>> =
             vec![vec![]; (lookup.else_index + 1) as usize];
@@ -1235,33 +1233,29 @@ impl CaseExpr {
             rows_per_branch[lookup_idx as usize].push(row_idx as u32);
         }
 
-        let mut arrays = Vec::with_capacity((lookup.else_index + 1) as usize);
-        let mut interleave_indices = vec![(0usize, 0usize); num_rows];
-
         for (lookup_idx, rows) in rows_per_branch.into_iter().enumerate() {
             if rows.is_empty() {
                 continue;
             }
 
-            let array_idx = arrays.len();
-            for (i, &row_idx) in rows.iter().enumerate() {
-                interleave_indices[row_idx as usize] = (array_idx, i);
-            }
-
             let row_indices = UInt32Array::from(rows);
+            let row_indices_ref: ArrayRef = Arc::new(row_indices);
 
-            // Take the indices of. this branch and evaluate the expressions
             let branch_batch = if projected.projection.len() < batch.num_columns() {
                 let projected_batch = batch.project(&projected.projection)?;
-                take_record_batch(&projected_batch, &row_indices)?
+                take_record_batch(
+                    &projected_batch,
+                    row_indices_ref.as_primitive::<UInt32Type>(),
+                )?
             } else {
-                take_record_batch(batch, &row_indices)?
+                take_record_batch(batch, row_indices_ref.as_primitive::<UInt32Type>())?
             };
 
-            let array = if (lookup_idx as u32) < lookup.else_index {
+            if (lookup_idx as u32) < lookup.else_index {
                 let original_idx = lookup.index_mapping[lookup_idx] as usize;
                 let then_expr = &projected.body.when_then_expr[original_idx].1;
-                then_expr.evaluate(&branch_batch)?.into_array(row_indices.len())?
+                let value = then_expr.evaluate(&branch_batch)?;
+                result_builder.add_branch_result(&row_indices_ref, value)?;
             } else {
                 // ELSE branch
                 if let Some(else_expr) = &projected.body.else_expr {
@@ -1270,20 +1264,13 @@ impl CaseExpr {
                         &batch.schema(),
                         return_type.clone(),
                     )?;
-                    expr.evaluate(&branch_batch)?.into_array(row_indices.len())?
-                } else {
-                    new_null_array(&return_type, row_indices.len())
+                    let value = expr.evaluate(&branch_batch)?;
+                    result_builder.add_branch_result(&row_indices_ref, value)?;
                 }
-            };
-            arrays.push(array);
+            }
         }
 
-        if arrays.is_empty() {
-            return Ok(ColumnarValue::Scalar(ScalarValue::try_new_null(&return_type)?));
-        }
-        // Use interleave rather than `ResultBuilder` since it can be more efficient
-        let arrays_ref: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
-        Ok(ColumnarValue::Array(interleave(&arrays_ref, &interleave_indices)?))
+        result_builder.finish()
     }
 }
 
