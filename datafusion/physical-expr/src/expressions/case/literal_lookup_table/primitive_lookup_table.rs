@@ -19,6 +19,7 @@ use crate::expressions::case::literal_lookup_table::WhenLiteralIndexMap;
 use arrow::array::{
     Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, AsArray, PrimitiveArray,
 };
+use arrow::compute::{max, min};
 use arrow::datatypes::{DataType, IntervalDayTime, IntervalMonthDayNano, i256};
 use datafusion_common::{HashMap, ScalarValue, internal_err};
 use half::f16;
@@ -77,37 +78,20 @@ where
         let primitive_array = input.as_primitive::<T>();
         let primitive_values = primitive_array.values();
 
-        // Optional dense mapping for small integer ranges
-        let mut min_val = i128::MAX;
-        let mut max_val = i128::MIN;
-        let mut all_integers = true;
-
-        for &val in primitive_values {
-            if let Some(i) = val.to_i128() {
-                if i < min_val {
-                    min_val = i;
-                }
-                if i > max_val {
-                    max_val = i;
-                }
-            } else {
-                all_integers = false;
-                break;
-            }
-        }
-
+        let min_value = min(primitive_array);
+        let max_value = max(primitive_array);
         let mut map: HashMap<_, _> = HashMap::new();
         let mut dense_map = None;
-        if all_integers && !primitive_values.is_empty() {
-            let range = max_val - min_val;
+        if let (Some(min_value), Some(max_value)) = (min_value.and_then(|x|x.to_i128()), max_value.and_then(|x|x.to_i128())) {
+            let range = max_value - min_value;
             // 2048 is an arbitrary limit for the dense map size
             if range >= 0 && range < 2048 {
                 let mut v = vec![u32::MAX; (range as usize) + 1];
                 for (branch_idx, &val) in primitive_values.iter().enumerate() {
-                    let idx = (val.to_i128().unwrap() - min_val) as usize;
+                    let idx = (val.to_i128().unwrap() - min_value) as usize;
                     v[idx] = branch_idx as u32;
                 }
-                dense_map = Some((min_val, v));
+                dense_map = Some((min_value, v));
             }
         } else {
             map = primitive_values

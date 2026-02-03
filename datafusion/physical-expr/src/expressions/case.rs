@@ -39,7 +39,7 @@ use std::hash::Hash;
 use std::{any::Any, sync::Arc};
 
 use crate::expressions::case::literal_lookup_table::{
-    LiteralLookupTable, WhenLookupTable,
+    LiteralLookupTable,
 };
 use arrow::compute::kernels::merge::{MergeIndex, merge, merge_n};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -83,12 +83,6 @@ enum EvalMethod {
     ///
     /// See [`LiteralLookupTable`] for more details
     WithExprScalarLookupTable(LiteralLookupTable),
-
-    /// This is a specialization for [`EvalMethod::WithExpression`] when the WHEN expressions are literals
-    /// but the results are NOT literals (or even if some are)
-    ///
-    /// See [`WhenLookupTable`] for more details
-    WithExprBranchLookupTable(WhenLookupTable, ProjectedCaseBody),
 }
 
 /// Implementing hash so we can use `derive` on [`EvalMethod`].
@@ -98,10 +92,6 @@ enum EvalMethod {
 ///
 /// So implementing empty hash is still valid as the data is derived from `PhysicalExpr` s which are already hashed
 impl Hash for LiteralLookupTable {
-    fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {}
-}
-
-impl Hash for WhenLookupTable {
     fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {}
 }
 
@@ -117,14 +107,7 @@ impl PartialEq for LiteralLookupTable {
     }
 }
 
-impl PartialEq for WhenLookupTable {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
 impl Eq for LiteralLookupTable {}
-impl Eq for WhenLookupTable {}
 
 /// The body of a CASE expression which consists of an optional base expression, the "when/then"
 /// branches and an optional "else" branch.
@@ -342,18 +325,6 @@ fn filter_record_batch(
             filter.count(),
         ))
     }
-}
-
-fn take_record_batch(
-    record_batch: &RecordBatch,
-    indices: &UInt32Array,
-) -> std::result::Result<RecordBatch, ArrowError> {
-    let columns = record_batch
-        .columns()
-        .iter()
-        .map(|c| arrow::compute::take(c, indices, None))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    RecordBatch::try_new(record_batch.schema(), columns)
 }
 
 // This function exists purely to be able to use the same call style
@@ -673,13 +644,6 @@ impl CaseExpr {
         if body.expr.is_some() {
             if let Some(mapping) = LiteralLookupTable::maybe_new(body) {
                 return Ok(EvalMethod::WithExprScalarLookupTable(mapping));
-            }
-
-            if let Some(lookup) = WhenLookupTable::maybe_new(body) {
-                return Ok(EvalMethod::WithExprBranchLookupTable(
-                    lookup,
-                    body.project()?,
-                ));
             }
 
             return Ok(EvalMethod::WithExpression(body.project()?));
@@ -1032,7 +996,7 @@ impl CaseExpr {
     /// This function evaluates the form of CASE that matches an expression to fixed values.
     ///
     /// CASE expression
-    ///     WHEN value THEN result
+    ///     WHEN value THEN result§
     ///     [WHEN ...]
     ///     [ELSE result]
     /// END
@@ -1208,70 +1172,6 @@ impl CaseExpr {
 
         Ok(result)
     }
-
-    fn with_branch_lookup(
-        &self,
-        batch: &RecordBatch,
-        lookup: &WhenLookupTable,
-        projected: &ProjectedCaseBody,
-    ) -> Result<ColumnarValue> {
-        let return_type = self.data_type(&batch.schema())?;
-        let expr = self.body.expr.as_ref().unwrap();
-        let evaluated_expression = expr.evaluate(batch)?;
-        let num_rows = batch.num_rows();
-        let evaluated_array = evaluated_expression.into_array(num_rows)?;
-
-        let lookup_indices = lookup
-            .lookup
-            .map_to_when_indices(&evaluated_array, lookup.else_index)?;
-
-        let mut result_builder = ResultBuilder::new(&return_type, num_rows);
-
-        let mut rows_per_branch: Vec<Vec<u32>> =
-            vec![vec![]; (lookup.else_index + 1) as usize];
-        for (row_idx, &lookup_idx) in lookup_indices.iter().enumerate() {
-            rows_per_branch[lookup_idx as usize].push(row_idx as u32);
-        }
-
-        for (lookup_idx, rows) in rows_per_branch.into_iter().enumerate() {
-            if rows.is_empty() {
-                continue;
-            }
-
-            let row_indices = UInt32Array::from(rows);
-            let row_indices_ref: ArrayRef = Arc::new(row_indices);
-
-            let branch_batch = if projected.projection.len() < batch.num_columns() {
-                let projected_batch = batch.project(&projected.projection)?;
-                take_record_batch(
-                    &projected_batch,
-                    row_indices_ref.as_primitive::<UInt32Type>(),
-                )?
-            } else {
-                take_record_batch(batch, row_indices_ref.as_primitive::<UInt32Type>())?
-            };
-
-            if (lookup_idx as u32) < lookup.else_index {
-                let original_idx = lookup.index_mapping[lookup_idx] as usize;
-                let then_expr = &projected.body.when_then_expr[original_idx].1;
-                let value = then_expr.evaluate(&branch_batch)?;
-                result_builder.add_branch_result(&row_indices_ref, value)?;
-            } else {
-                // ELSE branch
-                if let Some(else_expr) = &projected.body.else_expr {
-                    let expr = try_cast(
-                        Arc::clone(else_expr),
-                        &batch.schema(),
-                        return_type.clone(),
-                    )?;
-                    let value = expr.evaluate(&branch_batch)?;
-                    result_builder.add_branch_result(&row_indices_ref, value)?;
-                }
-            }
-        }
-
-        result_builder.finish()
-    }
 }
 
 impl PhysicalExpr for CaseExpr {
@@ -1369,9 +1269,6 @@ impl PhysicalExpr for CaseExpr {
             EvalMethod::ExpressionOrExpression(p) => self.expr_or_expr(batch, p),
             EvalMethod::WithExprScalarLookupTable(lookup_table) => {
                 self.with_lookup_table(batch, lookup_table)
-            }
-            EvalMethod::WithExprBranchLookupTable(lookup, p) => {
-                self.with_branch_lookup(batch, lookup, p)
             }
         }
     }
@@ -1585,74 +1482,6 @@ mod tests {
         let expected = &Int32Array::from(vec![Some(123), None, None, Some(456)]);
 
         assert_eq!(expected, result);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_case_with_expr_branch_lookup() -> Result<()> {
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("a", DataType::Int32, true),
-                Field::new("b", DataType::Int32, true),
-            ])),
-            vec![
-                Arc::new(Int32Array::from(vec![
-                    Some(1),
-                    Some(2),
-                    Some(3),
-                    None,
-                    Some(1),
-                ])),
-                Arc::new(Int32Array::from(vec![
-                    Some(10),
-                    Some(20),
-                    Some(30),
-                    Some(40),
-                    Some(50),
-                ])),
-            ],
-        )?;
-
-        // CASE a WHEN 1 THEN b + 1 WHEN 2 THEN b + 2 ELSE b + 3 END
-        let expr = col("a", &batch.schema())?;
-        let b = col("b", &batch.schema())?;
-
-        // WHEN 1 THEN b + 1
-        let when1 = lit(1);
-        let then1 = binary(Arc::clone(&b), Operator::Plus, lit(1), &batch.schema())?;
-
-        // WHEN 2 THEN b + 2
-        let when2 = lit(2);
-        let then2 = binary(Arc::clone(&b), Operator::Plus, lit(2), &batch.schema())?;
-
-        let else_expr = binary(Arc::clone(&b), Operator::Plus, lit(3), &batch.schema())?;
-
-        let case_expr = CaseExpr::try_new(
-            Some(expr),
-            vec![(when1, then1), (when2, then2)],
-            Some(else_expr),
-        )?;
-
-        // Check that it uses WithExprBranchLookupTable
-        assert!(matches!(
-            case_expr.eval_method,
-            EvalMethod::WithExprBranchLookupTable(_, _)
-        ));
-
-        let result = case_expr.evaluate(&batch)?.into_array(batch.num_rows())?;
-        let result = as_int32_array(&result)?;
-
-        // Rows:
-        // 0: a=1 -> b+1 = 10+1 = 11
-        // 1: a=2 -> b+2 = 20+2 = 22
-        // 2: a=3 -> b+3 = 30+3 = 33 (ELSE)
-        // 3: a=null -> b+3 = 40+3 = 43 (ELSE)
-        // 4: a=1 -> b+1 = 50+1 = 51
-
-        let expected =
-            &Int32Array::from(vec![Some(11), Some(22), Some(33), Some(43), Some(51)]);
-        assert_eq!(result, expected);
 
         Ok(())
     }
