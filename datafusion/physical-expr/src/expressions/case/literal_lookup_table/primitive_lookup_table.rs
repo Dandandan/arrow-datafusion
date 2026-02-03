@@ -36,6 +36,10 @@ where
     ///
     /// If searching this map becomes a bottleneck consider using linear map implementations for small hashmaps
     map: HashMap<<T::Native as ToHashableKey>::HashableKey, u32>,
+
+    /// Optional direct mapping for dense integer keys
+    /// (min_value, lookup_vector) where lookup_vector[value - min_value] = branch_index
+    dense_map: Option<(i128, Vec<u32>)>,
 }
 
 impl<T> Debug for PrimitiveIndexMap<T>
@@ -46,6 +50,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrimitiveIndexMap")
             .field("map", &self.map)
+            .field("dense_map", &self.dense_map)
             .finish()
     }
 }
@@ -69,18 +74,53 @@ where
             return internal_err!("Literal values for WHEN clauses cannot contain nulls");
         }
 
-        let map = input
-            .as_primitive::<T>()
-            .values()
-            .iter()
-            .enumerate()
-            // Because literals are unique we can collect directly, and we can avoid only inserting the first occurrence
-            .map(|(map_index, value)| (value.into_hashable_key(), map_index as u32))
-            .collect();
+        let primitive_array = input.as_primitive::<T>();
+        let primitive_values = primitive_array.values();
+
+        // Optional dense mapping for small integer ranges
+        let mut min_val = i128::MAX;
+        let mut max_val = i128::MIN;
+        let mut all_integers = true;
+
+        for &val in primitive_values {
+            if let Some(i) = val.to_i128() {
+                if i < min_val {
+                    min_val = i;
+                }
+                if i > max_val {
+                    max_val = i;
+                }
+            } else {
+                all_integers = false;
+                break;
+            }
+        }
+
+        let mut map: HashMap<_, _> = HashMap::new();
+        let mut dense_map = None;
+        if all_integers && !primitive_values.is_empty() {
+            let range = max_val - min_val;
+            // 2048 is an arbitrary limit for the dense map size
+            if range >= 0 && range < 2048 {
+                let mut v = vec![u32::MAX; (range as usize) + 1];
+                for (branch_idx, &val) in primitive_values.iter().enumerate() {
+                    let idx = (val.to_i128().unwrap() - min_val) as usize;
+                    v[idx] = branch_idx as u32;
+                }
+                dense_map = Some((min_val, v));
+            }
+        } else {
+            map = primitive_values
+                .iter()
+                .enumerate()
+                .map(|(branch_idx, &val)| (val.into_hashable_key(), branch_idx as u32))
+                .collect();
+        }
 
         Ok(Self {
             map,
             data_type: input.data_type().clone(),
+            dense_map,
         })
     }
 
@@ -89,6 +129,44 @@ where
         array: &PrimitiveArray<T>,
         else_index: u32,
     ) -> datafusion_common::Result<Vec<u32>> {
+        if let Some((min_val, dense_map)) = &self.dense_map {
+            if array.null_count() == 0 {
+                return Ok(array
+                    .values()
+                    .iter()
+                    .map(|value| {
+                        let v = value.to_i128().unwrap();
+                        let idx = v.checked_sub(*min_val).unwrap();
+                        if idx >= 0 && (idx as usize) < dense_map.len() {
+                            let branch_idx = dense_map[idx as usize];
+                            if branch_idx != u32::MAX {
+                                return branch_idx;
+                            }
+                        }
+                        else_index
+                    })
+                    .collect());
+            }
+            return Ok(array
+                .iter()
+                .map(|value| {
+                    value
+                        .and_then(|v| v.to_i128())
+                        .and_then(|v| {
+                            let idx = v.checked_sub(*min_val)?;
+                            if idx >= 0 && (idx as usize) < dense_map.len() {
+                                let branch_idx = dense_map[idx as usize];
+                                if branch_idx != u32::MAX {
+                                    return Some(branch_idx);
+                                }
+                            }
+                            None
+                        })
+                        .unwrap_or(else_index)
+                })
+                .collect());
+        }
+
         let indices = array
             .into_iter()
             .map(|value| match value {
@@ -156,10 +234,13 @@ pub(super) trait ToHashableKey: ArrowNativeTypeOp {
     /// Converts self to a hashable key
     /// the result of this value can be used as the key in hash maps/sets
     fn into_hashable_key(self) -> Self::HashableKey;
+
+    /// Convert to i128 if it's an integer type, else None
+    fn to_i128(self) -> Option<i128>;
 }
 
 macro_rules! impl_to_hashable_key {
-    (@single_already_hashable | $t:ty) => {
+    (@single_already_hashable | $t:ty, $to_i128:expr) => {
         impl ToHashableKey for $t {
             type HashableKey = $t;
 
@@ -167,11 +248,16 @@ macro_rules! impl_to_hashable_key {
             fn into_hashable_key(self) -> Self::HashableKey {
                 self
             }
+
+            #[inline]
+            fn to_i128(self) -> Option<i128> {
+                $to_i128(self)
+            }
         }
     };
-    (@already_hashable | $($t:ty),+ $(,)?) => {
+    (@already_hashable | $($t:ty, $to_i128:expr),+ $(,)?) => {
         $(
-            impl_to_hashable_key!(@single_already_hashable | $t);
+            impl_to_hashable_key!(@single_already_hashable | $t, $to_i128);
         )+
     };
     (@float | $t:ty => $hashable:ty) => {
@@ -182,11 +268,30 @@ macro_rules! impl_to_hashable_key {
             fn into_hashable_key(self) -> Self::HashableKey {
                 self.to_bits()
             }
+
+            #[inline]
+            fn to_i128(self) -> Option<i128> {
+                None
+            }
         }
     };
 }
 
-impl_to_hashable_key!(@already_hashable | i8, i16, i32, i64, i128, i256, u8, u16, u32, u64, IntervalDayTime, IntervalMonthDayNano);
+impl_to_hashable_key!(
+    @already_hashable |
+    i8, |x: i8| Some(x as i128),
+    i16, |x: i16| Some(x as i128),
+    i32, |x: i32| Some(x as i128),
+    i64, |x: i64| Some(x as i128),
+    i128, |x: i128| Some(x),
+    i256, |_x: i256| None,
+    u8, |x: u8| Some(x as i128),
+    u16, |x: u16| Some(x as i128),
+    u32, |x: u32| Some(x as i128),
+    u64, |x: u64| Some(x as i128),
+    IntervalDayTime, |_x: IntervalDayTime| None,
+    IntervalMonthDayNano, |_x: IntervalMonthDayNano| None
+);
 impl_to_hashable_key!(@float | f16 => u16);
 impl_to_hashable_key!(@float | f32 => u32);
 impl_to_hashable_key!(@float | f64 => u64);
