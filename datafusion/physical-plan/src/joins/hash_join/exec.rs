@@ -1615,6 +1615,30 @@ async fn collect_left_input(
         _ => None,
     };
 
+    // If there are no batches, return early
+    if batches.is_empty() {
+        let batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+        let map = Map::HashMap(Box::new(JoinHashMapU32::with_capacity(0)));
+
+        if should_collect_min_max_for_phj && !should_compute_dynamic_filters {
+            bounds = None;
+        }
+
+        return Ok(JoinLeftData {
+            map: Arc::new(map),
+            batch,
+            values: left_values,
+            visited_indices_bitmap: Mutex::new(BooleanBufferBuilder::new(0)),
+            probe_threads_counter: AtomicUsize::new(probe_threads_count),
+            _reservation: reservation,
+            bounds,
+            membership: PushdownStrategy::Empty,
+            probe_side_non_empty: AtomicBool::new(false),
+            probe_side_has_null: AtomicBool::new(false),
+        });
+    };
+
     let (join_hash_map, batch, left_values) =
         if let Some((array_map, batch, left_value)) = try_create_array_map(
             &bounds,
@@ -1653,32 +1677,51 @@ async fn collect_left_input(
                 Box::new(JoinHashMapU32::with_capacity(num_rows))
             };
 
-            let mut hashes_buffer = Vec::new();
-            let mut offset = 0;
-
-            let batches_iter = batches.iter().rev();
-
-            // Updating hashmap starting from the last batch
-            for batch in batches_iter.clone() {
-                hashes_buffer.clear();
-                hashes_buffer.resize(batch.num_rows(), 0);
+            let (batch, left_values) = if batches.len() == 1 {
+                // Fast path for single batch, no need to concat
+                let batch = batches.into_iter().next().unwrap();
+                let mut hashes_buffer = vec![0; batch.num_rows()];
                 update_hash(
                     &on_left,
-                    batch,
+                    &batch,
                     &mut *hashmap,
-                    offset,
+                    0,
                     &random_state,
                     &mut hashes_buffer,
                     0,
                     true,
                 )?;
-                offset += batch.num_rows();
-            }
+                let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+                (batch, left_values)
+            } else {
+                let mut hashes_buffer = Vec::new();
+                let mut offset = 0;
 
-            // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
+                let batches_iter = batches.iter().rev();
 
-            let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+                // Updating hashmap starting from the last batch
+                for batch in batches_iter.clone() {
+                    hashes_buffer.clear();
+                    hashes_buffer.resize(batch.num_rows(), 0);
+                    update_hash(
+                        &on_left,
+                        batch,
+                        &mut *hashmap,
+                        offset,
+                        &random_state,
+                        &mut hashes_buffer,
+                        0,
+                        true,
+                    )?;
+                    offset += batch.num_rows();
+                }
+
+                // Merge all batches into a single batch, so we can directly index into the arrays
+                let batch = concat_batches(&schema, batches.iter().rev())?;
+
+                let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+                (batch, left_values)
+            };
 
             (Map::HashMap(hashmap), batch, left_values)
         };
