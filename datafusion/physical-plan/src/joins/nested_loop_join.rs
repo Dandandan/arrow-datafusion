@@ -25,8 +25,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 
 use super::utils::{
-    asymmetric_join_output_partitioning, need_produce_result_in_final,
-    reorder_output_after_swap, swap_join_projection,
+    asymmetric_join_output_partitioning, build_unmatched_batch_multi,
+    create_record_batch_with_empty_schema, find_batch_idx, interleave_with_nulls,
+    need_produce_result_in_final, reorder_output_after_swap, swap_join_projection,
 };
 use crate::common::can_project;
 use crate::execution_plan::{EmissionType, boundedness_from_children};
@@ -49,20 +50,17 @@ use crate::{
 };
 
 use arrow::array::{
-    Array, BooleanArray, BooleanBufferBuilder, RecordBatchOptions, UInt32Array,
-    UInt64Array, new_null_array,
+    Array, BooleanArray, BooleanBufferBuilder, UInt32Array, UInt64Array,
 };
 use arrow::buffer::BooleanBuffer;
-use arrow::compute::{
-    BatchCoalescer, concat_batches, filter, filter_record_batch, not, take,
-};
+use arrow::compute::{BatchCoalescer, filter_record_batch, take};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::DataType;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{
     JoinSide, Result, ScalarValue, Statistics, arrow_err, assert_eq_or_internal_err,
-    internal_datafusion_err, internal_err, project_schema, unwrap_or_internal_err,
+    internal_datafusion_err, project_schema, unwrap_or_internal_err,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -628,8 +626,10 @@ impl EmbeddedProjection for NestedLoopJoinExec {
 
 /// Left (build-side) data
 pub(crate) struct JoinLeftData {
-    /// Build-side data collected to single batch
-    batch: RecordBatch,
+    /// Build-side data collected to batches
+    pub(crate) batches: Vec<RecordBatch>,
+    /// The cumulative number of rows in the build side batches
+    pub(crate) cumulative_rows: Vec<usize>,
     /// Shared bitmap builder for visited left indices
     bitmap: SharedBitmapBuilder,
     /// Counter of running probe-threads, potentially able to update `bitmap`
@@ -642,24 +642,6 @@ pub(crate) struct JoinLeftData {
 }
 
 impl JoinLeftData {
-    pub(crate) fn new(
-        batch: RecordBatch,
-        bitmap: SharedBitmapBuilder,
-        probe_threads_counter: AtomicUsize,
-        reservation: MemoryReservation,
-    ) -> Self {
-        Self {
-            batch,
-            bitmap,
-            probe_threads_counter,
-            reservation,
-        }
-    }
-
-    pub(crate) fn batch(&self) -> &RecordBatch {
-        &self.batch
-    }
-
     pub(crate) fn bitmap(&self) -> &SharedBitmapBuilder {
         &self.bitmap
     }
@@ -679,8 +661,6 @@ async fn collect_left_input(
     with_visited_left_side: bool,
     probe_threads_count: usize,
 ) -> Result<JoinLeftData> {
-    let schema = stream.schema();
-
     // Load all batches and count the rows
     let (batches, metrics, reservation) = stream
         .try_fold(
@@ -700,11 +680,18 @@ async fn collect_left_input(
         )
         .await?;
 
-    let merged_batch = concat_batches(&schema, &batches)?;
+    let n_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    let mut cumulative_rows = Vec::with_capacity(batches.len() + 1);
+    cumulative_rows.push(0);
+    let mut current_cumulative = 0;
+    for batch in &batches {
+        current_cumulative += batch.num_rows();
+        cumulative_rows.push(current_cumulative);
+    }
 
     // Reserve memory for visited_left_side bitmap if required by join type
     let visited_left_side = if with_visited_left_side {
-        let n_rows = merged_batch.num_rows();
         let buffer_size = n_rows.div_ceil(8);
         reservation.try_grow(buffer_size)?;
         metrics.build_mem_used.add(buffer_size);
@@ -716,12 +703,13 @@ async fn collect_left_input(
         BooleanBufferBuilder::new(0)
     };
 
-    Ok(JoinLeftData::new(
-        merged_batch,
-        Mutex::new(visited_left_side),
-        AtomicUsize::new(probe_threads_count),
+    Ok(JoinLeftData {
+        batches,
+        cumulative_rows,
+        bitmap: Mutex::new(visited_left_side),
+        probe_threads_counter: AtomicUsize::new(probe_threads_count),
         reservation,
-    ))
+    })
 }
 
 /// States for join processing. See `poll_next()` comment for more details about
@@ -1152,7 +1140,7 @@ impl NestedLoopJoinStream {
                 if let (Ok(left_data), Some(right_batch)) =
                     (self.get_left_data(), self.current_right_batch.as_ref())
                 {
-                    let left_rows = left_data.batch().num_rows();
+                    let left_rows = left_data.cumulative_rows.last().copied().unwrap_or(0);
                     let right_rows = right_batch.num_rows();
                     self.metrics.selectivity.add_total(left_rows * right_rows);
                 }
@@ -1277,8 +1265,9 @@ impl NestedLoopJoinStream {
             .ok_or_else(|| internal_datafusion_err!("Right batch should be available"))?
             .clone();
 
+        let num_left_rows = left_data.cumulative_rows.last().copied().unwrap_or(0);
         // stop probing, the caller will go to the next state
-        if self.left_probe_idx >= left_data.batch().num_rows() {
+        if self.left_probe_idx >= num_left_rows {
             return Ok(false);
         }
 
@@ -1305,10 +1294,7 @@ impl NestedLoopJoinStream {
             // Calculate max left rows to handle at once. This operator tries to handle
             // up to `datafusion.execution.batch_size` rows at once in the intermediate
             // batch.
-            let l_row_count = std::cmp::min(
-                l_row_cnt_ratio,
-                left_data.batch().num_rows() - self.left_probe_idx,
-            );
+            let l_row_count = std::cmp::min(l_row_cnt_ratio, num_left_rows - self.left_probe_idx);
 
             debug_assert!(
                 l_row_count != 0,
@@ -1331,8 +1317,14 @@ impl NestedLoopJoinStream {
         }
 
         let l_idx = self.left_probe_idx;
-        let joined_batch =
-            self.process_single_left_row_join(&left_data, &right_batch, l_idx)?;
+        let (batch_idx, local_idx) = find_batch_idx(&left_data.cumulative_rows, l_idx);
+        let joined_batch = self.process_single_left_row_join(
+            &left_data.batches[batch_idx],
+            &right_batch,
+            local_idx,
+            l_idx,
+            left_data.bitmap(),
+        )?;
 
         if let Some(batch) = joined_batch {
             self.output_buffer.push_batch(batch)?;
@@ -1397,8 +1389,22 @@ impl NestedLoopJoinStream {
                     Vec::with_capacity(filter.column_indices().len());
                 for column_index in filter.column_indices() {
                     let array = if column_index.side == JoinSide::Left {
-                        let col = left_data.batch().column(column_index.index);
-                        take(col.as_ref(), &left_indices, None)?
+                        let batches_col: Vec<_> = left_data
+                            .batches
+                            .iter()
+                            .map(|b| b.column(column_index.index).as_ref())
+                            .collect();
+                        let left_indices_u64 =
+                            arrow::compute::cast(&left_indices, &DataType::UInt64)?;
+                        let left_indices_u64 = left_indices_u64
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .unwrap();
+                        interleave_with_nulls(
+                            &batches_col,
+                            left_indices_u64,
+                            &left_data.cumulative_rows,
+                        )?
                     } else {
                         let col = right_batch.column(column_index.index);
                         take(col.as_ref(), &right_indices, None)?
@@ -1518,8 +1524,22 @@ impl NestedLoopJoinStream {
             Vec::with_capacity(self.output_schema.fields().len());
         for column_index in &self.column_indices {
             let array = if column_index.side == JoinSide::Left {
-                let col = left_data.batch().column(column_index.index);
-                take(col.as_ref(), &left_indices, None)?
+                let batches_col: Vec<_> = left_data
+                    .batches
+                    .iter()
+                    .map(|b| b.column(column_index.index).as_ref())
+                    .collect();
+                let left_indices_u64 =
+                    arrow::compute::cast(&left_indices, &DataType::UInt64)?;
+                let left_indices_u64 = left_indices_u64
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                interleave_with_nulls(
+                    &batches_col,
+                    left_indices_u64,
+                    &left_data.cumulative_rows,
+                )?
             } else {
                 let col = right_batch.column(column_index.index);
                 take(col.as_ref(), &right_indices, None)?
@@ -1539,9 +1559,11 @@ impl NestedLoopJoinStream {
     /// will be set for matched indices.
     fn process_single_left_row_join(
         &mut self,
-        left_data: &JoinLeftData,
+        left_batch: &RecordBatch,
         right_batch: &RecordBatch,
-        l_index: usize,
+        local_l_index: usize,
+        global_l_index: usize,
+        left_bitmap: &SharedBitmapBuilder,
     ) -> Result<Option<RecordBatch>> {
         let right_row_count = right_batch.num_rows();
         if right_row_count == 0 {
@@ -1549,17 +1571,16 @@ impl NestedLoopJoinStream {
         }
 
         let cur_right_bitmap = if let Some(filter) = &self.join_filter {
-            apply_filter_to_row_join_batch(
-                left_data.batch(),
-                l_index,
-                right_batch,
-                filter,
-            )?
+            apply_filter_to_row_join_batch(left_batch, local_l_index, right_batch, filter)?
         } else {
             BooleanArray::from(vec![true; right_row_count])
         };
 
-        self.update_matched_bitmap(l_index, &cur_right_bitmap)?;
+        self.update_matched_bitmap_with_params(
+            global_l_index,
+            &cur_right_bitmap,
+            left_bitmap,
+        )?;
 
         // For the following join types: here we only have to set the left/right
         // bitmap, and no need to output result
@@ -1582,8 +1603,8 @@ impl NestedLoopJoinStream {
             // Use the optimized approach similar to build_intermediate_batch_for_single_left_row
             let join_batch = build_row_join_batch(
                 &self.output_schema,
-                left_data.batch(),
-                l_index,
+                left_batch,
+                local_l_index,
                 right_batch,
                 Some(cur_right_bitmap),
                 &self.column_indices,
@@ -1598,7 +1619,7 @@ impl NestedLoopJoinStream {
     /// false -> next state (Done)
     fn process_left_unmatched(&mut self) -> Result<bool> {
         let left_data = self.get_left_data()?;
-        let left_batch = left_data.batch();
+        let num_left_rows = left_data.cumulative_rows.last().copied().unwrap_or(0);
 
         // ========
         // Check early return conditions
@@ -1610,7 +1631,7 @@ impl NestedLoopJoinStream {
         let handled_by_other_partition =
             self.left_emit_idx == 0 && !left_data.report_probe_completed();
         // Stop processing unmatched rows, the caller will go to the next state
-        let finished = self.left_emit_idx >= left_batch.num_rows();
+        let finished = self.left_emit_idx >= num_left_rows;
 
         if join_type_no_produce_left || handled_by_other_partition || finished {
             return Ok(false);
@@ -1621,7 +1642,7 @@ impl NestedLoopJoinStream {
         // Each time, the number to process is up to batch size
         // ========
         let start_idx = self.left_emit_idx;
-        let end_idx = std::cmp::min(start_idx + self.batch_size, left_batch.num_rows());
+        let end_idx = std::cmp::min(start_idx + self.batch_size, num_left_rows);
 
         if let Some(batch) =
             self.process_left_unmatched_range(left_data, start_idx, end_idx)?
@@ -1660,26 +1681,45 @@ impl NestedLoopJoinStream {
 
         // Slice both left batch, and bitmap to range [start_idx, end_idx)
         // The range is bit index (not byte)
-        let left_batch = left_data.batch();
-        let left_batch_sliced = left_batch.slice(start_idx, end_idx - start_idx);
-
-        // Can this be more efficient?
         let mut bitmap_sliced = BooleanBufferBuilder::new(end_idx - start_idx);
         bitmap_sliced.append_n(end_idx - start_idx, false);
         let bitmap = left_data.bitmap().lock();
         for i in start_idx..end_idx {
-            assert!(
-                i - start_idx < bitmap_sliced.capacity(),
-                "DBG: {start_idx}, {end_idx}"
-            );
             bitmap_sliced.set_bit(i - start_idx, bitmap.get_bit(i));
         }
         let bitmap_sliced = BooleanArray::new(bitmap_sliced.finish(), None);
 
         let right_schema = self.right_data.schema();
-        build_unmatched_batch(
+
+        let (start_batch_idx, local_start_idx) =
+            find_batch_idx(&left_data.cumulative_rows, start_idx);
+        let (end_batch_idx, local_end_idx) =
+            find_batch_idx(&left_data.cumulative_rows, end_idx - 1);
+
+        let mut relevant_batches = Vec::new();
+        for i in start_batch_idx..=end_batch_idx {
+            let b = &left_data.batches[i];
+            let start = if i == start_batch_idx { local_start_idx } else { 0 };
+            let end = if i == end_batch_idx {
+                local_end_idx + 1
+            } else {
+                b.num_rows()
+            };
+            relevant_batches.push(b.slice(start, end - start));
+        }
+
+        let mut relevant_cumulative = Vec::with_capacity(relevant_batches.len() + 1);
+        relevant_cumulative.push(0);
+        let mut cur = 0;
+        for b in &relevant_batches {
+            cur += b.num_rows();
+            relevant_cumulative.push(cur);
+        }
+
+        build_unmatched_batch_multi(
             &self.output_schema,
-            &left_batch_sliced,
+            &relevant_batches,
+            &relevant_cumulative,
             bitmap_sliced,
             &right_schema,
             &self.column_indices,
@@ -1701,11 +1741,17 @@ impl NestedLoopJoinStream {
         let cur_right_batch = unwrap_or_internal_err!(right_batch);
 
         let left_data = self.get_left_data()?;
-        let left_schema = left_data.batch().schema();
+        let left_schema = if left_data.batches.is_empty() {
+            self.right_data.schema() // This is a hack, should have build side schema
+        } else {
+            left_data.batches[0].schema()
+        };
 
-        let res = build_unmatched_batch(
+        let num_right_rows = cur_right_batch.num_rows();
+        let res = build_unmatched_batch_multi(
             &self.output_schema,
-            &cur_right_batch,
+            &[cur_right_batch],
+            &[0, num_right_rows],
             right_batch_bitmap,
             &left_schema,
             &self.column_indices,
@@ -1759,19 +1805,18 @@ impl NestedLoopJoinStream {
     /// - For join types that don't require output unmatched rows, this
     ///   function can be a no-op. For inner joins, this function is a no-op; for left
     ///   joins, only the left bitmap may be updated.
-    fn update_matched_bitmap(
+    fn update_matched_bitmap_with_params(
         &mut self,
         l_index: usize,
         r_matched_bitmap: &BooleanArray,
+        left_bitmap: &SharedBitmapBuilder,
     ) -> Result<()> {
-        let left_data = self.get_left_data()?;
-
         // number of successfully joined pairs from (l_index x cur_right_batch)
         let joined_len = r_matched_bitmap.true_count();
 
         // 1. Maybe update the left bitmap
         if need_produce_result_in_final(self.join_type) && (joined_len > 0) {
-            let mut bitmap = left_data.bitmap().lock();
+            let mut bitmap = left_bitmap.lock();
             bitmap.set_bit(l_index, true);
         }
 
@@ -1987,245 +2032,6 @@ fn build_row_join_batch(
     )?))
 }
 
-/// Special case for `PlaceHolderRowExec`
-/// Minimal example:  SELECT 1 WHERE EXISTS (SELECT 1);
-//
-/// # Return
-/// If Some, that's the result batch
-/// If None, it's not for this special case. Continue execution.
-fn build_unmatched_batch_empty_schema(
-    output_schema: &SchemaRef,
-    batch_bitmap: &BooleanArray,
-    // For left/right/full joins, it needs to fill nulls for another side
-    join_type: JoinType,
-) -> Result<Option<RecordBatch>> {
-    let result_size = match join_type {
-        JoinType::Left
-        | JoinType::Right
-        | JoinType::Full
-        | JoinType::LeftAnti
-        | JoinType::RightAnti => batch_bitmap.false_count(),
-        JoinType::LeftSemi | JoinType::RightSemi => batch_bitmap.true_count(),
-        JoinType::LeftMark | JoinType::RightMark => batch_bitmap.len(),
-        _ => unreachable!(),
-    };
-
-    if output_schema.fields().is_empty() {
-        Ok(Some(create_record_batch_with_empty_schema(
-            Arc::clone(output_schema),
-            result_size,
-        )?))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Creates an empty RecordBatch with a specific row count.
-/// This is useful for cases where we need a batch with the correct schema and row count
-/// but no actual data columns (e.g., for constant filters).
-fn create_record_batch_with_empty_schema(
-    schema: SchemaRef,
-    row_count: usize,
-) -> Result<RecordBatch> {
-    let options = RecordBatchOptions::new()
-        .with_match_field_names(true)
-        .with_row_count(Some(row_count));
-
-    RecordBatch::try_new_with_options(schema, vec![], &options).map_err(|e| {
-        internal_datafusion_err!("Failed to create empty record batch: {}", e)
-    })
-}
-
-/// # Example:
-/// batch:
-/// a
-/// ----
-/// 1
-/// 2
-/// 3
-///
-/// batch_bitmap:
-/// ----
-/// false
-/// true
-/// false
-///
-/// another_side_schema:
-/// [(b, bool), (c, int32)]
-///
-/// join_type: JoinType::Left
-///
-/// col_indices: ...(please refer to the comment in `NLJStream::column_indices``)
-///
-/// batch_side: right
-///
-/// # Walkthrough:
-///
-/// This executor is performing a right join, and the currently processed right
-/// batch is as above. After joining it with all buffered left rows, the joined
-/// entries are marked by the `batch_bitmap`.
-/// This method will keep the unmatched indices on the batch side (right), and pad
-/// the left side with nulls. The result would be:
-///
-/// b          c           a
-/// ------------------------
-/// Null(bool) Null(Int32) 1
-/// Null(bool) Null(Int32) 3
-fn build_unmatched_batch(
-    output_schema: &SchemaRef,
-    batch: &RecordBatch,
-    batch_bitmap: BooleanArray,
-    // For left/right/full joins, it needs to fill nulls for another side
-    another_side_schema: &SchemaRef,
-    col_indices: &[ColumnIndex],
-    join_type: JoinType,
-    batch_side: JoinSide,
-) -> Result<Option<RecordBatch>> {
-    // Should not call it for inner joins
-    debug_assert_ne!(join_type, JoinType::Inner);
-    debug_assert_ne!(batch_side, JoinSide::None);
-
-    // Handle special case (see function comment)
-    if let Some(batch) =
-        build_unmatched_batch_empty_schema(output_schema, &batch_bitmap, join_type)?
-    {
-        return Ok(Some(batch));
-    }
-
-    match join_type {
-        JoinType::Full | JoinType::Right | JoinType::Left => {
-            if join_type == JoinType::Right {
-                debug_assert_eq!(batch_side, JoinSide::Right);
-            }
-            if join_type == JoinType::Left {
-                debug_assert_eq!(batch_side, JoinSide::Left);
-            }
-
-            // 1. Filter the batch with *flipped* bitmap
-            // 2. Fill left side with nulls
-            let flipped_bitmap = not(&batch_bitmap)?;
-
-            // create a recordbatch, with left_schema, of only one row of all nulls
-            let left_null_columns: Vec<Arc<dyn Array>> = another_side_schema
-                .fields()
-                .iter()
-                .map(|field| new_null_array(field.data_type(), 1))
-                .collect();
-
-            // Hack: If the left schema is not nullable, the full join result
-            // might contain null, this is only a temporary batch to construct
-            // such full join result.
-            let nullable_left_schema = Arc::new(Schema::new(
-                another_side_schema
-                    .fields()
-                    .iter()
-                    .map(|field| (**field).clone().with_nullable(true))
-                    .collect::<Vec<_>>(),
-            ));
-            let left_null_batch = if nullable_left_schema.fields.is_empty() {
-                // Left input can be an empty relation, in this case left relation
-                // won't be used to construct the result batch (i.e. not in `col_indices`)
-                create_record_batch_with_empty_schema(nullable_left_schema, 0)?
-            } else {
-                RecordBatch::try_new(nullable_left_schema, left_null_columns)?
-            };
-
-            debug_assert_ne!(batch_side, JoinSide::None);
-            let opposite_side = batch_side.negate();
-
-            build_row_join_batch(
-                output_schema,
-                &left_null_batch,
-                0,
-                batch,
-                Some(flipped_bitmap),
-                col_indices,
-                opposite_side,
-            )
-        }
-        JoinType::RightSemi
-        | JoinType::RightAnti
-        | JoinType::LeftSemi
-        | JoinType::LeftAnti => {
-            if matches!(join_type, JoinType::RightSemi | JoinType::RightAnti) {
-                debug_assert_eq!(batch_side, JoinSide::Right);
-            }
-            if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
-                debug_assert_eq!(batch_side, JoinSide::Left);
-            }
-
-            let bitmap = if matches!(join_type, JoinType::LeftSemi | JoinType::RightSemi)
-            {
-                batch_bitmap.clone()
-            } else {
-                not(&batch_bitmap)?
-            };
-
-            if bitmap.true_count() == 0 {
-                return Ok(None);
-            }
-
-            let mut columns: Vec<Arc<dyn Array>> =
-                Vec::with_capacity(output_schema.fields().len());
-
-            for column_index in col_indices {
-                debug_assert!(column_index.side == batch_side);
-
-                let col = batch.column(column_index.index);
-                let filtered_col = filter(col, &bitmap)?;
-
-                columns.push(filtered_col);
-            }
-
-            Ok(Some(RecordBatch::try_new(
-                Arc::clone(output_schema),
-                columns,
-            )?))
-        }
-        JoinType::RightMark | JoinType::LeftMark => {
-            if join_type == JoinType::RightMark {
-                debug_assert_eq!(batch_side, JoinSide::Right);
-            }
-            if join_type == JoinType::LeftMark {
-                debug_assert_eq!(batch_side, JoinSide::Left);
-            }
-
-            let mut columns: Vec<Arc<dyn Array>> =
-                Vec::with_capacity(output_schema.fields().len());
-
-            // Hack to deal with the borrow checker
-            let mut right_batch_bitmap_opt = Some(batch_bitmap);
-
-            for column_index in col_indices {
-                if column_index.side == batch_side {
-                    let col = batch.column(column_index.index);
-
-                    columns.push(Arc::clone(col));
-                } else if column_index.side == JoinSide::None {
-                    let right_batch_bitmap = std::mem::take(&mut right_batch_bitmap_opt);
-                    match right_batch_bitmap {
-                        Some(right_batch_bitmap) => {
-                            columns.push(Arc::new(right_batch_bitmap))
-                        }
-                        None => unreachable!("Should only be one mark column"),
-                    }
-                } else {
-                    return internal_err!(
-                        "Not possible to have this join side for RightMark join"
-                    );
-                }
-            }
-
-            Ok(Some(RecordBatch::try_new(
-                Arc::clone(output_schema),
-                columns,
-            )?))
-        }
-        _ => internal_err!(
-            "If batch is at right side, this function must be handling Full/Right/RightSemi/RightAnti/RightMark joins"
-        ),
-    }
-}
 
 #[cfg(test)]
 pub(crate) mod tests {

@@ -186,9 +186,11 @@ pub(super) struct JoinLeftData {
     /// Arc is used to allow sharing with SharedBuildAccumulator for hash map pushdown
     pub(super) map: Arc<Map>,
     /// The input rows for the build side
-    batch: RecordBatch,
-    /// The build side on expressions values
-    values: Vec<ArrayRef>,
+    pub(super) batches: Vec<RecordBatch>,
+    /// The cumulative number of rows in the build side batches
+    pub(super) cumulative_rows: Vec<usize>,
+    /// The build side on expressions values, evaluated for each batch in `batches`
+    pub(super) key_values: Vec<Vec<ArrayRef>>,
     /// Shared bitmap builder for visited left indices
     visited_indices_bitmap: SharedBitmapBuilder,
     /// Counter of running probe-threads, potentially
@@ -219,14 +221,9 @@ impl JoinLeftData {
         &self.map
     }
 
-    /// returns a reference to the build side batch
-    pub(super) fn batch(&self) -> &RecordBatch {
-        &self.batch
-    }
-
     /// returns a reference to the build side expressions values
-    pub(super) fn values(&self) -> &[ArrayRef] {
-        &self.values
+    pub(super) fn key_values(&self) -> &[Vec<ArrayRef>] {
+        &self.key_values
     }
 
     /// returns a reference to the visited indices bitmap
@@ -1470,6 +1467,7 @@ impl CollectLeftAccumulator {
 struct BuildSideState {
     batches: Vec<RecordBatch>,
     num_rows: usize,
+    key_values: Vec<Vec<ArrayRef>>,
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
     bounds_accumulators: Option<Vec<CollectLeftAccumulator>>,
@@ -1487,6 +1485,7 @@ impl BuildSideState {
         Ok(Self {
             batches: Vec::new(),
             num_rows: 0,
+            key_values: Vec::new(),
             metrics,
             reservation,
             bounds_accumulators: should_compute_dynamic_filters
@@ -1544,7 +1543,7 @@ fn should_collect_min_max_for_perfect_hash(
 /// visited indices bitmap, and computed bounds (if requested).
 #[expect(clippy::too_many_arguments)]
 async fn collect_left_input(
-    random_state: RandomState,
+    _random_state: RandomState,
     left_stream: SendableRecordBatchStream,
     on_left: Vec<PhysicalExprRef>,
     metrics: BuildProbeJoinMetrics,
@@ -1569,28 +1568,37 @@ async fn collect_left_input(
         should_compute_dynamic_filters || should_collect_min_max_for_phj,
     )?;
 
+    let on_left_copy = on_left.clone();
     let state = left_stream
-        .try_fold(initial, |mut state, batch| async move {
-            // Update accumulators if computing bounds
-            if let Some(ref mut accumulators) = state.bounds_accumulators {
-                for accumulator in accumulators {
-                    accumulator.update_batch(&batch)?;
+        .try_fold(initial, |mut state, batch| {
+            let on_left = on_left_copy.clone();
+            async move {
+                // Update accumulators if computing bounds
+                if let Some(ref mut accumulators) = state.bounds_accumulators {
+                    for accumulator in accumulators {
+                        accumulator.update_batch(&batch)?;
+                    }
                 }
-            }
 
-            // Decide if we spill or not
-            let batch_size = get_record_batch_memory_size(&batch);
-            // Reserve memory for incoming batch
-            state.reservation.try_grow(batch_size)?;
-            // Update metrics
-            state.metrics.build_mem_used.add(batch_size);
-            state.metrics.build_input_batches.add(1);
-            state.metrics.build_input_rows.add(batch.num_rows());
-            // Update row count
-            state.num_rows += batch.num_rows();
-            // Push batch to output
-            state.batches.push(batch);
-            Ok(state)
+                // Decide if we spill or not
+                let batch_size = get_record_batch_memory_size(&batch);
+                // Reserve memory for incoming batch
+                state.reservation.try_grow(batch_size)?;
+                // Update metrics
+                state.metrics.build_mem_used.add(batch_size);
+                state.metrics.build_input_batches.add(1);
+                state.metrics.build_input_rows.add(batch.num_rows());
+                // Update row count
+                state.num_rows += batch.num_rows();
+
+                // Evaluate join keys for this batch
+                let keys = evaluate_expressions_to_arrays(&on_left, &batch)?;
+                state.key_values.push(keys);
+
+                // Push batch to output
+                state.batches.push(batch);
+                Ok(state)
+            }
         })
         .await?;
 
@@ -1598,6 +1606,7 @@ async fn collect_left_input(
     let BuildSideState {
         batches,
         num_rows,
+        key_values,
         metrics,
         mut reservation,
         bounds_accumulators,
@@ -1615,113 +1624,150 @@ async fn collect_left_input(
         _ => None,
     };
 
-    let (join_hash_map, batch, left_values) =
-        if let Some((array_map, batch, left_value)) = try_create_array_map(
-            &bounds,
-            &schema,
-            &batches,
-            &on_left,
-            &mut reservation,
-            config.execution.perfect_hash_join_small_build_threshold,
-            config.execution.perfect_hash_join_min_key_density,
-            null_equality,
-        )? {
-            array_map_created_count.add(1);
-            metrics.build_mem_used.add(array_map.size());
+    let (join_hash_map, batches, cumulative_rows, key_values, membership) = if let Some((
+        array_map,
+        batch,
+        left_values,
+    )) = try_create_array_map(
+        &bounds,
+        &schema,
+        &batches,
+        &on_left,
+        &mut reservation,
+        config.execution.perfect_hash_join_small_build_threshold,
+        config.execution.perfect_hash_join_min_key_density,
+        null_equality,
+    )? {
+        array_map_created_count.add(1);
+        metrics.build_mem_used.add(array_map.size());
 
-            (Map::ArrayMap(array_map), batch, left_value)
+        let map_arc = Arc::new(Map::ArrayMap(array_map));
+        let membership = if num_rows == 0 {
+            PushdownStrategy::Empty
         } else {
-            // Estimation of memory size, required for hashtable, prior to allocation.
-            // Final result can be verified using `RawTable.allocation_info()`
-            let fixed_size_u32 = size_of::<JoinHashMapU32>();
-            let fixed_size_u64 = size_of::<JoinHashMapU64>();
-
-            // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
-            // `u64` indice variant
-            // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
-            let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
-                let estimated_hashtable_size =
-                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-                reservation.try_grow(estimated_hashtable_size)?;
-                metrics.build_mem_used.add(estimated_hashtable_size);
-                Box::new(JoinHashMapU64::with_capacity(num_rows))
+            let estimated_size = left_values
+                .iter()
+                .map(|arr| arr.get_array_memory_size())
+                .sum::<usize>();
+            if left_values.is_empty()
+                || left_values[0].is_empty()
+                || estimated_size > config.optimizer.hash_join_inlist_pushdown_max_size
+                || map_arc.num_of_distinct_key()
+                    > config
+                        .optimizer
+                        .hash_join_inlist_pushdown_max_distinct_values
+            {
+                PushdownStrategy::Map(Arc::clone(&map_arc))
+            } else if let Some(in_list_values) = build_struct_inlist_values(&left_values)?
+            {
+                PushdownStrategy::InList(in_list_values)
             } else {
-                let estimated_hashtable_size =
-                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-                reservation.try_grow(estimated_hashtable_size)?;
-                metrics.build_mem_used.add(estimated_hashtable_size);
-                Box::new(JoinHashMapU32::with_capacity(num_rows))
-            };
-
-            let mut hashes_buffer = Vec::new();
-            let mut offset = 0;
-
-            let batches_iter = batches.iter().rev();
-
-            // Updating hashmap starting from the last batch
-            for batch in batches_iter.clone() {
-                hashes_buffer.clear();
-                hashes_buffer.resize(batch.num_rows(), 0);
-                update_hash(
-                    &on_left,
-                    batch,
-                    &mut *hashmap,
-                    offset,
-                    &random_state,
-                    &mut hashes_buffer,
-                    0,
-                    true,
-                )?;
-                offset += batch.num_rows();
+                PushdownStrategy::Map(Arc::clone(&map_arc))
             }
-
-            // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
-
-            let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
-
-            (Map::HashMap(hashmap), batch, left_values)
         };
+        // In the ArrayMap case, we currently still concatenate for simplicity.
+        // But JoinLeftData now stores Vec<RecordBatch>.
+        // We can just keep the concatenated batch as a single batch in Vec.
+        // TODO: optimize ArrayMap to work with Vec<RecordBatch>
+        let cumulative_rows = vec![0, batch.num_rows()];
+        (map_arc, vec![batch], cumulative_rows, vec![left_values], membership)
+    } else {
+        // Estimation of memory size, required for hashtable, prior to allocation.
+        // Final result can be verified using `RawTable.allocation_info()`
+        let fixed_size_u32 = size_of::<JoinHashMapU32>();
+        let fixed_size_u64 = size_of::<JoinHashMapU64>();
+
+        // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
+        // `u64` indice variant
+        // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
+        let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
+            let estimated_hashtable_size =
+                estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+            reservation.try_grow(estimated_hashtable_size)?;
+            metrics.build_mem_used.add(estimated_hashtable_size);
+            Box::new(JoinHashMapU64::with_capacity(num_rows))
+        } else {
+            let estimated_hashtable_size =
+                estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+            reservation.try_grow(estimated_hashtable_size)?;
+            metrics.build_mem_used.add(estimated_hashtable_size);
+            Box::new(JoinHashMapU32::with_capacity(num_rows))
+        };
+
+        let mut hashes_buffer = Vec::new();
+
+        let mut cumulative_rows = Vec::with_capacity(batches.len() + 1);
+        cumulative_rows.push(0);
+        let mut current_cumulative = 0;
+        for batch in &batches {
+            current_cumulative += batch.num_rows();
+            cumulative_rows.push(current_cumulative);
+        }
+
+        // Updating hashmap starting from the last batch to maintain LIFO order
+        for (i, batch) in batches.iter().enumerate().rev() {
+            hashes_buffer.clear();
+            hashes_buffer.resize(batch.num_rows(), 0);
+            update_hash(
+                &on_left,
+                batch,
+                &mut *hashmap,
+                cumulative_rows[i],
+                &HASH_JOIN_SEED.random_state(),
+                &mut hashes_buffer,
+                0,
+                true,
+            )?;
+        }
+
+        let map = Arc::new(Map::HashMap(hashmap));
+
+        // For membership, we still might want to evaluate keys across all batches.
+        // For simplicity and since it's only for small build sides, we can concatenate keys here.
+        let membership = if num_rows == 0 {
+            PushdownStrategy::Empty
+        } else {
+            // Only concatenate keys for InList pushdown if build side is small
+            // Otherwise use the Map strategy
+            if num_rows > config.optimizer.hash_join_inlist_pushdown_max_distinct_values {
+                PushdownStrategy::Map(Arc::clone(&map))
+            } else {
+                let batch_keys = concat_batches(&schema, &batches)?;
+                let left_values = evaluate_expressions_to_arrays(&on_left, &batch_keys)?;
+                let estimated_size = left_values
+                    .iter()
+                    .map(|arr| arr.get_array_memory_size())
+                    .sum::<usize>();
+
+                if left_values.is_empty()
+                    || left_values[0].is_empty()
+                    || estimated_size > config.optimizer.hash_join_inlist_pushdown_max_size
+                {
+                    PushdownStrategy::Map(Arc::clone(&map))
+                } else if let Some(in_list_values) =
+                    build_struct_inlist_values(&left_values)?
+                {
+                    PushdownStrategy::InList(in_list_values)
+                } else {
+                    PushdownStrategy::Map(Arc::clone(&map))
+                }
+            }
+        };
+
+        (map, batches, cumulative_rows, key_values, membership)
+    };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
-        let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
+        let bitmap_size = bit_util::ceil(num_rows, 8);
         reservation.try_grow(bitmap_size)?;
         metrics.build_mem_used.add(bitmap_size);
 
-        let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
+        let mut bitmap_buffer = BooleanBufferBuilder::new(num_rows);
         bitmap_buffer.append_n(num_rows, false);
         bitmap_buffer
     } else {
         BooleanBufferBuilder::new(0)
-    };
-
-    let map = Arc::new(join_hash_map);
-
-    let membership = if num_rows == 0 {
-        PushdownStrategy::Empty
-    } else {
-        // If the build side is small enough we can use IN list pushdown.
-        // If it's too big we fall back to pushing down a reference to the hash table.
-        // See `PushdownStrategy` for more details.
-        let estimated_size = left_values
-            .iter()
-            .map(|arr| arr.get_array_memory_size())
-            .sum::<usize>();
-        if left_values.is_empty()
-            || left_values[0].is_empty()
-            || estimated_size > config.optimizer.hash_join_inlist_pushdown_max_size
-            || map.num_of_distinct_key()
-                > config
-                    .optimizer
-                    .hash_join_inlist_pushdown_max_distinct_values
-        {
-            PushdownStrategy::Map(Arc::clone(&map))
-        } else if let Some(in_list_values) = build_struct_inlist_values(&left_values)? {
-            PushdownStrategy::InList(in_list_values)
-        } else {
-            PushdownStrategy::Map(Arc::clone(&map))
-        }
     };
 
     if should_collect_min_max_for_phj && !should_compute_dynamic_filters {
@@ -1729,9 +1775,10 @@ async fn collect_left_input(
     }
 
     let data = JoinLeftData {
-        map,
-        batch,
-        values: left_values,
+        map: join_hash_map,
+        batches,
+        cumulative_rows,
+        key_values,
         visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
         probe_threads_counter: AtomicUsize::new(probe_threads_count),
         _reservation: reservation,
@@ -3991,7 +4038,8 @@ mod tests {
         let mut build_indices_buffer = Vec::new();
         let (l, r, _) = lookup_join_hashmap(
             &join_hash_map,
-            &[left_keys_values],
+            &[vec![left_keys_values]],
+            &[0, left.num_rows()],
             &[right_keys_values],
             NullEquality::NullEqualsNothing,
             &hashes_buffer,
@@ -4052,7 +4100,8 @@ mod tests {
         let mut build_indices_buffer = Vec::new();
         let (l, r, _) = lookup_join_hashmap(
             &join_hash_map,
-            &[left_keys_values],
+            &[vec![left_keys_values]],
+            &[0, left.num_rows()],
             &[right_keys_values],
             NullEquality::NullEqualsNothing,
             &hashes_buffer,

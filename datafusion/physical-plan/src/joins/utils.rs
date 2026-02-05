@@ -1900,6 +1900,333 @@ pub fn compare_join_arrays(
     Ok(res)
 }
 
+pub(crate) fn create_record_batch_with_empty_schema(
+    schema: Arc<Schema>,
+    row_count: usize,
+) -> Result<RecordBatch> {
+    let options = RecordBatchOptions::new()
+        .with_match_field_names(true)
+        .with_row_count(Some(row_count));
+
+    RecordBatch::try_new_with_options(schema, vec![], &options).map_err(|e| {
+        DataFusionError::Internal(format!("Failed to create empty record batch: {}", e))
+    })
+}
+
+pub(crate) fn find_batch_idx(cumulative_rows: &[usize], row_idx: usize) -> (usize, usize) {
+    let mut batch_idx = 0;
+    while batch_idx + 1 < cumulative_rows.len() && cumulative_rows[batch_idx + 1] <= row_idx
+    {
+        batch_idx += 1;
+    }
+    (batch_idx, row_idx - cumulative_rows[batch_idx])
+}
+
+pub(crate) fn interleave_with_nulls(
+    batches: &[&dyn Array],
+    indices: &UInt64Array,
+    cumulative_rows: &[usize],
+) -> Result<Arc<dyn Array>> {
+    if indices.is_empty() {
+        return Ok(new_null_array(batches[0].data_type(), 0));
+    }
+
+    let null_arr = new_null_array(batches[0].data_type(), 1);
+    let mut all_batches = Vec::with_capacity(batches.len() + 1);
+    all_batches.extend_from_slice(batches);
+    all_batches.push(null_arr.as_ref());
+
+    let null_batch_idx = batches.len();
+
+    let mut interleave_indices = Vec::with_capacity(indices.len());
+    for i in 0..indices.len() {
+        if indices.is_null(i) {
+            interleave_indices.push((null_batch_idx, 0));
+        } else {
+            let (batch_idx, local_idx) =
+                find_batch_idx(cumulative_rows, indices.value(i) as usize);
+            interleave_indices.push((batch_idx, local_idx));
+        }
+    }
+
+    Ok(compute::interleave(&all_batches, &interleave_indices)?)
+}
+
+pub(crate) fn build_batch_from_indices_multi(
+    schema: &Schema,
+    build_batches: &[RecordBatch],
+    probe_batches: &[RecordBatch],
+    build_indices: &UInt64Array,
+    probe_indices: &UInt32Array,
+    column_indices: &[ColumnIndex],
+    build_side: JoinSide,
+    build_cumulative_rows: &[usize],
+    probe_cumulative_rows: &[usize],
+) -> Result<RecordBatch> {
+    if schema.fields().is_empty() {
+        let options = RecordBatchOptions::new()
+            .with_match_field_names(true)
+            .with_row_count(Some(build_indices.len()));
+
+        return Ok(RecordBatch::try_new_with_options(
+            Arc::new(schema.clone()),
+            vec![],
+            &options,
+        )?);
+    }
+
+    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
+
+    for column_index in column_indices {
+        let array = if column_index.side == JoinSide::None {
+            Arc::new(compute::is_not_null(probe_indices)?)
+        } else if column_index.side == build_side {
+            if build_indices.null_count() == build_indices.len() {
+                new_null_array(
+                    build_batches[0]
+                        .schema()
+                        .field(column_index.index)
+                        .data_type(),
+                    build_indices.len(),
+                )
+            } else {
+                let batches_col: Vec<_> = build_batches
+                    .iter()
+                    .map(|b| b.column(column_index.index).as_ref())
+                    .collect();
+                interleave_with_nulls(&batches_col, build_indices, build_cumulative_rows)?
+            }
+        } else {
+            if probe_indices.null_count() == probe_indices.len() {
+                new_null_array(
+                    probe_batches[0]
+                        .schema()
+                        .field(column_index.index)
+                        .data_type(),
+                    probe_indices.len(),
+                )
+            } else {
+                let batches_col: Vec<_> = probe_batches
+                    .iter()
+                    .map(|b| b.column(column_index.index).as_ref())
+                    .collect();
+                let probe_indices_u64 = compute::cast(probe_indices, &DataType::UInt64)?;
+                let probe_indices_u64 = probe_indices_u64
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                interleave_with_nulls(
+                    &batches_col,
+                    probe_indices_u64,
+                    probe_cumulative_rows,
+                )?
+            }
+        };
+
+        columns.push(array);
+    }
+    Ok(RecordBatch::try_new(Arc::new(schema.clone()), columns)?)
+}
+
+pub(crate) fn apply_join_filter_to_indices_multi(
+    build_batches: &[RecordBatch],
+    probe_batches: &[RecordBatch],
+    build_indices: UInt64Array,
+    probe_indices: UInt32Array,
+    filter: &JoinFilter,
+    build_side: JoinSide,
+    build_cumulative_rows: &[usize],
+    probe_cumulative_rows: &[usize],
+) -> Result<(UInt64Array, UInt32Array)> {
+    if build_indices.is_empty() && probe_indices.is_empty() {
+        return Ok((build_indices, probe_indices));
+    }
+
+    let filter_batch = build_batch_from_indices_multi(
+        filter.schema(),
+        build_batches,
+        probe_batches,
+        &build_indices,
+        &probe_indices,
+        filter.column_indices(),
+        build_side,
+        build_cumulative_rows,
+        probe_cumulative_rows,
+    )?;
+
+    let filter_result = filter
+        .expression()
+        .evaluate(&filter_batch)?
+        .into_array(filter_batch.num_rows())?;
+    let mask = as_boolean_array(&filter_result)?;
+
+    let build_filtered = compute::filter(&build_indices, mask)?;
+    let probe_filtered = compute::filter(&probe_indices, mask)?;
+
+    Ok((
+        downcast_array(build_filtered.as_ref()),
+        downcast_array(probe_filtered.as_ref()),
+    ))
+}
+
+pub(crate) fn build_unmatched_batch_multi(
+    output_schema: &Arc<Schema>,
+    batch: &[RecordBatch],
+    batch_cumulative_rows: &[usize],
+    batch_bitmap: BooleanArray,
+    another_side_schema: &Arc<Schema>,
+    col_indices: &[ColumnIndex],
+    join_type: JoinType,
+    batch_side: JoinSide,
+) -> Result<Option<RecordBatch>> {
+    if output_schema.fields().is_empty() {
+        let num_rows = match join_type {
+            JoinType::LeftSemi | JoinType::RightSemi => batch_bitmap.true_count(),
+            JoinType::LeftMark | JoinType::RightMark => batch_bitmap.len(),
+            _ => batch_bitmap.false_count(),
+        };
+
+        if num_rows == 0 {
+            return Ok(None);
+        }
+
+        let options = RecordBatchOptions::new()
+            .with_match_field_names(true)
+            .with_row_count(Some(num_rows));
+
+        return Ok(Some(RecordBatch::try_new_with_options(
+            Arc::clone(output_schema),
+            vec![],
+            &options,
+        )?));
+    }
+
+    let num_input_rows = batch_cumulative_rows.last().copied().unwrap_or(0);
+
+    let (indices, probe_indices) = match join_type {
+        JoinType::LeftSemi | JoinType::RightSemi => {
+            let mut indices = UInt64Builder::with_capacity(batch_bitmap.true_count());
+            for i in 0..batch_bitmap.len() {
+                if batch_bitmap.value(i) {
+                    indices.append_value(i as u64);
+                }
+            }
+            let indices = indices.finish();
+            let dummy = UInt32Array::from_iter(std::iter::repeat_n(None, indices.len()));
+            (indices, dummy)
+        }
+        JoinType::LeftAnti
+        | JoinType::RightAnti
+        | JoinType::Left
+        | JoinType::Right
+        | JoinType::Full => {
+            let mut indices = UInt64Builder::with_capacity(batch_bitmap.false_count());
+            for i in 0..batch_bitmap.len() {
+                if !batch_bitmap.value(i) {
+                    indices.append_value(i as u64);
+                }
+            }
+            let indices = indices.finish();
+            let dummy = UInt32Array::from_iter(std::iter::repeat_n(None, indices.len()));
+            (indices, dummy)
+        }
+        JoinType::LeftMark | JoinType::RightMark => {
+            let indices = UInt64Array::from_iter_values(0..num_input_rows as u64);
+            let mut mark_indices = UInt32Builder::with_capacity(num_input_rows);
+            for i in 0..batch_bitmap.len() {
+                if batch_bitmap.value(i) {
+                    mark_indices.append_value(1);
+                } else {
+                    mark_indices.append_null();
+                }
+            }
+            (indices, mark_indices.finish())
+        }
+        _ => {
+            return Err(DataFusionError::Internal(format!(
+                "Unsupported join type in build_unmatched_batch_multi: {:?}",
+                join_type
+            )));
+        }
+    };
+
+    if indices.is_empty() && !matches!(join_type, JoinType::LeftMark | JoinType::RightMark)
+    {
+        return Ok(None);
+    }
+
+    let empty_another_side_batch = RecordBatch::new_empty(another_side_schema.clone());
+
+    Ok(Some(build_batch_from_indices_multi(
+        output_schema,
+        batch,
+        &[empty_another_side_batch],
+        &indices,
+        &probe_indices,
+        col_indices,
+        batch_side,
+        batch_cumulative_rows,
+        &[0, 0],
+    )?))
+}
+
+pub(super) fn equal_rows_arr_multi(
+    indices_left: &UInt64Array,
+    indices_right: &UInt32Array,
+    left_key_values: &[Vec<ArrayRef>],
+    left_cumulative_rows: &[usize],
+    right_arrays: &[ArrayRef],
+    null_equality: NullEquality,
+) -> Result<(UInt64Array, UInt32Array)> {
+    if left_key_values.is_empty() {
+        return Ok((indices_left.clone(), indices_right.clone()));
+    }
+    let num_columns = left_key_values[0].len();
+
+    if num_columns == 0 {
+        return Ok((indices_left.clone(), indices_right.clone()));
+    }
+
+    let first_left_key_col: Vec<_> = left_key_values
+        .iter()
+        .map(|v| v[0].as_ref())
+        .collect();
+    let arr_left = interleave_with_nulls(
+        &first_left_key_col,
+        indices_left,
+        left_cumulative_rows,
+    )?;
+    let arr_right = take(right_arrays[0].as_ref(), indices_right, None)?;
+
+    let mut equal: BooleanArray =
+        eq_dyn_null(arr_left.as_ref(), arr_right.as_ref(), null_equality)?;
+
+    for col_idx in 1..num_columns {
+        let left_key_col: Vec<_> = left_key_values
+            .iter()
+            .map(|v| v[col_idx].as_ref())
+            .collect();
+        let arr_left = interleave_with_nulls(
+            &left_key_col,
+            indices_left,
+            left_cumulative_rows,
+        )?;
+        let arr_right = take(right_arrays[col_idx].as_ref(), indices_right, None)?;
+        let eq = eq_dyn_null(arr_left.as_ref(), arr_right.as_ref(), null_equality)?;
+        equal = and(&equal, &eq)?;
+    }
+
+    let filter_builder = FilterBuilder::new(&equal).optimize().build();
+
+    let left_filtered = filter_builder.filter(indices_left)?;
+    let right_filtered = filter_builder.filter(indices_right)?;
+
+    Ok((
+        downcast_array(left_filtered.as_ref()),
+        downcast_array(right_filtered.as_ref()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
