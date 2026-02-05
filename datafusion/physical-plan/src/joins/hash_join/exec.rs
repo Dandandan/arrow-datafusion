@@ -23,6 +23,7 @@ use std::{any::Any, vec};
 
 use crate::ExecutionPlanProperties;
 use crate::execution_plan::{EmissionType, boundedness_from_children};
+use crate::hash_utils::create_hashes;
 use crate::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase,
     FilterPushdownPropagation,
@@ -107,11 +108,47 @@ fn try_create_array_map(
     perfect_hash_join_small_build_threshold: usize,
     perfect_hash_join_min_key_density: f64,
     null_equality: NullEquality,
+    pre_evaluated_left_values: Option<Vec<ArrayRef>>,
 ) -> Result<Option<(ArrayMap, RecordBatch, Vec<ArrayRef>)>> {
     if on_left.len() != 1 {
         return Ok(None);
     }
 
+    // If we have only one batch, we can evaluate expressions once and use it for everything.
+    if batches.len() == 1 {
+        let batch = &batches[0];
+        let left_values = match pre_evaluated_left_values {
+            Some(v) => v,
+            None => evaluate_expressions_to_arrays(on_left, batch)?,
+        };
+
+        if null_equality == NullEquality::NullEqualsNull && left_values[0].null_count() > 0 {
+            return Ok(None);
+        }
+
+        let Some((min_val, max_val)) = get_min_max_for_phj(bounds)? else {
+            return Ok(None);
+        };
+
+        if !should_use_phj(
+            min_val,
+            max_val,
+            batch.num_rows(),
+            perfect_hash_join_small_build_threshold,
+            perfect_hash_join_min_key_density,
+        ) {
+            return Ok(None);
+        }
+
+        let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, batch.num_rows());
+        reservation.try_grow(mem_size)?;
+
+        let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
+
+        return Ok(Some((array_map, batch.clone(), left_values)));
+    }
+
+    // Multi-batch case
     if null_equality == NullEquality::NullEqualsNull {
         for batch in batches.iter() {
             let arrays = evaluate_expressions_to_arrays(on_left, batch)?;
@@ -121,7 +158,35 @@ fn try_create_array_map(
         }
     }
 
-    let (min_val, max_val) = if let Some(bounds) = bounds {
+    let Some((min_val, max_val)) = get_min_max_for_phj(bounds)? else {
+        return Ok(None);
+    };
+
+    let num_rows: usize = batches.iter().map(|x| x.num_rows()).sum();
+    if !should_use_phj(
+        min_val,
+        max_val,
+        num_rows,
+        perfect_hash_join_small_build_threshold,
+        perfect_hash_join_min_key_density,
+    ) {
+        return Ok(None);
+    }
+
+    let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, num_rows);
+    reservation.try_grow(mem_size)?;
+
+    let batch = concat_batches(schema, batches)?;
+    let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+
+    let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
+
+    Ok(Some((array_map, batch, left_values)))
+}
+
+/// Helper function to get min/max values for PHJ from bounds
+fn get_min_max_for_phj(bounds: &Option<PartitionBounds>) -> Result<Option<(u64, u64)>> {
+    if let Some(bounds) = bounds {
         let (min_val, max_val) = if let Some(cb) = bounds.get_column_bounds(0) {
             (cb.min.clone(), cb.max.clone())
         } else {
@@ -139,45 +204,45 @@ fn try_create_array_map(
         if let Some((mi, ma)) =
             ArrayMap::key_to_u64(&min_val).zip(ArrayMap::key_to_u64(&max_val))
         {
-            (mi, ma)
+            Ok(Some((mi, ma)))
         } else {
-            return Ok(None);
+            Ok(None)
         }
     } else {
-        return Ok(None);
-    };
+        Ok(None)
+    }
+}
 
+/// Helper function to determine if PHJ should be used based on range and density
+fn should_use_phj(
+    min_val: u64,
+    max_val: u64,
+    num_rows: usize,
+    perfect_hash_join_small_build_threshold: usize,
+    perfect_hash_join_min_key_density: f64,
+) -> bool {
     let range = ArrayMap::calculate_range(min_val, max_val);
-    let num_row: usize = batches.iter().map(|x| x.num_rows()).sum();
-    let dense_ratio = (num_row as f64) / ((range + 1) as f64);
+    let dense_ratio = (num_rows as f64) / ((range + 1) as f64);
 
     // TODO: support create ArrayMap<u64>
-    if num_row >= u32::MAX as usize {
-        return Ok(None);
+    if num_rows >= u32::MAX as usize {
+        return false;
     }
 
     if range >= perfect_hash_join_small_build_threshold as u64
         && dense_ratio <= perfect_hash_join_min_key_density
     {
-        return Ok(None);
+        return false;
     }
 
     // If range equals usize::MAX, then range + 1 would overflow to 0, which would cause
     // ArrayMap to allocate an invalid zero-sized array or cause indexing issues.
     // This check prevents such overflow and ensures valid array allocation.
     if range == usize::MAX as u64 {
-        return Ok(None);
+        return false;
     }
 
-    let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, num_row);
-    reservation.try_grow(mem_size)?;
-
-    let batch = concat_batches(schema, batches)?;
-    let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
-
-    let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
-
-    Ok(Some((array_map, batch, left_values)))
+    true
 }
 
 /// HashTable and input data for the left (build side) of a join
@@ -1615,7 +1680,67 @@ async fn collect_left_input(
         _ => None,
     };
 
-    let (join_hash_map, batch, left_values) =
+    let (join_hash_map, batch, left_values) = if batches.len() == 1 {
+        let batch = batches.into_iter().next().unwrap();
+        let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+
+        if let Some((array_map, batch, left_value)) = try_create_array_map(
+            &bounds,
+            &schema,
+            &[batch.clone()],
+            &on_left,
+            &mut reservation,
+            config.execution.perfect_hash_join_small_build_threshold,
+            config.execution.perfect_hash_join_min_key_density,
+            null_equality,
+            Some(left_values.clone()),
+        )? {
+            array_map_created_count.add(1);
+            metrics.build_mem_used.add(array_map.size());
+
+            (Map::ArrayMap(array_map), batch, left_value)
+        } else {
+            // Estimation of memory size, required for hashtable, prior to allocation.
+            // Final result can be verified using `RawTable.allocation_info()`
+            let fixed_size_u32 = size_of::<JoinHashMapU32>();
+            let fixed_size_u64 = size_of::<JoinHashMapU64>();
+
+            // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
+            // `u64` indice variant
+            // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
+            let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
+                let estimated_hashtable_size =
+                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+                reservation.try_grow(estimated_hashtable_size)?;
+                metrics.build_mem_used.add(estimated_hashtable_size);
+                Box::new(JoinHashMapU64::with_capacity(num_rows))
+            } else {
+                let estimated_hashtable_size =
+                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+                reservation.try_grow(estimated_hashtable_size)?;
+                metrics.build_mem_used.add(estimated_hashtable_size);
+                Box::new(JoinHashMapU32::with_capacity(num_rows))
+            };
+
+            let mut hashes_buffer = Vec::new();
+            hashes_buffer.resize(batch.num_rows(), 0);
+            create_hashes(&left_values, &random_state, &mut hashes_buffer)?;
+
+            hashmap.extend_zero(batch.num_rows());
+            hashmap.update_from_iter(
+                Box::new(
+                    hashes_buffer
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .map(|(i, val)| (i, val)),
+                ),
+                0,
+            );
+
+            (Map::HashMap(hashmap), batch, left_values)
+        }
+    } else {
         if let Some((array_map, batch, left_value)) = try_create_array_map(
             &bounds,
             &schema,
@@ -1625,6 +1750,7 @@ async fn collect_left_input(
             config.execution.perfect_hash_join_small_build_threshold,
             config.execution.perfect_hash_join_min_key_density,
             null_equality,
+            None,
         )? {
             array_map_created_count.add(1);
             metrics.build_mem_used.add(array_map.size());
@@ -1681,7 +1807,8 @@ async fn collect_left_input(
             let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
 
             (Map::HashMap(hashmap), batch, left_values)
-        };
+        }
+    };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
