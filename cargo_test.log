@@ -1,0 +1,14 @@
+   Compiling datafusion-optimizer v52.0.0 (/app/datafusion/optimizer)
+warning: unused variable: `transformed_plan`
+   --> datafusion/optimizer/src/optimize_projections/mod.rs:144:9
+    |
+144 |     let transformed_plan = match plan {
+    |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_transformed_plan`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `datafusion-optimizer` (lib) generated 1 warning (run `cargo fix --lib -p datafusion-optimizer` to apply 1 suggestion)
+warning: `datafusion-optimizer` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 52.75s
+     Running unittests src/lib.rs (target/debug/deps/datafusion_optimizer-f1953a54dda4ea42)
+error: test failed, to rerun pass `-p datafusion-optimizer --lib`
