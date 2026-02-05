@@ -21,11 +21,10 @@
 
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::{any::Any, vec};
 
-use super::common::SharedMemoryReservation;
 use super::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use super::{
     DisplayAs, ExecutionPlanProperties, RecordBatchStream, SendableRecordBatchStream,
@@ -49,12 +48,12 @@ use datafusion_common::stats::Precision;
 use datafusion_common::utils::transpose;
 use datafusion_common::{
     ColumnStatistics, DataFusionError, HashMap, assert_or_internal_err,
-    internal_datafusion_err, internal_err,
+    internal_datafusion_err,
 };
 use datafusion_common::{Result, not_impl_err};
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::MemoryConsumer;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
@@ -127,7 +126,7 @@ use distributor_channels::{
 #[derive(Debug)]
 enum RepartitionBatch {
     /// Batch held in memory (counts against memory reservation)
-    Memory(RecordBatch),
+    Memory(RecordBatch, MemoryReservation),
     /// Marker indicating a batch was spilled to the partition's SpillPool.
     /// The actual batch can be retrieved by reading from the SpillPoolStream.
     /// This variant contains no data itself - it's just a signal to the reader
@@ -139,10 +138,13 @@ type MaybeBatch = Option<Result<RepartitionBatch>>;
 type InputPartitionsToCurrentPartitionSender = Vec<DistributionSender<MaybeBatch>>;
 type InputPartitionsToCurrentPartitionReceiver = Vec<DistributionReceiver<MaybeBatch>>;
 
+/// Streams and metrics for each input partition
+type InputStreams = Vec<Mutex<Option<(SendableRecordBatchStream, RepartitionMetrics)>>>;
+
 /// Output channel with its associated memory reservation and spill writer
 struct OutputChannel {
     sender: DistributionSender<MaybeBatch>,
-    reservation: SharedMemoryReservation,
+    reservation: MemoryReservation,
     spill_writer: SpillPoolWriter,
 }
 
@@ -173,7 +175,7 @@ struct PartitionChannels {
     /// Receivers for each input partition sending data to this output partition
     rx: InputPartitionsToCurrentPartitionReceiver,
     /// Memory reservation for this output partition
-    reservation: SharedMemoryReservation,
+    reservation: MemoryReservation,
     /// Spill writers for writing spilled data.
     /// SpillPoolWriter is Clone, so multiple writers can share state in non-preserve-order mode.
     spill_writers: Vec<SpillPoolWriter>,
@@ -184,8 +186,8 @@ struct PartitionChannels {
 
 struct ConsumingInputStreamsState {
     /// Channels for sending batches from input partitions to output partitions.
-    /// Key is the partition number.
-    channels: HashMap<usize, PartitionChannels>,
+    /// Each output partition takes its own channel from this vector.
+    channels: Vec<Mutex<Option<PartitionChannels>>>,
 
     /// Helper that ensures that background jobs are killed once they are no longer needed.
     abort_helper: Arc<Vec<SpawnedTask<()>>>,
@@ -202,65 +204,57 @@ impl Debug for ConsumingInputStreamsState {
 
 /// Inner state of [`RepartitionExec`].
 #[derive(Default)]
-enum RepartitionExecState {
-    /// Not initialized yet. This is the default state stored in the RepartitionExec node
-    /// upon instantiation.
-    #[default]
-    NotInitialized,
-    /// Input streams are initialized, but they are still not being consumed. The node
-    /// transitions to this state when the arrow's RecordBatch stream is created in
-    /// RepartitionExec::execute(), but before any message is polled.
-    InputStreamsInitialized(Vec<(SendableRecordBatchStream, RepartitionMetrics)>),
-    /// The input streams are being consumed. The node transitions to this state when
-    /// the first message in the arrow's RecordBatch stream is consumed.
-    ConsumingInputStreams(ConsumingInputStreamsState),
+struct RepartitionExecState {
+    /// Input streams and metrics, initialized in `execute`
+    input_streams: OnceLock<Result<InputStreams, Arc<DataFusionError>>>,
+
+    /// Consuming state, initialized in the first poll of any output stream
+    consuming_state: OnceLock<Result<Arc<ConsumingInputStreamsState>, Arc<DataFusionError>>>,
 }
 
 impl Debug for RepartitionExecState {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RepartitionExecState::NotInitialized => write!(f, "NotInitialized"),
-            RepartitionExecState::InputStreamsInitialized(v) => {
-                write!(f, "InputStreamsInitialized({:?})", v.len())
-            }
-            RepartitionExecState::ConsumingInputStreams(v) => {
-                write!(f, "ConsumingInputStreams({v:?})")
-            }
-        }
+        f.debug_struct("RepartitionExecState")
+            .field("input_streams_initialized", &self.input_streams.get().is_some())
+            .field("consuming_state_initialized", &self.consuming_state.get().is_some())
+            .finish()
     }
 }
 
 impl RepartitionExecState {
     fn ensure_input_streams_initialized(
-        &mut self,
+        &self,
         input: &Arc<dyn ExecutionPlan>,
         metrics: &ExecutionPlanMetricsSet,
         output_partitions: usize,
         ctx: &Arc<TaskContext>,
-    ) -> Result<()> {
-        if !matches!(self, RepartitionExecState::NotInitialized) {
-            return Ok(());
-        }
+    ) -> Result<(), Arc<DataFusionError>> {
+        self.input_streams
+            .get_or_init(|| {
+                let num_input_partitions = input.output_partitioning().partition_count();
+                let mut streams_and_metrics = Vec::with_capacity(num_input_partitions);
 
-        let num_input_partitions = input.output_partitioning().partition_count();
-        let mut streams_and_metrics = Vec::with_capacity(num_input_partitions);
+                for i in 0..num_input_partitions {
+                    let metrics = RepartitionMetrics::new(i, output_partitions, metrics);
 
-        for i in 0..num_input_partitions {
-            let metrics = RepartitionMetrics::new(i, output_partitions, metrics);
+                    let timer = metrics.fetch_time.timer();
+                    let stream = input
+                        .execute(i, Arc::clone(ctx))
+                        .map_err(Arc::new)?;
+                    timer.done();
 
-            let timer = metrics.fetch_time.timer();
-            let stream = input.execute(i, Arc::clone(ctx))?;
-            timer.done();
-
-            streams_and_metrics.push((stream, metrics));
-        }
-        *self = RepartitionExecState::InputStreamsInitialized(streams_and_metrics);
-        Ok(())
+                    streams_and_metrics.push(Mutex::new(Some((stream, metrics))));
+                }
+                Ok(streams_and_metrics)
+            })
+            .as_ref()
+            .map(|_| ())
+            .map_err(Arc::clone)
     }
 
     #[expect(clippy::too_many_arguments)]
     fn consume_input_streams(
-        &mut self,
+        &self,
         input: &Arc<dyn ExecutionPlan>,
         metrics: &ExecutionPlanMetricsSet,
         partitioning: &Partitioning,
@@ -268,146 +262,148 @@ impl RepartitionExecState {
         name: &str,
         context: &Arc<TaskContext>,
         spill_manager: SpillManager,
-    ) -> Result<&mut ConsumingInputStreamsState> {
-        let streams_and_metrics = match self {
-            RepartitionExecState::NotInitialized => {
+    ) -> Result<Arc<ConsumingInputStreamsState>, Arc<DataFusionError>> {
+        self.consuming_state
+            .get_or_init(|| {
                 self.ensure_input_streams_initialized(
                     input,
                     metrics,
                     partitioning.partition_count(),
                     context,
                 )?;
-                let RepartitionExecState::InputStreamsInitialized(value) = self else {
-                    // This cannot happen, as ensure_input_streams_initialized() was just called,
-                    // but the compiler does not know.
-                    return internal_err!(
-                        "Programming error: RepartitionExecState must be in the InputStreamsInitialized state after calling RepartitionExecState::ensure_input_streams_initialized"
-                    );
+
+                let streams_and_metrics = self
+                    .input_streams
+                    .get()
+                    .expect("input streams initialized")
+                    .as_ref()
+                    .map_err(Arc::clone)?;
+
+                let num_input_partitions = streams_and_metrics.len();
+                let num_output_partitions = partitioning.partition_count();
+
+                let spill_manager = Arc::new(spill_manager);
+
+                let (txs, rxs) = if preserve_order {
+                    // Create partition-aware channels with one channel per (input, output) pair
+                    // This provides backpressure while maintaining proper ordering
+                    let (txs_all, rxs_all) =
+                        partition_aware_channels(num_input_partitions, num_output_partitions);
+                    // Take transpose of senders and receivers. `state.channels` keeps track of entries per output partition
+                    let txs = transpose(txs_all);
+                    let rxs = transpose(rxs_all);
+                    (txs, rxs)
+                } else {
+                    // Create one channel per *output* partition with backpressure
+                    let (txs, rxs) = channels(num_output_partitions);
+                    // Clone sender for each input partitions
+                    let txs = txs
+                        .into_iter()
+                        .map(|item| vec![item; num_input_partitions])
+                        .collect::<Vec<_>>();
+                    let rxs = rxs.into_iter().map(|item| vec![item]).collect::<Vec<_>>();
+                    (txs, rxs)
                 };
-                value
-            }
-            RepartitionExecState::ConsumingInputStreams(value) => return Ok(value),
-            RepartitionExecState::InputStreamsInitialized(value) => value,
-        };
 
-        let num_input_partitions = streams_and_metrics.len();
-        let num_output_partitions = partitioning.partition_count();
+                let mut partition_channels = Vec::with_capacity(txs.len());
+                for (tx, rx) in txs.into_iter().zip(rxs) {
+                    let partition = partition_channels.len();
+                    let reservation = MemoryConsumer::new(format!("{name}[{partition}]"))
+                        .with_can_spill(true)
+                        .register(context.memory_pool());
 
-        let spill_manager = Arc::new(spill_manager);
+                    // Create spill channels based on mode:
+                    // - preserve_order: one spill channel per (input, output) pair for proper FIFO ordering
+                    // - non-preserve-order: one shared spill channel per output partition since all inputs
+                    //   share the same receiver
+                    let max_file_size = context
+                        .session_config()
+                        .options()
+                        .execution
+                        .max_spill_file_size_bytes;
+                    let num_spill_channels = if preserve_order {
+                        num_input_partitions
+                    } else {
+                        1
+                    };
+                    let (spill_writers, spill_readers): (Vec<_>, Vec<_>) = (0
+                        ..num_spill_channels)
+                        .map(|_| {
+                            spill_pool::channel(max_file_size, Arc::clone(&spill_manager))
+                        })
+                        .unzip();
 
-        let (txs, rxs) = if preserve_order {
-            // Create partition-aware channels with one channel per (input, output) pair
-            // This provides backpressure while maintaining proper ordering
-            let (txs_all, rxs_all) =
-                partition_aware_channels(num_input_partitions, num_output_partitions);
-            // Take transpose of senders and receivers. `state.channels` keeps track of entries per output partition
-            let txs = transpose(txs_all);
-            let rxs = transpose(rxs_all);
-            (txs, rxs)
-        } else {
-            // Create one channel per *output* partition with backpressure
-            let (txs, rxs) = channels(num_output_partitions);
-            // Clone sender for each input partitions
-            let txs = txs
-                .into_iter()
-                .map(|item| vec![item; num_input_partitions])
-                .collect::<Vec<_>>();
-            let rxs = rxs.into_iter().map(|item| vec![item]).collect::<Vec<_>>();
-            (txs, rxs)
-        };
+                    partition_channels.push(Mutex::new(Some(PartitionChannels {
+                        tx,
+                        rx,
+                        reservation,
+                        spill_readers,
+                        spill_writers,
+                    })));
+                }
 
-        let mut channels = HashMap::with_capacity(txs.len());
-        for (partition, (tx, rx)) in txs.into_iter().zip(rxs).enumerate() {
-            let reservation = Arc::new(Mutex::new(
-                MemoryConsumer::new(format!("{name}[{partition}]"))
-                    .with_can_spill(true)
-                    .register(context.memory_pool()),
-            ));
+                // launch one async task per *input* partition
+                let mut spawned_tasks = Vec::with_capacity(num_input_partitions);
+                for (i, stream_mutex) in streams_and_metrics.iter().enumerate() {
+                    let (stream, metrics) = stream_mutex
+                        .lock()
+                        .take()
+                        .expect("stream not yet taken");
 
-            // Create spill channels based on mode:
-            // - preserve_order: one spill channel per (input, output) pair for proper FIFO ordering
-            // - non-preserve-order: one shared spill channel per output partition since all inputs
-            //   share the same receiver
-            let max_file_size = context
-                .session_config()
-                .options()
-                .execution
-                .max_spill_file_size_bytes;
-            let num_spill_channels = if preserve_order {
-                num_input_partitions
-            } else {
-                1
-            };
-            let (spill_writers, spill_readers): (Vec<_>, Vec<_>) = (0
-                ..num_spill_channels)
-                .map(|_| spill_pool::channel(max_file_size, Arc::clone(&spill_manager)))
-                .unzip();
+                    let txs: HashMap<_, _> = partition_channels
+                        .iter()
+                        .enumerate()
+                        .map(|(partition, channels)| {
+                            // In preserve_order mode: each input gets its own spill writer (index i)
+                            // In non-preserve-order mode: all inputs share spill writer 0 via clone
+                            let spill_writer_idx = if preserve_order { i } else { 0 };
+                            let channels = channels.lock();
+                            let channels = channels.as_ref().expect("channels not yet taken");
+                            (
+                                partition,
+                                OutputChannel {
+                                    sender: channels.tx[i].clone(),
+                                    reservation: channels.reservation.new_empty(),
+                                    spill_writer: channels.spill_writers[spill_writer_idx]
+                                        .clone(),
+                                },
+                            )
+                        })
+                        .collect();
 
-            channels.insert(
-                partition,
-                PartitionChannels {
-                    tx,
-                    rx,
-                    reservation,
-                    spill_readers,
-                    spill_writers,
-                },
-            );
-        }
+                    // Extract senders for wait_for_task before moving txs
+                    let senders: HashMap<_, _> = txs
+                        .iter()
+                        .map(|(partition, channel)| (*partition, channel.sender.clone()))
+                        .collect();
 
-        // launch one async task per *input* partition
-        let mut spawned_tasks = Vec::with_capacity(num_input_partitions);
-        for (i, (stream, metrics)) in
-            std::mem::take(streams_and_metrics).into_iter().enumerate()
-        {
-            let txs: HashMap<_, _> = channels
-                .iter()
-                .map(|(partition, channels)| {
-                    // In preserve_order mode: each input gets its own spill writer (index i)
-                    // In non-preserve-order mode: all inputs share spill writer 0 via clone
-                    let spill_writer_idx = if preserve_order { i } else { 0 };
-                    (
-                        *partition,
-                        OutputChannel {
-                            sender: channels.tx[i].clone(),
-                            reservation: Arc::clone(&channels.reservation),
-                            spill_writer: channels.spill_writers[spill_writer_idx]
-                                .clone(),
-                        },
-                    )
-                })
-                .collect();
+                    let input_task = SpawnedTask::spawn(RepartitionExec::pull_from_input(
+                        stream,
+                        txs,
+                        partitioning.clone(),
+                        metrics,
+                        // preserve_order depends on partition index to start from 0
+                        if preserve_order { 0 } else { i },
+                        num_input_partitions,
+                    ));
 
-            // Extract senders for wait_for_task before moving txs
-            let senders: HashMap<_, _> = txs
-                .iter()
-                .map(|(partition, channel)| (*partition, channel.sender.clone()))
-                .collect();
+                    // In a separate task, wait for each input to be done
+                    // (and pass along any errors, including panic!s)
+                    let wait_for_task =
+                        SpawnedTask::spawn(RepartitionExec::wait_for_task(
+                            input_task, senders,
+                        ));
+                    spawned_tasks.push(wait_for_task);
+                }
 
-            let input_task = SpawnedTask::spawn(RepartitionExec::pull_from_input(
-                stream,
-                txs,
-                partitioning.clone(),
-                metrics,
-                // preserve_order depends on partition index to start from 0
-                if preserve_order { 0 } else { i },
-                num_input_partitions,
-            ));
-
-            // In a separate task, wait for each input to be done
-            // (and pass along any errors, including panic!s)
-            let wait_for_task =
-                SpawnedTask::spawn(RepartitionExec::wait_for_task(input_task, senders));
-            spawned_tasks.push(wait_for_task);
-        }
-        *self = Self::ConsumingInputStreams(ConsumingInputStreamsState {
-            channels,
-            abort_helper: Arc::new(spawned_tasks),
-        });
-        match self {
-            RepartitionExecState::ConsumingInputStreams(value) => Ok(value),
-            _ => unreachable!(),
-        }
+                Ok(Arc::new(ConsumingInputStreamsState {
+                    channels: partition_channels,
+                    abort_helper: Arc::new(spawned_tasks),
+                }))
+            })
+            .as_ref()
+            .map(Arc::clone)
+            .map_err(Arc::clone)
     }
 }
 
@@ -756,7 +752,7 @@ pub struct RepartitionExec {
     input: Arc<dyn ExecutionPlan>,
     /// Inner state that is initialized when the parent calls .execute() on this node
     /// and consumed as soon as the parent starts consuming this node.
-    state: Arc<Mutex<RepartitionExecState>>,
+    state: Arc<RepartitionExecState>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
     /// Boolean flag to decide whether to preserve ordering. If true means
@@ -952,23 +948,18 @@ impl ExecutionPlan for RepartitionExec {
         let sort_exprs = self.sort_exprs().cloned();
 
         let state = Arc::clone(&self.state);
-        if let Some(mut state) = state.try_lock() {
-            state.ensure_input_streams_initialized(
-                &input,
-                &metrics,
-                partitioning.partition_count(),
-                &context,
-            )?;
-        }
+        state.ensure_input_streams_initialized(
+            &input,
+            &metrics,
+            partitioning.partition_count(),
+            &context,
+        ).map_err(|e| DataFusionError::External(Box::new(Arc::clone(&e))))?;
 
         let num_input_partitions = input.output_partitioning().partition_count();
 
         let stream = futures::stream::once(async move {
-            // lock scope
-            let (rx, reservation, spill_readers, abort_helper) = {
-                // lock mutexes
-                let mut state = state.lock();
-                let state = state.consume_input_streams(
+            let state = state
+                .consume_input_streams(
                     &input,
                     &metrics,
                     &partitioning,
@@ -976,27 +967,23 @@ impl ExecutionPlan for RepartitionExec {
                     &name,
                     &context,
                     spill_manager.clone(),
-                )?;
+                )
+                .map_err(|e| DataFusionError::External(Box::new(Arc::clone(&e))))?;
 
-                // now return stream for the specified *output* partition which will
-                // read from the channel
+            // now return stream for the specified *output* partition which will
+            // read from the channel
+            let (rx, reservation, spill_readers) = {
+                let mut channel_lock = state.channels[partition].lock();
                 let PartitionChannels {
                     rx,
                     reservation,
                     spill_readers,
                     ..
-                } = state
-                    .channels
-                    .remove(&partition)
-                    .expect("partition not used yet");
-
-                (
-                    rx,
-                    reservation,
-                    spill_readers,
-                    Arc::clone(&state.abort_helper),
-                )
+                } = channel_lock.take().expect("partition not used yet");
+                (rx, reservation, spill_readers)
             };
+
+            let abort_helper = Arc::clone(&state.abort_helper);
 
             trace!(
                 "Before returning stream in {name}::execute for partition: {partition}"
@@ -1014,7 +1001,7 @@ impl ExecutionPlan for RepartitionExec {
                             Arc::clone(&schema_captured),
                             receiver,
                             Arc::clone(&abort_helper),
-                            Arc::clone(&reservation),
+                            reservation.new_empty(),
                             spill_stream,
                             1, // Each receiver handles one input partition
                             BaselineMetrics::new(&metrics, partition),
@@ -1232,7 +1219,7 @@ impl RepartitionExec {
         let cache = Self::compute_properties(&input, partitioning, preserve_order);
         Ok(RepartitionExec {
             input,
-            state: Default::default(),
+            state: Arc::new(RepartitionExecState::default()),
             metrics: ExecutionPlanMetricsSet::new(),
             preserve_order,
             cache,
@@ -1368,27 +1355,23 @@ impl RepartitionExec {
                 let timer = metrics.send_time[partition].timer();
                 // if there is still a receiver, send to it
                 if let Some(channel) = output_channels.get_mut(&partition) {
-                    let (batch_to_send, is_memory_batch) =
-                        match channel.reservation.lock().try_grow(size) {
+                    let batch_to_send =
+                        match channel.reservation.try_grow(size) {
                             Ok(_) => {
                                 // Memory available - send in-memory batch
-                                (RepartitionBatch::Memory(batch), true)
+                                RepartitionBatch::Memory(batch, channel.reservation.split(size))
                             }
                             Err(_) => {
                                 // We're memory limited - spill to SpillPool
                                 // SpillPool handles file handle reuse and rotation
                                 channel.spill_writer.push_batch(&batch)?;
                                 // Send marker indicating batch was spilled
-                                (RepartitionBatch::Spilled, false)
+                                RepartitionBatch::Spilled
                             }
                         };
 
                     if channel.sender.send(Some(Ok(batch_to_send))).await.is_err() {
                         // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
-                        // Only shrink memory if it was a memory batch
-                        if is_memory_batch {
-                            channel.reservation.lock().shrink(size);
-                        }
                         output_channels.remove(&partition);
                     }
                 }
@@ -1534,8 +1517,8 @@ struct PerPartitionStream {
     /// Handle to ensure background tasks are killed when no longer needed.
     _drop_helper: Arc<Vec<SpawnedTask<()>>>,
 
-    /// Memory reservation.
-    reservation: SharedMemoryReservation,
+    /// Memory reservation to keep the consumer registered with the pool
+    _reservation: MemoryReservation,
 
     /// Infinite stream for reading from the spill pool
     spill_stream: SendableRecordBatchStream,
@@ -1561,7 +1544,7 @@ impl PerPartitionStream {
         schema: SchemaRef,
         receiver: DistributionReceiver<MaybeBatch>,
         drop_helper: Arc<Vec<SpawnedTask<()>>>,
-        reservation: SharedMemoryReservation,
+        reservation: MemoryReservation,
         spill_stream: SendableRecordBatchStream,
         num_input_partitions: usize,
         baseline_metrics: BaselineMetrics,
@@ -1573,7 +1556,7 @@ impl PerPartitionStream {
             schema,
             receiver,
             _drop_helper: drop_helper,
-            reservation,
+            _reservation: reservation,
             spill_stream,
             state: StreamState::ReadingMemory,
             remaining_partitions: num_input_partitions,
@@ -1604,11 +1587,9 @@ impl PerPartitionStream {
 
                     match value {
                         Some(Some(v)) => match v {
-                            Ok(RepartitionBatch::Memory(batch)) => {
+                            Ok(RepartitionBatch::Memory(batch, reservation)) => {
                                 // Release memory and return batch
-                                self.reservation
-                                    .lock()
-                                    .shrink(batch.get_array_memory_size());
+                                drop(reservation);
                                 return Poll::Ready(Some(Ok(batch)));
                             }
                             Ok(RepartitionBatch::Spilled) => {
