@@ -1631,56 +1631,14 @@ async fn collect_left_input(
 
             (Map::ArrayMap(array_map), batch, left_value)
         } else {
-            // Estimation of memory size, required for hashtable, prior to allocation.
-            // Final result can be verified using `RawTable.allocation_info()`
-            let fixed_size_u32 = size_of::<JoinHashMapU32>();
-            let fixed_size_u64 = size_of::<JoinHashMapU64>();
-
-            // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
-            // `u64` indice variant
-            // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
-            let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
-                let estimated_hashtable_size =
-                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-                reservation.try_grow(estimated_hashtable_size)?;
-                metrics.build_mem_used.add(estimated_hashtable_size);
-                Box::new(JoinHashMapU64::with_capacity(num_rows))
-            } else {
-                let estimated_hashtable_size =
-                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-                reservation.try_grow(estimated_hashtable_size)?;
-                metrics.build_mem_used.add(estimated_hashtable_size);
-                Box::new(JoinHashMapU32::with_capacity(num_rows))
-            };
-
-            let mut hashes_buffer = Vec::new();
-            let mut offset = 0;
-
-            let batches_iter = batches.iter().rev();
-
-            // Updating hashmap starting from the last batch
-            for batch in batches_iter.clone() {
-                hashes_buffer.clear();
-                hashes_buffer.resize(batch.num_rows(), 0);
-                update_hash(
-                    &on_left,
-                    batch,
-                    &mut *hashmap,
-                    offset,
-                    &random_state,
-                    &mut hashes_buffer,
-                    0,
-                    true,
-                )?;
-                offset += batch.num_rows();
-            }
-
-            // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
-
-            let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
-
-            (Map::HashMap(hashmap), batch, left_values)
+            create_hash_map(
+                &schema,
+                batches,
+                &on_left,
+                random_state,
+                &mut reservation,
+                &metrics,
+            )?
         };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
@@ -1743,6 +1701,74 @@ async fn collect_left_input(
 
     Ok(data)
 }
+
+/// Create a hash map from the given batches.
+fn create_hash_map(
+    schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+    on_left: &[PhysicalExprRef],
+    random_state: RandomState,
+    reservation: &mut MemoryReservation,
+    metrics: &BuildProbeJoinMetrics,
+) -> Result<(Map, RecordBatch, Vec<ArrayRef>)> {
+    let num_rows = batches.iter().map(|b| b.num_rows()).sum();
+    // Estimation of memory size, required for hashtable, prior to allocation.
+    // Final result can be verified using `RawTable.allocation_info()`
+    let fixed_size_u32 = size_of::<JoinHashMapU32>();
+    let fixed_size_u64 = size_of::<JoinHashMapU64>();
+
+    // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
+    // `u64` indice variant
+    // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
+    let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
+        let estimated_hashtable_size =
+            estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+        reservation.try_grow(estimated_hashtable_size)?;
+        metrics.build_mem_used.add(estimated_hashtable_size);
+        Box::new(JoinHashMapU64::with_capacity(num_rows))
+    } else {
+        let estimated_hashtable_size =
+            estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+        reservation.try_grow(estimated_hashtable_size)?;
+        metrics.build_mem_used.add(estimated_hashtable_size);
+        Box::new(JoinHashMapU32::with_capacity(num_rows))
+    };
+
+    let mut hashes_buffer = Vec::new();
+    let mut offset = 0;
+
+    // Updating hashmap starting from the last batch
+    for batch in batches.iter().rev() {
+        hashes_buffer.clear();
+        hashes_buffer.resize(batch.num_rows(), 0);
+        update_hash(
+            on_left,
+            batch,
+            &mut *hashmap,
+            offset,
+            &random_state,
+            &mut hashes_buffer,
+            0,
+            true,
+        )?;
+        offset += batch.num_rows();
+    }
+
+    // Merge all batches into a single batch, so we can directly index into the arrays.
+    // If the build side is just a single batch, we can avoid the costly concat_batches
+    // operation.
+    let batch = if batches.len() == 1 {
+        // When there is only one batch, we don't need to concatenate
+        batches.into_iter().next().unwrap()
+    } else {
+        concat_batches(schema, batches.iter().rev())?
+    };
+
+    let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+
+    Ok((Map::HashMap(hashmap), batch, left_values))
+}
+
 
 #[cfg(test)]
 mod tests {
