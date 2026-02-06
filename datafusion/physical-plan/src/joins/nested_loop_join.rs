@@ -54,12 +54,12 @@ use arrow::array::{
 };
 use arrow::buffer::BooleanBuffer;
 use arrow::compute::{
-    BatchCoalescer, concat_batches, filter, filter_record_batch, not, take,
+    BatchCoalescer, concat_batches, filter, not, take,
 };
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::DataType;
-use datafusion_common::cast::as_boolean_array;
+use datafusion_common::cast::{as_boolean_array, as_uint32_array};
 use datafusion_common::{
     JoinSide, Result, ScalarValue, Statistics, arrow_err, assert_eq_or_internal_err,
     internal_datafusion_err, internal_err, project_schema, unwrap_or_internal_err,
@@ -1514,22 +1514,28 @@ impl NestedLoopJoinStream {
             )?));
         }
 
+        // Filter the index arrays before materializing the output columns
+        let filtered_left_indices = filter(&left_indices, &bitmap_combined)?;
+        let filtered_right_indices = filter(&right_indices, &bitmap_combined)?;
+        let filtered_left_indices = as_uint32_array(&filtered_left_indices)?;
+        let filtered_right_indices = as_uint32_array(&filtered_right_indices)?;
+
         let mut out_columns: Vec<Arc<dyn Array>> =
             Vec::with_capacity(self.output_schema.fields().len());
         for column_index in &self.column_indices {
             let array = if column_index.side == JoinSide::Left {
                 let col = left_data.batch().column(column_index.index);
-                take(col.as_ref(), &left_indices, None)?
+                take(col.as_ref(), filtered_left_indices, None)?
             } else {
                 let col = right_batch.column(column_index.index);
-                take(col.as_ref(), &right_indices, None)?
+                take(col.as_ref(), filtered_right_indices, None)?
             };
             out_columns.push(array);
         }
-        let pre_filtered =
-            RecordBatch::try_new(Arc::clone(&self.output_schema), out_columns)?;
-        let filtered = filter_record_batch(&pre_filtered, &bitmap_combined)?;
-        Ok(Some(filtered))
+        Ok(Some(RecordBatch::try_new(
+            Arc::clone(&self.output_schema),
+            out_columns,
+        )?))
     }
 
     /// Process a single left row join with the current right batch.
@@ -1585,7 +1591,7 @@ impl NestedLoopJoinStream {
                 left_data.batch(),
                 l_index,
                 right_batch,
-                Some(cur_right_bitmap),
+                Some(&cur_right_bitmap),
                 &self.column_indices,
                 JoinSide::Left,
             )?;
@@ -1906,7 +1912,7 @@ fn build_row_join_batch(
     build_side_batch: &RecordBatch,
     build_side_index: usize,
     probe_side_batch: &RecordBatch,
-    probe_side_filter: Option<BooleanArray>,
+    probe_side_filter: Option<&BooleanArray>,
     // See [`NLJStream`] struct's `column_indices` field for more detail
     col_indices: &[ColumnIndex],
     // If the build side is left or right, used to interpret the side information
@@ -1915,15 +1921,10 @@ fn build_row_join_batch(
 ) -> Result<Option<RecordBatch>> {
     debug_assert!(build_side != JoinSide::None);
 
-    // TODO(perf): since the output might be projection of right batch, this
-    // filtering step is more efficient to be done inside the column_index loop
-    let filtered_probe_batch = if let Some(filter) = probe_side_filter {
-        &filter_record_batch(probe_side_batch, &filter)?
-    } else {
-        probe_side_batch
-    };
+    let num_rows = probe_side_filter
+        .map_or_else(|| probe_side_batch.num_rows(), |f| f.true_count());
 
-    if filtered_probe_batch.num_rows() == 0 {
+    if num_rows == 0 {
         return Ok(None);
     }
 
@@ -1937,7 +1938,7 @@ fn build_row_join_batch(
     if output_schema.fields.is_empty() {
         return Ok(Some(create_record_batch_with_empty_schema(
             Arc::new(output_schema.clone()),
-            filtered_probe_batch.num_rows(),
+            num_rows,
         )?));
     }
 
@@ -1958,10 +1959,8 @@ fn build_row_join_batch(
                 DataType::List(field) | DataType::LargeList(field)
                     if field.data_type() == &DataType::Utf8View =>
                 {
-                    let indices_iter = std::iter::repeat_n(
-                        build_side_index as u64,
-                        filtered_probe_batch.num_rows(),
-                    );
+                    let indices_iter =
+                        std::iter::repeat_n(build_side_index as u64, num_rows);
                     let indices_array = UInt64Array::from_iter_values(indices_iter);
                     take(original_left_array.as_ref(), &indices_array, None)?
                 }
@@ -1970,12 +1969,17 @@ fn build_row_join_batch(
                         original_left_array.as_ref(),
                         build_side_index,
                     )?;
-                    scalar_value.to_array_of_size(filtered_probe_batch.num_rows())?
+                    scalar_value.to_array_of_size(num_rows)?
                 }
             }
         } else {
-            // Take the filtered probe-side column using compute::take
-            Arc::clone(filtered_probe_batch.column(column_index.index))
+            // Take the filtered probe-side column using compute::filter
+            let col = probe_side_batch.column(column_index.index);
+            if let Some(filter_arr) = probe_side_filter {
+                filter(col.as_ref(), filter_arr)?
+            } else {
+                Arc::clone(col)
+            }
         };
 
         columns.push(array);
@@ -2138,7 +2142,7 @@ fn build_unmatched_batch(
                 &left_null_batch,
                 0,
                 batch,
-                Some(flipped_bitmap),
+                Some(&flipped_bitmap),
                 col_indices,
                 opposite_side,
             )
