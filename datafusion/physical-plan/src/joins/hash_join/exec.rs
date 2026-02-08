@@ -1654,31 +1654,50 @@ async fn collect_left_input(
             };
 
             let mut hashes_buffer = Vec::new();
-            let mut offset = 0;
 
-            let batches_iter = batches.iter().rev();
-
-            // Updating hashmap starting from the last batch
-            for batch in batches_iter.clone() {
-                hashes_buffer.clear();
-                hashes_buffer.resize(batch.num_rows(), 0);
+            // ⚡ FAST PATH: If there is only one batch, we can skip the expensive `concat_batches`
+            let (batch, left_values) = if batches.len() == 1 {
+                let single_batch = batches.into_iter().next().unwrap();
+                hashes_buffer.resize(single_batch.num_rows(), 0);
                 update_hash(
                     &on_left,
-                    batch,
+                    &single_batch,
                     &mut *hashmap,
-                    offset,
+                    0, // offset is 0 because there is only one batch
                     &random_state,
                     &mut hashes_buffer,
                     0,
                     true,
                 )?;
-                offset += batch.num_rows();
-            }
+                let left_values =
+                    evaluate_expressions_to_arrays(&on_left, &single_batch)?;
+                (single_batch, left_values)
+            } else {
+                let mut offset = 0;
+                let batches_iter = batches.iter().rev();
 
-            // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
+                // Updating hashmap starting from the last batch
+                for batch in batches_iter.clone() {
+                    hashes_buffer.clear();
+                    hashes_buffer.resize(batch.num_rows(), 0);
+                    update_hash(
+                        &on_left,
+                        batch,
+                        &mut *hashmap,
+                        offset,
+                        &random_state,
+                        &mut hashes_buffer,
+                        0,
+                        true,
+                    )?;
+                    offset += batch.num_rows();
+                }
 
-            let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+                // Merge all batches into a single batch, so we can directly index into the arrays
+                let batch = concat_batches(&schema, batches_iter.clone())?;
+                let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+                (batch, left_values)
+            };
 
             (Map::HashMap(hashmap), batch, left_values)
         };
