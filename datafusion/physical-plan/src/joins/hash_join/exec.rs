@@ -1676,7 +1676,12 @@ async fn collect_left_input(
             }
 
             // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
+            let batch = if batches.len() == 1 {
+                // Optimization: If there is only one batch, no need to concatenate.
+                batches[0].clone()
+            } else {
+                concat_batches(&schema, batches_iter.clone())?
+            };
 
             let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
 
