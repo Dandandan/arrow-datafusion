@@ -1656,10 +1656,9 @@ async fn collect_left_input(
             let mut hashes_buffer = Vec::new();
             let mut offset = 0;
 
-            let batches_iter = batches.iter().rev();
-
-            // Updating hashmap starting from the last batch
-            for batch in batches_iter.clone() {
+            // The logic to build the hash map requires iterating batches in reverse to maintain
+            // a deterministic order in the hash map's collision chains (LIFO).
+            for batch in batches.iter().rev() {
                 hashes_buffer.clear();
                 hashes_buffer.resize(batch.num_rows(), 0);
                 update_hash(
@@ -1675,10 +1674,21 @@ async fn collect_left_input(
                 offset += batch.num_rows();
             }
 
-            // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
-
-            let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+            // ⚡ B O L T ⚡
+            // Fast path for a single build-side batch to avoid expensive `concat_batches`.
+            let (batch, left_values) = if batches.len() == 1 {
+                // If there's only one batch, we can use it directly.
+                let batch = batches.into_iter().next().unwrap();
+                let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+                (batch, left_values)
+            } else {
+                // If there are multiple batches, concatenate them into a single batch.
+                // The concatenation must be on the reversed iterator to match the row indices
+                // inserted into the hash map during the `update_hash` loop.
+                let batch = concat_batches(&schema, batches.iter().rev())?;
+                let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
+                (batch, left_values)
+            };
 
             (Map::HashMap(hashmap), batch, left_values)
         };
