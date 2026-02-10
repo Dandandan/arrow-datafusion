@@ -904,9 +904,7 @@ pub(crate) fn get_final_indices_from_bit_map(
     };
     // right_indices
     // all the element in the right side is None
-    let mut builder = UInt32Builder::with_capacity(left_indices.len());
-    builder.append_nulls(left_indices.len());
-    let right_indices = builder.finish();
+    let right_indices = UInt32Array::new_null(left_indices.len());
     (left_indices, right_indices)
 }
 
@@ -968,6 +966,13 @@ pub(crate) fn apply_join_filter_to_indices(
     };
 
     let mask = as_boolean_array(&filter_result)?;
+
+    // Fast path: if all rows match, avoid filtering.
+    // This reduces CPU usage and memory allocation by skipping the expensive
+    // filter operation and avoiding the creation of new index arrays.
+    if mask.null_count() == 0 && mask.true_count() == mask.len() {
+        return Ok((build_indices, probe_indices));
+    }
 
     let left_filtered = compute::filter(&build_indices, mask)?;
     let right_filtered = compute::filter(&probe_indices, mask)?;
@@ -1773,6 +1778,13 @@ pub(super) fn equal_rows_arr(
             eq_dyn_null(arr_left.as_ref(), arr_right.as_ref(), null_equality)
         })
         .try_fold(equal, |acc, equal2| and(&acc, &equal2?))?;
+
+    // Fast path: if all rows match, avoid filtering.
+    // In many joins (e.g. unique keys), hash collisions are rare,
+    // so this path avoids redundant work and allocations.
+    if equal.null_count() == 0 && equal.true_count() == equal.len() {
+        return Ok((indices_left.clone(), indices_right.clone()));
+    }
 
     let filter_builder = FilterBuilder::new(&equal).optimize().build();
 
