@@ -82,7 +82,10 @@ use datafusion_functions_aggregate_common::min_max::{MaxAccumulator, MinAccumula
 use datafusion_physical_expr::equivalence::{
     ProjectionMapping, join_equivalence_properties,
 };
-use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
+use datafusion_expr::Operator;
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, Column, DynamicFilterPhysicalExpr, lit,
+};
 use datafusion_physical_expr::projection::{ProjectionRef, combine_projections};
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 
@@ -829,12 +832,84 @@ impl HashJoinExec {
         self.into()
     }
 
-    fn create_dynamic_filter(on: &JoinOn) -> Arc<DynamicFilterPhysicalExpr> {
+    /// Create a dynamic filter for pushing down join key bounds to the probe
+    /// side. If build-side statistics are available (with column min/max), seed
+    /// the filter with an initial bounds expression so the probe side can
+    /// start pruning files and row groups immediately, before the build side
+    /// finishes reading.
+    fn create_dynamic_filter(
+        on: &JoinOn,
+        build_stats: Option<&Statistics>,
+    ) -> Arc<DynamicFilterPhysicalExpr> {
         // Extract the right-side keys (probe side keys) from the `on` clauses
         // Dynamic filter will be created from build side values (left side) and applied to probe side (right side)
         let right_keys: Vec<_> = on.iter().map(|(_, r)| Arc::clone(r)).collect();
-        // Initialize with a placeholder expression (true) that will be updated when the hash table is built
-        Arc::new(DynamicFilterPhysicalExpr::new(right_keys, lit(true)))
+
+        // Try to seed with bounds from build-side statistics so the probe
+        // side can prune before the build side is fully read.
+        let initial_expr = build_stats
+            .and_then(|stats| {
+                Self::bounds_expr_from_stats(on, &right_keys, stats)
+            })
+            .unwrap_or_else(|| lit(true));
+
+        Arc::new(DynamicFilterPhysicalExpr::new(right_keys, initial_expr))
+    }
+
+    /// Build a `col >= min AND col <= max` bounds expression from build-side
+    /// column statistics, keyed on the corresponding probe-side (right)
+    /// columns.
+    fn bounds_expr_from_stats(
+        on: &JoinOn,
+        right_keys: &[PhysicalExprRef],
+        stats: &Statistics,
+    ) -> Option<Arc<dyn PhysicalExpr>> {
+        let mut predicates: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+        for (i, (left_key, _)) in on.iter().enumerate() {
+            // We can only extract stats for simple column references
+            let col = left_key.as_any().downcast_ref::<Column>()?;
+            let col_stats = stats.column_statistics.get(col.index())?;
+
+            // Need both min and max to form a useful range
+            let (min_val, max_val) = match (
+                col_stats.min_value.get_value(),
+                col_stats.max_value.get_value(),
+            ) {
+                (Some(min), Some(max)) => (min.clone(), max.clone()),
+                _ => continue,
+            };
+
+            let right_expr = Arc::clone(&right_keys[i]);
+            let min_pred = Arc::new(BinaryExpr::new(
+                Arc::clone(&right_expr),
+                Operator::GtEq,
+                lit(min_val),
+            )) as Arc<dyn PhysicalExpr>;
+            let max_pred = Arc::new(BinaryExpr::new(
+                right_expr,
+                Operator::LtEq,
+                lit(max_val),
+            )) as Arc<dyn PhysicalExpr>;
+            predicates.push(Arc::new(BinaryExpr::new(
+                min_pred,
+                Operator::And,
+                max_pred,
+            )));
+        }
+
+        if predicates.is_empty() {
+            return None;
+        }
+
+        Some(
+            predicates
+                .into_iter()
+                .reduce(|a, b| {
+                    Arc::new(BinaryExpr::new(a, Operator::And, b))
+                        as Arc<dyn PhysicalExpr>
+                })
+                .unwrap(),
+        )
     }
 
     fn allow_join_dynamic_filter_pushdown(&self, config: &ConfigOptions) -> bool {
@@ -1615,8 +1690,11 @@ impl ExecutionPlan for HashJoinExec {
         if phase == FilterPushdownPhase::Post
             && self.allow_join_dynamic_filter_pushdown(config)
         {
-            // Add actual dynamic filter to right side (probe side)
-            let dynamic_filter = Self::create_dynamic_filter(&self.on);
+            // Seed the dynamic filter with build-side statistics (if available)
+            // so the probe side can start pruning before the build finishes.
+            let build_stats = self.left().partition_statistics(None).ok();
+            let dynamic_filter =
+                Self::create_dynamic_filter(&self.on, build_stats.as_ref());
             right_child = right_child.with_self_filter(dynamic_filter);
         }
 
@@ -5386,7 +5464,7 @@ mod tests {
         )];
 
         // Create a dynamic filter manually
-        let dynamic_filter = HashJoinExec::create_dynamic_filter(&on);
+        let dynamic_filter = HashJoinExec::create_dynamic_filter(&on, None);
         let dynamic_filter_clone = Arc::clone(&dynamic_filter);
 
         // Create HashJoinExec with the dynamic filter
@@ -5435,7 +5513,7 @@ mod tests {
         )];
 
         // Create a dynamic filter manually
-        let dynamic_filter = HashJoinExec::create_dynamic_filter(&on);
+        let dynamic_filter = HashJoinExec::create_dynamic_filter(&on, None);
         let dynamic_filter_clone = Arc::clone(&dynamic_filter);
 
         // Create HashJoinExec with the dynamic filter
@@ -5924,5 +6002,58 @@ mod tests {
         assert_eq!(lr_is_preserved(JoinType::RightSemi), (true, true));
         assert_eq!(lr_is_preserved(JoinType::RightAnti), (true, true));
         assert_eq!(lr_is_preserved(JoinType::RightMark), (false, true));
+    }
+
+    #[test]
+    fn test_dynamic_filter_seeded_from_build_stats() {
+        use datafusion_common::stats::Precision;
+        use datafusion_common::ColumnStatistics;
+
+        let left_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let right_schema = Schema::new(vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+        ]);
+
+        let on: JoinOn = vec![(
+            Arc::new(Column::new_with_schema("a", &left_schema).unwrap()),
+            Arc::new(Column::new_with_schema("x", &right_schema).unwrap()),
+        )];
+
+        // With stats that have min/max, the initial expression should be a bounds predicate
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics::new_unknown()
+                    .with_min_value(Precision::Exact(ScalarValue::Int32(Some(10))))
+                    .with_max_value(Precision::Exact(ScalarValue::Int32(Some(50)))),
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+
+        let filter = HashJoinExec::create_dynamic_filter(&on, Some(&stats));
+        let snapshot = filter.current().unwrap();
+        let display = format!("{snapshot}");
+        // Should contain bounds: x >= 10 AND x <= 50
+        assert!(
+            display.contains("x@0 >= 10") && display.contains("x@0 <= 50"),
+            "expected bounds predicate, got: {display}"
+        );
+
+        // Without stats, should fall back to lit(true)
+        let filter_no_stats = HashJoinExec::create_dynamic_filter(&on, None);
+        let snapshot = filter_no_stats.current().unwrap();
+        assert_eq!(format!("{snapshot}"), "true");
+
+        // With unknown stats, should also fall back to lit(true)
+        let unknown_stats = Statistics::new_unknown(&Arc::new(left_schema));
+        let filter_unknown =
+            HashJoinExec::create_dynamic_filter(&on, Some(&unknown_stats));
+        let snapshot = filter_unknown.current().unwrap();
+        assert_eq!(format!("{snapshot}"), "true");
     }
 }
