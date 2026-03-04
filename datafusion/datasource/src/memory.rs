@@ -29,6 +29,7 @@ use crate::source::{DataSource, DataSourceExec};
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{Schema, SchemaRef};
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     Result, ScalarValue, assert_or_internal_err, plan_err, project_schema,
@@ -38,6 +39,8 @@ use datafusion_physical_expr::equivalence::project_orderings;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering};
+use datafusion_physical_plan::filter::batch_filter;
+use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion_physical_plan::memory::MemoryStream;
 use datafusion_physical_plan::projection::{
     all_alias_free_columns, new_projections_for_columns,
@@ -74,6 +77,9 @@ pub struct MemorySourceConfig {
     /// The maximum number of records to read from this plan. If `None`,
     /// all records after filtering are returned.
     fetch: Option<usize>,
+    /// Optional filter predicate pushed down from the optimizer.
+    /// The predicate is expressed in terms of the output (projected) schema.
+    filter: Option<Arc<dyn PhysicalExpr>>,
 }
 
 impl DataSource for MemorySourceConfig {
@@ -82,9 +88,26 @@ impl DataSource for MemorySourceConfig {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let batches = if let Some(filter) = &self.filter {
+            // The filter predicate is expressed in the original (pre-projection)
+            // schema because it was pushed down before projection pushdown.
+            // Apply filter first on unprojected batches, then let MemoryStream
+            // handle projection as usual.
+            let mut filtered = Vec::with_capacity(self.partitions[partition].len());
+            for batch in &self.partitions[partition] {
+                let batch = batch_filter(batch, filter)?;
+                if batch.num_rows() > 0 {
+                    filtered.push(batch);
+                }
+            }
+            filtered
+        } else {
+            self.partitions[partition].clone()
+        };
+
         Ok(Box::pin(cooperative(
             MemoryStream::try_new(
-                self.partitions[partition].clone(),
+                batches,
                 Arc::clone(&self.projected_schema),
                 self.projection.clone(),
             )?
@@ -119,16 +142,21 @@ impl DataSource for MemorySourceConfig {
                 let limit = self
                     .fetch
                     .map_or(String::new(), |limit| format!(", fetch={limit}"));
+                let predicate = self
+                    .filter
+                    .as_ref()
+                    .map(|p| format!(", predicate={p}"))
+                    .unwrap_or_default();
                 if self.show_sizes {
                     write!(
                         f,
-                        "partitions={}, partition_sizes={partition_sizes:?}{limit}{output_ordering}{constraints}",
+                        "partitions={}, partition_sizes={partition_sizes:?}{limit}{predicate}{output_ordering}{constraints}",
                         partition_sizes.len(),
                     )
                 } else {
                     write!(
                         f,
-                        "partitions={}{limit}{output_ordering}{constraints}",
+                        "partitions={}{limit}{predicate}{output_ordering}{constraints}",
                         partition_sizes.len(),
                     )
                 }
@@ -172,11 +200,13 @@ impl DataSource for MemorySourceConfig {
         };
 
         if let Some(repartitioned) = maybe_repartitioned {
-            Ok(Some(Arc::new(Self::try_new(
+            let mut source = Self::try_new(
                 &repartitioned,
                 self.original_schema(),
                 self.projection.clone(),
-            )?)))
+            )?;
+            source.filter = self.filter.clone();
+            Ok(Some(Arc::new(source)))
         } else {
             Ok(None)
         }
@@ -249,9 +279,44 @@ impl DataSource for MemorySourceConfig {
                     self.original_schema(),
                     Some(new_projections),
                 )
-                .map(|s| Arc::new(s) as Arc<dyn DataSource>)
+                .map(|mut s| {
+                    // Preserve pushed-down filter when updating projection.
+                    // The filter is in terms of the original (pre-projection)
+                    // schema and does not need remapping.
+                    s.filter = self.filter.clone();
+                    Arc::new(s) as Arc<dyn DataSource>
+                })
             })
             .transpose()
+    }
+
+    fn try_pushdown_filters(
+        &self,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn DataSource>>> {
+        if filters.is_empty() {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                vec![],
+            ));
+        }
+
+        let mut source = self.clone();
+        // Combine all pushed-down filters with AND, merging with any existing filter
+        let new_predicate = datafusion_physical_expr::conjunction_opt(
+            source
+                .filter
+                .into_iter()
+                .chain(filters.iter().map(Arc::clone)),
+        );
+        source.filter = new_predicate;
+
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(
+                vec![PushedDown::Yes; filters.len()],
+            )
+            .with_updated_node(Arc::new(source)),
+        )
     }
 
     fn apply_expressions(
@@ -264,6 +329,10 @@ impl DataSource for MemorySourceConfig {
             for sort_expr in ordering {
                 tnr = tnr.visit_sibling(|| f(sort_expr.expr.as_ref()))?;
             }
+        }
+        // Visit filter expression
+        if let Some(filter) = &self.filter {
+            tnr = tnr.visit_sibling(|| f(filter.as_ref()))?;
         }
         Ok(tnr)
     }
@@ -286,6 +355,7 @@ impl MemorySourceConfig {
             sort_information: vec![],
             show_sizes: true,
             fetch: None,
+            filter: None,
         })
     }
 
@@ -388,6 +458,7 @@ impl MemorySourceConfig {
             sort_information: vec![],
             show_sizes: true,
             fetch: None,
+            filter: None,
         };
         Ok(DataSourceExec::from_data_source(source))
     }
