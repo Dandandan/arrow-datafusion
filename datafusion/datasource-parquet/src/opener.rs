@@ -740,6 +740,14 @@ impl FileOpener for ParquetOpener {
             projection = projection
                 .try_map_exprs(|p| simplifier.simplify(rewriter.rewrite(p)?))?;
 
+            // Track whether the predicate contains dynamic filters. Dynamic
+            // filters (e.g. from hash joins or TopK) can tighten during
+            // execution, so morsels that passed row-group pruning during
+            // morselize() may now be prunable with the updated filter values.
+            let has_dynamic_predicate = predicate
+                .as_ref()
+                .is_some_and(|p| is_dynamic_physical_expr(p));
+
             // Build predicates for this specific file
             let (pruning_predicate, page_pruning_predicate) = build_pruning_predicates(
                 predicate.as_ref(),
@@ -825,7 +833,10 @@ impl FileOpener for ParquetOpener {
                 rg_metadata,
                 file_range.as_ref(),
                 predicate
-                    .filter(|_| enable_row_group_stats_pruning && !is_morsel)
+                    .filter(|_| {
+                        enable_row_group_stats_pruning
+                            && (!is_morsel || has_dynamic_predicate)
+                    })
                     .map(|predicate| RowGroupStatisticsPruningContext {
                         physical_file_schema: &physical_file_schema,
                         parquet_schema: builder.parquet_schema(),
@@ -879,6 +890,14 @@ impl FileOpener for ParquetOpener {
                 file_metrics
                     .row_groups_pruned_bloom_filter
                     .add_matched(n_remaining_row_groups);
+            }
+
+            // If a morsel was fully pruned by re-evaluated row group
+            // statistics (dynamic filters tightened since morselize()),
+            // return an empty stream immediately.
+            if is_morsel && row_groups.is_empty() {
+                file_metrics.row_groups_pruned_statistics.add_pruned(1);
+                return Ok(futures::stream::empty().boxed());
             }
 
             // --------------------------------------------------------
@@ -2468,5 +2487,92 @@ mod test {
                 "row_groups_pruned_bloom_filter should be equivalent for open vs morselize path (enable_row_group_stats_pruning={enable_row_group_stats_pruning})"
             );
         }
+    }
+
+    /// Test that morsels are re-pruned by row group statistics when a dynamic
+    /// filter tightens after morselization.
+    ///
+    /// Scenario:
+    ///   - File has 3 row groups: RG0=[1,2], RG1=[10,11], RG2=[20,21]
+    ///   - Initial dynamic filter is `lit(true)` → all 3 morsels created
+    ///   - Dynamic filter tightens to `a > 15` before opening
+    ///   - RG0 and RG1 should be pruned (max values 2 and 11 < 15)
+    ///   - Only RG2 should produce data
+    #[tokio::test]
+    async fn test_morsel_repruned_by_tightened_dynamic_filter() {
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+
+        // Create 3 batches with non-overlapping ranges → 3 row groups
+        let batch0 = record_batch!(("a", Int32, vec![Some(1), Some(2)])).unwrap();
+        let batch1 = record_batch!(("a", Int32, vec![Some(10), Some(11)])).unwrap();
+        let batch2 = record_batch!(("a", Int32, vec![Some(20), Some(21)])).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch0.clone(), batch1, batch2],
+            Some(props),
+        )
+        .await;
+
+        let schema = batch0.schema();
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        );
+
+        // Create a dynamic filter wrapping `lit(true)` — initially matches everything
+        let initial_expr: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(
+            ScalarValue::Boolean(Some(true)),
+        ));
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>],
+            initial_expr,
+        ));
+
+        let opener = ParquetOpenerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_predicate(dynamic_filter.clone() as Arc<dyn PhysicalExpr>)
+            .with_row_group_stats_pruning(true)
+            .build();
+
+        // Step 1: Morselize — all 3 row groups should survive (filter is `true`)
+        let morsels = opener.morselize(file).await.unwrap();
+        assert_eq!(morsels.len(), 3, "all 3 row groups should produce morsels");
+
+        // Step 2: Tighten the dynamic filter to `a > 15`
+        let tight_expr = logical2physical(&col("a").gt(lit(15)), &schema);
+        dynamic_filter.update(tight_expr).unwrap();
+
+        // Step 3: Open each morsel — RG0 (max=2) and RG1 (max=11) should be
+        // pruned because their max < 15. Only RG2 (min=20) should produce data.
+        let mut all_values = vec![];
+        let mut pruned_count = 0;
+        for morsel_file in &morsels {
+            let stream = opener.open(morsel_file.clone()).unwrap().await.unwrap();
+            let values = collect_int32_values(stream).await;
+            if values.is_empty() {
+                pruned_count += 1;
+            }
+            all_values.extend(values);
+        }
+
+        assert_eq!(
+            all_values,
+            vec![20, 21],
+            "only RG2 values should survive after dynamic filter tightens to a > 15"
+        );
+        assert_eq!(
+            pruned_count, 2,
+            "RG0 and RG1 should be pruned by row group stats"
+        );
     }
 }
