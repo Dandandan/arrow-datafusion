@@ -137,11 +137,15 @@ fn try_transform_topk_join(
         .expect("detect_topk_pattern guarantees FileScanConfig");
 
     // Check heuristic: is the table wide enough to benefit?
+    // Use the scan's output schema for column count (reflects actual projection).
+    let scan_schema = pattern.data_source.schema();
+    let total_columns = scan_schema.fields().len();
+
+    // Table schema is needed for building the lightweight projection indices.
     let table_schema = file_scan_config
         .file_source()
         .table_schema()
         .table_schema();
-    let total_columns = table_schema.fields().len();
 
     // Collect columns needed for sort + filter
     let mut required_col_names: HashSet<String> = HashSet::new();
@@ -208,9 +212,10 @@ fn try_transform_topk_join(
     let inner_sort = SortExec::new(remapped_ordering, Arc::new(inner_filter))
         .with_fetch(pattern.sort.fetch());
 
-    // Build the right side: full scan with filter re-applied
+    // Build the right side: reuse the original DataSourceExec (preserves
+    // projection and type coercions) with filter re-applied.
     let full_scan: Arc<dyn ExecutionPlan> =
-        Arc::new(DataSourceExec::new(Arc::new(file_scan_config.clone())));
+        Arc::new(pattern.data_source.clone());
     let right_filter =
         FilterExec::try_new(Arc::clone(pattern.filter.predicate()), full_scan)?;
 
@@ -252,7 +257,7 @@ fn try_transform_topk_join(
     // Build projection to select only right-side columns
     // Join schema is [lightweight_cols..., full_cols...]
     let left_col_count = lightweight_schema.fields().len();
-    let full_schema = pattern.data_source.schema();
+    let full_schema = scan_schema;
     let mut proj_exprs: Vec<(PhysicalExprRef, String)> = Vec::new();
     for (i, field) in full_schema.fields().iter().enumerate() {
         let join_idx = left_col_count + i;
