@@ -33,6 +33,7 @@ use crate::output_requirements::OutputRequirements;
 use crate::projection_pushdown::ProjectionPushdown;
 use crate::sanity_checker::SanityCheckPlan;
 use crate::topk_aggregation::TopKAggregation;
+use crate::topk_join::TopKJoin;
 use crate::update_aggr_exprs::OptimizeAggregateOrder;
 
 use crate::limit_pushdown_past_window::LimitPushPastWindows;
@@ -133,6 +134,11 @@ impl PhysicalOptimizer {
             // into an `order by max(x) limit y`. In this case it will copy the limit value down
             // to the aggregation, allowing it to use only y number of accumulators.
             Arc::new(TopKAggregation::new()),
+            // The TopKJoin rule rewrites TopK over wide file-backed scans into a
+            // two-pass plan: lightweight inner TopK joined back to the full scan.
+            // Must run before the post-optimization FilterPushdown so dynamic
+            // filters from the inner TopK get pushed through the join.
+            Arc::new(TopKJoin::new()),
             // Tries to push limits down through window functions, growing as appropriate
             // This can possibly be combined with [LimitPushdown]
             // It needs to come after [EnforceSorting]

@@ -389,6 +389,92 @@ physical_plan
 statement ok
 DROP TABLE partial_sorted;
 
+##########
+# TopK Join (late materialization) tests
+##########
+
+# Create a wide parquet table with 10 columns to test TopK Join optimization
+statement ok
+CREATE EXTERNAL TABLE wide_table (
+    sort_col INT,
+    filter_col VARCHAR,
+    c2 INT,
+    c3 INT,
+    c4 INT,
+    c5 INT,
+    c6 INT,
+    c7 INT,
+    c8 INT,
+    c9 INT
+)
+STORED AS parquet
+LOCATION 'test_files/scratch/topk/wide_table/1.parquet';
+
+query I
+COPY (
+  SELECT *
+  FROM (
+    VALUES
+      (1, 'apple', 10, 20, 30, 40, 50, 60, 70, 80),
+      (2, 'banana', 11, 21, 31, 41, 51, 61, 71, 81),
+      (3, 'cherry', 12, 22, 32, 42, 52, 62, 72, 82),
+      (4, 'apple', 13, 23, 33, 43, 53, 63, 73, 83),
+      (5, 'date', 14, 24, 34, 44, 54, 64, 74, 84),
+      (6, 'elderberry', 15, 25, 35, 45, 55, 65, 75, 85),
+      (7, 'fig', 16, 26, 36, 46, 56, 66, 76, 86),
+      (8, 'grape', 17, 27, 37, 47, 57, 67, 77, 87),
+      (9, 'honeydew', 18, 28, 38, 48, 58, 68, 78, 88),
+      (10, 'fig', 19, 29, 39, 49, 59, 69, 79, 89)
+  ) AS t(sort_col, filter_col, c2, c3, c4, c5, c6, c7, c8, c9)
+)
+TO 'test_files/scratch/topk/wide_table/1.parquet';
+----
+10
+
+# Reset batch size for TopK Join tests
+statement ok
+set datafusion.execution.batch_size = 8192;
+
+# Enable TopK Join optimization
+statement ok
+set datafusion.optimizer.enable_topk_join = true;
+
+# Test: TopK Join should transform the plan for a wide table with filter + sort + limit
+query TT
+explain SELECT * FROM wide_table WHERE filter_col = 'apple' ORDER BY sort_col LIMIT 2;
+----
+physical_plan
+01)SortPreservingMergeExec: [sort_col@0 ASC NULLS LAST], fetch=2
+02)--SortExec: TopK(fetch=2), expr=[sort_col@0 ASC NULLS LAST], preserve_partitioning=[false]
+03)----HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(sort_col@0, sort_col@0)], projection=[sort_col@2, filter_col@3, c2@4, c3@5, c4@6, c5@7, c6@8, c7@9, c8@10, c9@11]
+04)------SortExec: TopK(fetch=2), expr=[sort_col@0 ASC NULLS LAST], preserve_partitioning=[false]
+05)--------FilterExec: filter_col@1 = apple
+06)----------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/topk/wide_table/1.parquet]]}, projection=[sort_col, filter_col], file_type=parquet, predicate=filter_col@1 = apple AND DynamicFilter [ empty ], pruning_predicate=filter_col_null_count@2 != row_count@3 AND filter_col_min@0 <= apple AND apple <= filter_col_max@1, required_guarantees=[filter_col in (apple)]
+07)------FilterExec: filter_col@1 = apple
+08)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/topk/wide_table/1.parquet]]}, projection=[sort_col, filter_col, c2, c3, c4, c5, c6, c7, c8, c9], file_type=parquet, predicate=filter_col@1 = apple AND DynamicFilter [ empty ] AND DynamicFilter [ empty ], pruning_predicate=filter_col_null_count@2 != row_count@3 AND filter_col_min@0 <= apple AND apple <= filter_col_max@1, required_guarantees=[filter_col in (apple)]
+
+# Verify correctness: results should match expected values
+query ITIIIIIIII
+SELECT * FROM wide_table WHERE filter_col = 'apple' ORDER BY sort_col LIMIT 2;
+----
+1 apple 10 20 30 40 50 60 70 80
+4 apple 13 23 33 43 53 63 73 83
+
+# Disable TopK Join optimization
+statement ok
+set datafusion.optimizer.enable_topk_join = false;
+
+# Verify without optimization the results are the same
+query ITIIIIIIII
+SELECT * FROM wide_table WHERE filter_col = 'apple' ORDER BY sort_col LIMIT 2;
+----
+1 apple 10 20 30 40 50 60 70 80
+4 apple 13 23 33 43 53 63 73 83
+
+# Cleanup wide_table
+statement ok
+DROP TABLE wide_table;
+
 statement ok
 set datafusion.explain.physical_plan_only = false
 

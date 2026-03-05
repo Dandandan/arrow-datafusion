@@ -918,6 +918,11 @@ config_namespace! {
         /// during aggregations, if possible
         pub enable_topk_aggregation: bool, default = true
 
+        /// When set to true, the optimizer will rewrite TopK queries on wide
+        /// file-backed tables into a two-pass plan: a lightweight inner TopK
+        /// reading only sort+filter columns joined back to the full scan.
+        pub enable_topk_join: bool, default = true
+
         /// When set to true, the optimizer will attempt to push limit operations
         /// past window functions, if possible
         pub enable_window_limits: bool, default = true
