@@ -129,6 +129,13 @@ fn try_transform_topk_join(
         return Ok(None);
     };
 
+    // Bail out if intermediate nodes (e.g. ProjectionExec for schema
+    // coercion) changed the schema between DataSourceExec and the
+    // SortExec.  We cannot safely reconstruct such transformations.
+    if pattern.data_source.schema() != plan.schema() {
+        return Ok(None);
+    }
+
     let file_scan_config = pattern
         .data_source
         .data_source()
