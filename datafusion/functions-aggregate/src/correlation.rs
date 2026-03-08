@@ -380,6 +380,7 @@ impl GroupsAccumulator for CorrelationGroupsAccumulator {
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         self.count.resize(total_num_groups, 0);
         self.sum_x.resize(total_num_groups, 0.0);
@@ -395,6 +396,7 @@ impl GroupsAccumulator for CorrelationGroupsAccumulator {
             group_indices,
             &[&array_x, &array_y],
             opt_filter,
+            opt_permutation,
             |group_index, batch_index, columns| {
                 let x = columns[0].value(batch_index);
                 let y = columns[1].value(batch_index);
@@ -497,6 +499,7 @@ impl GroupsAccumulator for CorrelationGroupsAccumulator {
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         // Resize vectors to accommodate total number of groups
         self.count.resize(total_num_groups, 0);

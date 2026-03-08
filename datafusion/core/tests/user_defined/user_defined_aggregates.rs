@@ -855,6 +855,7 @@ impl GroupsAccumulator for TestGroupsAccumulator {
         _group_indices: &[usize],
         _opt_filter: Option<&arrow::array::BooleanArray>,
         _total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         Ok(())
     }
@@ -879,6 +880,7 @@ impl GroupsAccumulator for TestGroupsAccumulator {
         _group_indices: &[usize],
         _opt_filter: Option<&arrow::array::BooleanArray>,
         _total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         Ok(())
     }

@@ -77,23 +77,22 @@ where
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         assert_eq!(values.len(), 1, "single argument to update_batch");
         let values = values[0].as_boolean();
 
         if self.values.len() < total_num_groups {
             let new_groups = total_num_groups - self.values.len();
-            // Fill with the identity element, so that when the first non-null value is encountered,
-            // it will combine with the identity and the result will be the first non-null value itself.
             self.values.append_n(new_groups, self.identity);
         }
 
-        // NullState dispatches / handles tracking nulls and groups that saw no values
         self.null_state.accumulate_boolean(
             group_indices,
             values,
             opt_filter,
             total_num_groups,
+            opt_permutation,
             |group_index, new_value| {
                 let current_value = self.values.get_bit(group_index);
                 let value = (self.bool_fn)(current_value, new_value);
@@ -134,9 +133,9 @@ where
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
-        // update / merge are the same
-        self.update_batch(values, group_indices, opt_filter, total_num_groups)
+        self.update_batch(values, group_indices, opt_filter, total_num_groups, opt_permutation)
     }
 
     fn size(&self) -> usize {

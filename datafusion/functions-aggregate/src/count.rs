@@ -577,6 +577,7 @@ impl GroupsAccumulator for CountGroupsAccumulator {
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         assert_eq!(values.len(), 1, "single argument to update_batch");
         let values = &values[0];
@@ -588,6 +589,7 @@ impl GroupsAccumulator for CountGroupsAccumulator {
             group_indices,
             values.logical_nulls().as_ref(),
             opt_filter,
+            opt_permutation,
             |group_index| {
                 // SAFETY: group_index is guaranteed to be in bounds
                 let count = unsafe { self.counts.get_unchecked_mut(group_index) };
@@ -605,6 +607,7 @@ impl GroupsAccumulator for CountGroupsAccumulator {
         // Since aggregate filter should be applied in partial stage, in final stage there should be no filter
         _opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         assert_eq!(values.len(), 1, "one argument to merge_batch");
         // first batch is counts, second is partial sums

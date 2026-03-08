@@ -146,7 +146,8 @@ unsafe extern "C" fn update_batch_fn_wrapper(
             &values,
             &group_indices,
             opt_filter.as_ref(),
-            total_num_groups
+            total_num_groups,
+            None
         ))
     }
 }
@@ -205,7 +206,8 @@ unsafe extern "C" fn merge_batch_fn_wrapper(
             &values,
             &group_indices,
             opt_filter.as_ref(),
-            total_num_groups
+            total_num_groups,
+            None
         ))
     }
 }
@@ -308,6 +310,7 @@ impl GroupsAccumulator for ForeignGroupsAccumulator {
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         unsafe {
             let values = values
@@ -371,6 +374,7 @@ impl GroupsAccumulator for ForeignGroupsAccumulator {
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         unsafe {
             let values = values
@@ -489,6 +493,7 @@ mod tests {
             &[0, 0, 1, 1, 2, 2],
             Some(opt_filter.as_ref()),
             3,
+            None,
         )?;
 
         let groups_bool = foreign_accum.evaluate(EmitTo::All)?;

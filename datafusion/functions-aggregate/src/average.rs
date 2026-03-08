@@ -808,6 +808,7 @@ where
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         assert_eq!(values.len(), 1, "single argument to update_batch");
         let values = values[0].as_primitive::<T>();
@@ -820,6 +821,7 @@ where
             values,
             opt_filter,
             total_num_groups,
+            opt_permutation,
             |group_index, new_value| {
                 // SAFETY: group_index is guaranteed to be in bounds
                 let sum = unsafe { self.sums.get_unchecked_mut(group_index) };
@@ -895,6 +897,7 @@ where
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         assert_eq!(values.len(), 2, "two arguments to merge_batch");
         // first batch is counts, second is partial sums
@@ -907,6 +910,7 @@ where
             partial_counts,
             opt_filter,
             total_num_groups,
+            opt_permutation,
             |group_index, partial_count| {
                 // SAFETY: group_index is guaranteed to be in bounds
                 let count = unsafe { self.counts.get_unchecked_mut(group_index) };
@@ -921,6 +925,7 @@ where
             partial_sums,
             opt_filter,
             total_num_groups,
+            opt_permutation,
             |group_index, new_value: <T as ArrowPrimitiveType>::Native| {
                 // SAFETY: group_index is guaranteed to be in bounds
                 let sum = unsafe { self.sums.get_unchecked_mut(group_index) };

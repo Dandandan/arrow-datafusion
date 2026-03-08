@@ -66,6 +66,7 @@ impl GroupsAccumulator for MinMaxStructAccumulator {
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         let array = &values[0];
         assert_eq!(array.len(), group_indices.len());
@@ -134,9 +135,10 @@ impl GroupsAccumulator for MinMaxStructAccumulator {
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         // min/max are their own states (no transition needed)
-        self.update_batch(values, group_indices, opt_filter, total_num_groups)
+        self.update_batch(values, group_indices, opt_filter, total_num_groups, None)
     }
 
     fn convert_to_state(

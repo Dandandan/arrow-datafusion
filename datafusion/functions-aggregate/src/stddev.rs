@@ -331,9 +331,10 @@ impl GroupsAccumulator for StddevGroupsAccumulator {
         group_indices: &[usize],
         opt_filter: Option<&arrow::array::BooleanArray>,
         total_num_groups: usize,
+        opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         self.variance
-            .update_batch(values, group_indices, opt_filter, total_num_groups)
+            .update_batch(values, group_indices, opt_filter, total_num_groups, opt_permutation)
     }
 
     fn merge_batch(
@@ -342,9 +343,10 @@ impl GroupsAccumulator for StddevGroupsAccumulator {
         group_indices: &[usize],
         opt_filter: Option<&arrow::array::BooleanArray>,
         total_num_groups: usize,
+        opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         self.variance
-            .merge_batch(values, group_indices, opt_filter, total_num_groups)
+            .merge_batch(values, group_indices, opt_filter, total_num_groups, opt_permutation)
     }
 
     fn evaluate(&mut self, emit_to: datafusion_expr::EmitTo) -> Result<ArrayRef> {

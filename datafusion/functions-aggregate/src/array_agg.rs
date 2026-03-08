@@ -551,6 +551,7 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         assert_eq!(values.len(), 1, "single argument to update_batch");
         let input = &values[0];
@@ -680,6 +681,7 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
         group_indices: &[usize],
         _opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         assert_eq!(values.len(), 1, "one argument to merge_batch");
         let input_list = values[0].as_list::<i32>();

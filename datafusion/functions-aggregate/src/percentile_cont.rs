@@ -513,6 +513,7 @@ where
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         // For ordered-set aggregates, we only care about the ORDER BY column (first element)
         // The percentile parameter is already stored in self.percentile
@@ -525,6 +526,7 @@ where
             group_indices,
             values,
             opt_filter,
+            None,
             |group_index, new_value| {
                 self.group_values[group_index].push(new_value);
             },
@@ -540,6 +542,7 @@ where
         // Since aggregate filter should be applied in partial stage, in final stage there should be no filter
         _opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         assert_eq!(values.len(), 1, "one argument to merge_batch");
 

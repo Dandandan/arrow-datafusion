@@ -302,6 +302,7 @@ impl GroupsAccumulator for GroupsAccumulatorAdapter {
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         self.invoke_per_accumulator(
             values,
@@ -377,6 +378,7 @@ impl GroupsAccumulator for GroupsAccumulatorAdapter {
         group_indices: &[usize],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         self.invoke_per_accumulator(
             values,

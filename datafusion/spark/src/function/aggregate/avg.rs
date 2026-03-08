@@ -254,6 +254,7 @@ where
         group_indices: &[usize],
         _opt_filter: Option<&arrow::array::BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         assert_eq!(values.len(), 1, "single argument to update_batch");
         let values = values[0].as_primitive::<T>();
@@ -291,6 +292,7 @@ where
         group_indices: &[usize],
         _opt_filter: Option<&arrow::array::BooleanArray>,
         total_num_groups: usize,
+        _opt_permutation: Option<&[u32]>,
     ) -> Result<()> {
         assert_eq!(values.len(), 2, "two arguments to merge_batch");
         // first batch is partial sums, second is counts

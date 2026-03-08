@@ -166,6 +166,7 @@ impl NullState {
         values: &PrimitiveArray<T>,
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        opt_permutation: Option<&[u32]>,
         mut value_fn: F,
     ) where
         T: ArrowPrimitiveType + Send,
@@ -176,16 +177,22 @@ impl NullState {
             && opt_filter.is_none()
             && values.null_count() == 0
         {
-            accumulate(group_indices, values, None, value_fn);
+            accumulate(group_indices, values, None, opt_permutation, value_fn);
             *num_values = total_num_groups;
             return;
         }
 
         let seen_values = self.seen_values.get_builder(total_num_groups);
-        accumulate(group_indices, values, opt_filter, |group_index, value| {
-            seen_values.set_bit(group_index, true);
-            value_fn(group_index, value);
-        });
+        accumulate(
+            group_indices,
+            values,
+            opt_filter,
+            opt_permutation,
+            |group_index, value| {
+                seen_values.set_bit(group_index, true);
+                value_fn(group_index, value);
+            },
+        );
     }
 
     /// Invokes `value_fn(group_index, value)` for each non null, non
@@ -204,12 +211,45 @@ impl NullState {
         values: &BooleanArray,
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
+        opt_permutation: Option<&[u32]>,
         mut value_fn: F,
     ) where
         F: FnMut(usize, bool) + Send,
     {
         let data = values.values();
         assert_eq!(data.len(), group_indices.len());
+
+        // When a permutation is provided, iterate in permuted order for cache locality
+        if let Some(perm) = opt_permutation {
+            let nulls = values.nulls();
+            let filter_has_nulls =
+                opt_filter.map_or(false, |f| f.null_count() > 0);
+            let needs_seen_tracking = !(matches!(&self.seen_values, SeenValues::All { .. })
+                && opt_filter.is_none()
+                && values.null_count() == 0);
+            if needs_seen_tracking {
+                let seen_values = self.seen_values.get_builder(total_num_groups);
+                for &p in perm {
+                    let p = p as usize;
+                    let is_valid = nulls.map_or(true, |n| n.is_valid(p));
+                    let passes_filter = opt_filter
+                        .map_or(true, |f| f.value(p) && (!filter_has_nulls || f.is_valid(p)));
+                    if is_valid && passes_filter {
+                        seen_values.set_bit(group_indices[p], true);
+                        value_fn(group_indices[p], data.value(p));
+                    }
+                }
+            } else {
+                for &p in perm {
+                    let p = p as usize;
+                    value_fn(group_indices[p], data.value(p));
+                }
+                if let SeenValues::All { num_values } = &mut self.seen_values {
+                    *num_values = total_num_groups;
+                }
+            }
+            return;
+        }
 
         // skip null handling if no nulls in input or accumulator
         if let SeenValues::All { num_values } = &mut self.seen_values
@@ -371,6 +411,7 @@ pub fn accumulate<T, F>(
     group_indices: &[usize],
     values: &PrimitiveArray<T>,
     opt_filter: Option<&BooleanArray>,
+    opt_permutation: Option<&[u32]>,
     mut value_fn: F,
 ) where
     T: ArrowPrimitiveType + Send,
@@ -378,6 +419,22 @@ pub fn accumulate<T, F>(
 {
     let data: &[T::Native] = values.values();
     assert_eq!(data.len(), group_indices.len());
+
+    // When a permutation is provided, iterate in permuted order for cache locality
+    if let Some(perm) = opt_permutation {
+        let nulls = values.nulls();
+        let filter_has_nulls = opt_filter.map_or(false, |f| f.null_count() > 0);
+        for &p in perm {
+            let p = p as usize;
+            let is_valid = nulls.map_or(true, |n| n.is_valid(p));
+            let passes_filter = opt_filter
+                .map_or(true, |f| f.value(p) && (!filter_has_nulls || f.is_valid(p)));
+            if is_valid && passes_filter {
+                value_fn(group_indices[p], data[p]);
+            }
+        }
+        return;
+    }
 
     match (values.null_count() > 0, opt_filter) {
         // no nulls, no filter,
@@ -486,6 +543,7 @@ pub fn accumulate_multiple<T, F>(
     group_indices: &[usize],
     value_columns: &[&PrimitiveArray<T>],
     opt_filter: Option<&BooleanArray>,
+    opt_permutation: Option<&[u32]>,
     mut value_fn: F,
 ) where
     T: ArrowPrimitiveType + Send,
@@ -520,6 +578,27 @@ pub fn accumulate_multiple<T, F>(
         debug_assert_eq!(col.len(), group_indices.len());
     }
 
+    // When a permutation is provided, iterate in permuted order for cache locality
+    if let Some(perm) = opt_permutation {
+        match valid_indices {
+            None => {
+                for &p in perm {
+                    let p = p as usize;
+                    value_fn(group_indices[p], p, value_columns);
+                }
+            }
+            Some(ref valid) => {
+                for &p in perm {
+                    let p = p as usize;
+                    if valid.value(p) {
+                        value_fn(group_indices[p], p, value_columns);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     match valid_indices {
         None => {
             for (batch_idx, &group_idx) in group_indices.iter().enumerate() {
@@ -549,10 +628,26 @@ pub fn accumulate_indices<F>(
     group_indices: &[usize],
     nulls: Option<&NullBuffer>,
     opt_filter: Option<&BooleanArray>,
+    opt_permutation: Option<&[u32]>,
     mut index_fn: F,
 ) where
     F: FnMut(usize) + Send,
 {
+    // When a permutation is provided, iterate in permuted order for cache locality
+    if let Some(perm) = opt_permutation {
+        let filter_has_nulls = opt_filter.map_or(false, |f| f.null_count() > 0);
+        for &p in perm {
+            let p = p as usize;
+            let is_valid = nulls.map_or(true, |n| n.is_valid(p));
+            let passes_filter = opt_filter
+                .map_or(true, |f| f.value(p) && (!filter_has_nulls || f.is_valid(p)));
+            if is_valid && passes_filter {
+                index_fn(group_indices[p]);
+            }
+        }
+        return;
+    }
+
     match (nulls, opt_filter) {
         (None, None) => {
             for &group_index in group_indices.iter() {
