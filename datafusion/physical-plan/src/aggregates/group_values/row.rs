@@ -79,7 +79,7 @@ pub struct GroupValuesRows {
 }
 
 impl GroupValuesRows {
-    pub fn try_new(schema: SchemaRef) -> Result<Self> {
+    pub fn try_new(schema: SchemaRef, batch_size: usize) -> Result<Self> {
         // Print a debugging message, so it is clear when the (slower) fallback
         // GroupValuesRows is used.
         debug!("Creating GroupValuesRows for schema: {schema}");
@@ -91,9 +91,9 @@ impl GroupValuesRows {
                 .collect(),
         )?;
 
-        let map = HashTable::with_capacity(0);
+        let map = HashTable::with_capacity(batch_size);
 
-        let starting_rows_capacity = 1000;
+        let starting_rows_capacity = batch_size;
 
         let starting_data_capacity = 64 * starting_rows_capacity;
         let rows_buffer =

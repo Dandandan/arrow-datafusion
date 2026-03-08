@@ -587,7 +587,14 @@ impl GroupedHashAggregateStream {
             _ => OutOfMemoryMode::ReportError,
         };
 
-        let group_values = new_group_values(group_schema, &group_ordering)?;
+        let initial_capacity = agg
+            .input
+            .partition_statistics(None)
+            .ok()
+            .and_then(|stats| stats.num_rows.get_value().copied())
+            .map_or(batch_size, |input_rows| input_rows.min(batch_size));
+        let group_values =
+            new_group_values(group_schema, &group_ordering, initial_capacity)?;
         let reservation = MemoryConsumer::new(name)
             // We interpret 'can spill' as 'can handle memory back pressure'.
             // This value needs to be set to true for the default memory pool implementations

@@ -96,12 +96,12 @@ pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
 }
 
 impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
-    pub fn new(data_type: DataType) -> Self {
+    pub fn new(data_type: DataType, batch_size: usize) -> Self {
         assert!(PrimitiveArray::<T>::is_compatible(&data_type));
         Self {
             data_type,
-            map: HashTable::with_capacity(128),
-            values: Vec::with_capacity(128),
+            map: HashTable::with_capacity(batch_size),
+            values: Vec::with_capacity(batch_size),
             null_group: None,
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
         }

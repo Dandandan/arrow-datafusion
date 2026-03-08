@@ -445,7 +445,8 @@ struct DistinctDeduplicator {
 
 impl DistinctDeduplicator {
     fn new(schema: SchemaRef, task_context: &TaskContext) -> Result<Self> {
-        let group_values = new_group_values(schema, &GroupOrdering::None)?;
+        let batch_size = task_context.session_config().batch_size();
+        let group_values = new_group_values(schema, &GroupOrdering::None, batch_size)?;
         let reservation = MemoryConsumer::new("RecursiveQueryHashTable")
             .register(task_context.memory_pool());
         Ok(Self {

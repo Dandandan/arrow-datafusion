@@ -134,13 +134,17 @@ pub trait GroupValues: Send {
 pub fn new_group_values(
     schema: SchemaRef,
     group_ordering: &GroupOrdering,
+    batch_size: usize,
 ) -> Result<Box<dyn GroupValues>> {
     if schema.fields.len() == 1 {
         let d = schema.fields[0].data_type();
 
         macro_rules! downcast_helper {
             ($t:ty, $d:ident) => {
-                return Ok(Box::new(GroupValuesPrimitive::<$t>::new($d.clone())))
+                return Ok(Box::new(GroupValuesPrimitive::<$t>::new(
+                    $d.clone(),
+                    batch_size,
+                )))
             };
         }
 
@@ -202,11 +206,15 @@ pub fn new_group_values(
 
     if multi_group_by::supported_schema(schema.as_ref()) {
         if matches!(group_ordering, GroupOrdering::None) {
-            Ok(Box::new(GroupValuesColumn::<false>::try_new(schema)?))
+            Ok(Box::new(GroupValuesColumn::<false>::try_new(
+                schema, batch_size,
+            )?))
         } else {
-            Ok(Box::new(GroupValuesColumn::<true>::try_new(schema)?))
+            Ok(Box::new(GroupValuesColumn::<true>::try_new(
+                schema, batch_size,
+            )?))
         }
     } else {
-        Ok(Box::new(GroupValuesRows::try_new(schema)?))
+        Ok(Box::new(GroupValuesRows::try_new(schema, batch_size)?))
     }
 }
