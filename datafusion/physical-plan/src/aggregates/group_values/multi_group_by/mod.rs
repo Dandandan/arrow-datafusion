@@ -218,6 +218,9 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     /// reused buffer to store hashes
     hashes_buffer: Vec<u64>,
 
+    /// Reused buffer for sorted indices during intern
+    sorted_indices: Vec<u32>,
+
     /// Random state for creating hashes
     random_state: RandomState,
 }
@@ -271,6 +274,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             map_size: 0,
             group_values: vec![],
             hashes_buffer: Default::default(),
+            sorted_indices: Vec::new(),
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
         })
     }
@@ -475,13 +479,17 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
 
     /// Collect vectorized context by checking hash values of `cols` in `map`
     ///
+    /// Processes rows in hash-sorted order for better cache locality when
+    /// probing the hash table, and skips hash table probes for runs of
+    /// duplicate hashes (adding them directly to the equal_to list).
+    ///
     /// 1. If bucket not found
     ///   - Build and insert the `new inlined group index view`
     ///     and its hash value to `map`
     ///   - Add row index to `vectorized_append_row_indices`
     ///   - Set group index to row in `groups`
     ///
-    /// 2. bucket found
+    /// 2. bucket found (or duplicate hash from sorted run)
     ///   - Add row index to `vectorized_equal_to_row_indices`
     ///   - Check if the `group index view` is `inlined` or `non_inlined`:
     ///     If it is inlined, add to `vectorized_equal_to_group_indices` directly.
@@ -499,8 +507,36 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             .equal_to_group_indices
             .clear();
 
+        // Sort indices by hash for cache locality and duplicate detection
+        let n_rows = batch_hashes.len();
+        let sorted_indices = &mut self.sorted_indices;
+        sorted_indices.clear();
+        sorted_indices.extend(0..n_rows as u32);
+        sorted_indices.sort_unstable_by_key(|&i| batch_hashes[i as usize]);
+
         let mut group_values_len = self.group_values[0].len();
-        for (row, &target_hash) in batch_hashes.iter().enumerate() {
+
+        // Track previous hash and group index for duplicate hash detection
+        let mut prev_hash: u64 = 0;
+        let mut prev_group_idx: usize = 0;
+        let mut has_prev = false;
+
+        for &idx in sorted_indices.iter() {
+            let row = idx as usize;
+            let target_hash = batch_hashes[row];
+
+            // Fast path: same hash as previous row in sorted order.
+            // Skip hash table probe and add directly to equal_to list.
+            if has_prev && target_hash == prev_hash {
+                self.vectorized_operation_buffers
+                    .equal_to_row_indices
+                    .push(row);
+                self.vectorized_operation_buffers
+                    .equal_to_group_indices
+                    .push(prev_group_idx);
+                continue;
+            }
+
             let entry = self
                 .map
                 .find(target_hash, |(exist_hash, _)| target_hash == *exist_hash);
@@ -528,19 +564,23 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                 // Set group index to row in `groups`
                 groups[row] = current_group_idx;
 
+                prev_hash = target_hash;
+                prev_group_idx = current_group_idx;
+                has_prev = true;
+
                 group_values_len += 1;
                 continue;
             };
 
             // 2. bucket found
             // Check if the `group index view` is `inlined` or `non_inlined`
+            let first_group_idx;
             if group_index_view.is_non_inlined() {
                 // Non-inlined case, the value of view is offset in `group_index_lists`.
-                // We use it to get `group_index_list`, and add related `rows` and `group_indices`
-                // into `vectorized_equal_to_row_indices` and `vectorized_equal_to_group_indices`.
                 let list_offset = group_index_view.value() as usize;
                 let group_index_list = &self.group_index_lists[list_offset];
 
+                first_group_idx = group_index_list[0];
                 self.vectorized_operation_buffers
                     .equal_to_group_indices
                     .extend_from_slice(group_index_list);
@@ -548,14 +588,18 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                     .equal_to_row_indices
                     .extend(std::iter::repeat_n(row, group_index_list.len()));
             } else {
-                let group_index = group_index_view.value() as usize;
+                first_group_idx = group_index_view.value() as usize;
                 self.vectorized_operation_buffers
                     .equal_to_row_indices
                     .push(row);
                 self.vectorized_operation_buffers
                     .equal_to_group_indices
-                    .push(group_index);
+                    .push(first_group_idx);
             }
+
+            prev_hash = target_hash;
+            prev_group_idx = first_group_idx;
+            has_prev = true;
         }
     }
 
@@ -1063,7 +1107,10 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
 
     fn size(&self) -> usize {
         let group_values_size: usize = self.group_values.iter().map(|v| v.size()).sum();
-        group_values_size + self.map_size + self.hashes_buffer.allocated_size()
+        group_values_size
+            + self.map_size
+            + self.hashes_buffer.allocated_size()
+            + self.sorted_indices.allocated_size()
     }
 
     fn is_empty(&self) -> bool {

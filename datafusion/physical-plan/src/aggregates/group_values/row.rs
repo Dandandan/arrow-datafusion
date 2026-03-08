@@ -74,6 +74,9 @@ pub struct GroupValuesRows {
     /// reused buffer to store rows
     rows_buffer: Rows,
 
+    /// Reused buffer for sorted indices during intern
+    sorted_indices: Vec<u32>,
+
     /// Random state for creating hashes
     random_state: RandomState,
 }
@@ -106,6 +109,7 @@ impl GroupValuesRows {
             group_values: None,
             hashes_buffer: Default::default(),
             rows_buffer,
+            sorted_indices: Vec::new(),
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
         })
     }
@@ -126,6 +130,7 @@ impl GroupValues for GroupValuesRows {
 
         // tracks to which group each of the input rows belongs
         groups.clear();
+        groups.resize(n_rows, 0);
 
         // 1.1 Calculate the group keys for the group values
         let batch_hashes = &mut self.hashes_buffer;
@@ -133,16 +138,31 @@ impl GroupValues for GroupValuesRows {
         batch_hashes.resize(n_rows, 0);
         create_hashes(cols, &self.random_state, batch_hashes)?;
 
-        for (row, &target_hash) in batch_hashes.iter().enumerate() {
+        // Sort indices by hash for cache locality and duplicate detection
+        let sorted_indices = &mut self.sorted_indices;
+        sorted_indices.clear();
+        sorted_indices.extend(0..n_rows as u32);
+        sorted_indices.sort_unstable_by_key(|&i| batch_hashes[i as usize]);
+
+        // Process in sorted hash order
+        let mut prev_hash: u64 = 0;
+        let mut prev_group: usize = 0;
+        let mut has_prev = false;
+
+        for &idx in sorted_indices.iter() {
+            let row = idx as usize;
+            let target_hash = batch_hashes[row];
+
+            // Fast path: same hash as previous row, check row equality directly
+            if has_prev && target_hash == prev_hash {
+                if group_rows.row(row) == group_values.row(prev_group) {
+                    groups[row] = prev_group;
+                    continue;
+                }
+            }
+
             let entry = self.map.find_mut(target_hash, |(exist_hash, group_idx)| {
-                // Somewhat surprisingly, this closure can be called even if the
-                // hash doesn't match, so check the hash first with an integer
-                // comparison first avoid the more expensive comparison with
-                // group value. https://github.com/apache/datafusion/pull/11718
                 target_hash == *exist_hash
-                    // verify that the group that we are inserting with hash is
-                    // actually the same key value as the group in
-                    // existing_idx  (aka group_values @ row)
                     && group_rows.row(row) == group_values.row(*group_idx)
             });
 
@@ -164,7 +184,10 @@ impl GroupValues for GroupValuesRows {
                     group_idx
                 }
             };
-            groups.push(group_idx);
+            groups[row] = group_idx;
+            prev_hash = target_hash;
+            prev_group = group_idx;
+            has_prev = true;
         }
 
         self.group_values = Some(group_values);
@@ -179,6 +202,7 @@ impl GroupValues for GroupValuesRows {
             + self.map_size
             + self.rows_buffer.size()
             + self.hashes_buffer.allocated_size()
+            + self.sorted_indices.allocated_size()
     }
 
     fn is_empty(&self) -> bool {
@@ -253,6 +277,8 @@ impl GroupValues for GroupValuesRows {
         self.map_size = self.map.capacity() * size_of::<(u64, usize)>();
         self.hashes_buffer.clear();
         self.hashes_buffer.shrink_to(num_rows);
+        self.sorted_indices.clear();
+        self.sorted_indices.shrink_to(num_rows);
     }
 }
 

@@ -93,6 +93,10 @@ pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
     values: Vec<T::Native>,
     /// The random state used to generate hashes
     random_state: RandomState,
+    /// Reused buffer for sorted indices during intern
+    sorted_indices: Vec<u32>,
+    /// Reused buffer for hashes during intern
+    hashes_buffer: Vec<u64>,
 }
 
 impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
@@ -104,6 +108,8 @@ impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
             values: Vec::with_capacity(128),
             null_group: None,
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
+            sorted_indices: Vec::new(),
+            hashes_buffer: Vec::new(),
         }
     }
 }
@@ -114,44 +120,92 @@ where
 {
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
         assert_eq!(cols.len(), 1);
+        let n_rows = cols[0].len();
         groups.clear();
+        groups.resize(n_rows, 0);
 
-        for v in cols[0].as_primitive::<T>() {
-            let group_id = match v {
-                None => *self.null_group.get_or_insert_with(|| {
-                    let group_id = self.values.len();
-                    self.values.push(Default::default());
-                    group_id
-                }),
+        let array = cols[0].as_primitive::<T>();
+        let state = &self.random_state;
+
+        // Compute hashes for all rows and handle nulls
+        let hashes = &mut self.hashes_buffer;
+        hashes.clear();
+        hashes.resize(n_rows, 0);
+
+        let mut sorted_indices = std::mem::take(&mut self.sorted_indices);
+        sorted_indices.clear();
+        sorted_indices.reserve(n_rows);
+
+        for (i, v) in array.iter().enumerate() {
+            match v {
+                None => {
+                    let group_id = *self.null_group.get_or_insert_with(|| {
+                        let group_id = self.values.len();
+                        self.values.push(Default::default());
+                        group_id
+                    });
+                    groups[i] = group_id;
+                }
                 Some(key) => {
-                    let state = &self.random_state;
-                    let hash = key.hash(state);
-                    let insert = self.map.entry(
-                        hash,
-                        |&(g, h)| unsafe {
-                            hash == h && self.values.get_unchecked(g).is_eq(key)
-                        },
-                        |&(_, h)| h,
-                    );
+                    hashes[i] = key.hash(state);
+                    sorted_indices.push(i as u32);
+                }
+            }
+        }
 
-                    match insert {
-                        hashbrown::hash_table::Entry::Occupied(o) => o.get().0,
-                        hashbrown::hash_table::Entry::Vacant(v) => {
-                            let g = self.values.len();
-                            v.insert((g, hash));
-                            self.values.push(key);
-                            g
-                        }
-                    }
+        // Sort indices by hash for cache locality and duplicate detection
+        sorted_indices.sort_unstable_by_key(|&i| hashes[i as usize]);
+
+        // Process in sorted hash order
+        let mut prev_hash: u64 = 0;
+        let mut prev_group: usize = 0;
+        let mut has_prev = false;
+
+        for &idx in &sorted_indices {
+            let row = idx as usize;
+            let hash = hashes[row];
+            let key = array.value(row);
+
+            // Fast path: same hash as previous row, check value equality directly
+            if has_prev && hash == prev_hash {
+                if unsafe { self.values.get_unchecked(prev_group).is_eq(key) } {
+                    groups[row] = prev_group;
+                    continue;
+                }
+            }
+
+            // Normal path: probe hash table
+            let insert = self.map.entry(
+                hash,
+                |&(g, h)| unsafe { hash == h && self.values.get_unchecked(g).is_eq(key) },
+                |&(_, h)| h,
+            );
+
+            let group_id = match insert {
+                hashbrown::hash_table::Entry::Occupied(o) => o.get().0,
+                hashbrown::hash_table::Entry::Vacant(v) => {
+                    let g = self.values.len();
+                    v.insert((g, hash));
+                    self.values.push(key);
+                    g
                 }
             };
-            groups.push(group_id)
+
+            groups[row] = group_id;
+            prev_hash = hash;
+            prev_group = group_id;
+            has_prev = true;
         }
+
+        self.sorted_indices = sorted_indices;
         Ok(())
     }
 
     fn size(&self) -> usize {
-        self.map.capacity() * size_of::<(usize, u64)>() + self.values.allocated_size()
+        self.map.capacity() * size_of::<(usize, u64)>()
+            + self.values.allocated_size()
+            + self.sorted_indices.allocated_size()
+            + self.hashes_buffer.allocated_size()
     }
 
     fn is_empty(&self) -> bool {
