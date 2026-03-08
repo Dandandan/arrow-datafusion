@@ -19,7 +19,7 @@ use crate::aggregates::group_values::GroupValues;
 use ahash::RandomState;
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::{
-    ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, NullBufferBuilder, PrimitiveArray,
+    Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, NullBufferBuilder, PrimitiveArray,
     cast::AsArray,
 };
 use arrow::datatypes::{DataType, i256};
@@ -93,6 +93,14 @@ pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
     values: Vec<T::Native>,
     /// The random state used to generate hashes
     random_state: RandomState,
+    /// Reused buffer to store hashes
+    hashes_buffer: Vec<u64>,
+    /// Reused buffer for sorted indices during intern
+    sorted_indices: Vec<u32>,
+    /// Reused buffer for gathered hashes in sorted order
+    gathered_hashes: Vec<u64>,
+    /// Reused buffer for counting sort bucket offsets
+    bucket_offsets: Vec<u32>,
 }
 
 impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
@@ -104,6 +112,10 @@ impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
             values: Vec::with_capacity(128),
             null_group: None,
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
+            hashes_buffer: Vec::new(),
+            sorted_indices: Vec::new(),
+            gathered_hashes: Vec::new(),
+            bucket_offsets: Vec::new(),
         }
     }
 }
@@ -114,44 +126,132 @@ where
 {
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
         assert_eq!(cols.len(), 1);
+        let arr = cols[0].as_primitive::<T>();
+        let n_rows = arr.len();
 
         groups.clear();
-        for v in cols[0].as_primitive::<T>() {
-            let group_id = match v {
-                None => *self.null_group.get_or_insert_with(|| {
+        groups.resize(n_rows, 0);
+
+        // Compute all hashes upfront
+        let raw_values = arr.values();
+        let state = &self.random_state;
+        let hashes_buffer = &mut self.hashes_buffer;
+        hashes_buffer.clear();
+        hashes_buffer.reserve(n_rows);
+        for i in 0..n_rows {
+            hashes_buffer.push(raw_values[i].hash(state));
+        }
+
+        // Reserve capacity upfront so the table won't rehash during inserts,
+        // keeping the bucket layout stable for our sort order.
+        self.map.reserve(n_rows, |&(_, h)| h);
+
+        // Counting sort by bucket index for cache locality when probing
+        // the hash table.
+        let num_buckets = self.map.capacity().next_power_of_two();
+        let bucket_mask = num_buckets - 1;
+
+        let sort_bits = 8u32;
+        let num_partitions = 1usize << sort_bits;
+        let bucket_bits = num_buckets.trailing_zeros();
+        let shift = bucket_bits.saturating_sub(sort_bits);
+
+        // Phase 1: Count elements per partition
+        let bucket_offsets = &mut self.bucket_offsets;
+        bucket_offsets.clear();
+        bucket_offsets.resize(num_partitions, 0);
+
+        for &hash in hashes_buffer.iter() {
+            let partition = ((hash as usize) & bucket_mask) >> shift;
+            bucket_offsets[partition] += 1;
+        }
+
+        // Phase 2: Prefix sum to get starting offsets
+        let mut sum = 0u32;
+        for count in bucket_offsets.iter_mut() {
+            let c = *count;
+            *count = sum;
+            sum += c;
+        }
+
+        // Phase 3: Scatter indices and gather hashes into sorted order
+        let sorted_indices = &mut self.sorted_indices;
+        sorted_indices.clear();
+        sorted_indices.resize(n_rows, 0);
+
+        let gathered_hashes = &mut self.gathered_hashes;
+        gathered_hashes.clear();
+        gathered_hashes.resize(n_rows, 0);
+
+        for (i, &hash) in hashes_buffer.iter().enumerate() {
+            let partition = ((hash as usize) & bucket_mask) >> shift;
+            let pos = bucket_offsets[partition] as usize;
+            sorted_indices[pos] = i as u32;
+            gathered_hashes[pos] = hash;
+            bucket_offsets[partition] += 1;
+        }
+
+        // Process in sorted hash order for cache locality
+        let mut prev_hash: u64 = 0;
+        let mut prev_group: usize = 0;
+        let mut has_prev = false;
+
+        for (sorted_pos, &idx) in sorted_indices.iter().enumerate() {
+            let row = idx as usize;
+
+            // Handle nulls
+            if arr.is_null(row) {
+                let group_id = *self.null_group.get_or_insert_with(|| {
                     let group_id = self.values.len();
                     self.values.push(Default::default());
                     group_id
-                }),
-                Some(key) => {
-                    let state = &self.random_state;
-                    let hash = key.hash(state);
-                    let insert = self.map.entry(
-                        hash,
-                        |&(g, h)| unsafe {
-                            hash == h && self.values.get_unchecked(g).is_eq(key)
-                        },
-                        |&(_, h)| h,
-                    );
+                });
+                groups[row] = group_id;
+                continue;
+            }
 
-                    match insert {
-                        hashbrown::hash_table::Entry::Occupied(o) => o.get().0,
-                        hashbrown::hash_table::Entry::Vacant(v) => {
-                            let g = self.values.len();
-                            v.insert((g, hash));
-                            self.values.push(key);
-                            g
-                        }
-                    }
+            let key = raw_values[row];
+            let target_hash = gathered_hashes[sorted_pos];
+
+            // Fast path: same hash as previous row, check equality directly
+            if has_prev && target_hash == prev_hash {
+                if unsafe { self.values.get_unchecked(prev_group).is_eq(key) } {
+                    groups[row] = prev_group;
+                    continue;
+                }
+            }
+
+            let entry = self.map.find_mut(target_hash, |&(g, h)| unsafe {
+                target_hash == h && self.values.get_unchecked(g).is_eq(key)
+            });
+
+            let group_idx = match entry {
+                Some(&mut (g, _)) => g,
+                None => {
+                    let g = self.values.len();
+                    self.map
+                        .insert_unique(target_hash, (g, target_hash), |&(_, h)| h);
+                    self.values.push(key);
+                    g
                 }
             };
-            groups.push(group_id)
+
+            groups[row] = group_idx;
+            prev_hash = target_hash;
+            prev_group = group_idx;
+            has_prev = true;
         }
+
         Ok(())
     }
 
     fn size(&self) -> usize {
-        self.map.capacity() * size_of::<(usize, u64)>() + self.values.allocated_size()
+        self.map.capacity() * size_of::<(usize, u64)>()
+            + self.values.allocated_size()
+            + self.hashes_buffer.allocated_size()
+            + self.sorted_indices.allocated_size()
+            + self.gathered_hashes.allocated_size()
+            + self.bucket_offsets.allocated_size()
     }
 
     fn is_empty(&self) -> bool {
@@ -219,5 +319,11 @@ where
         self.values.shrink_to(num_rows);
         self.map.clear();
         self.map.shrink_to(num_rows, |_| 0); // hasher does not matter since the map is cleared
+        self.hashes_buffer.clear();
+        self.hashes_buffer.shrink_to(num_rows);
+        self.sorted_indices.clear();
+        self.sorted_indices.shrink_to(num_rows);
+        self.gathered_hashes.clear();
+        self.gathered_hashes.shrink_to(num_rows);
     }
 }
