@@ -77,12 +77,15 @@ pub struct GroupValuesRows {
     /// Reused buffer for sorted indices during intern
     sorted_indices: Vec<u32>,
 
+    /// Whether this is in streaming mode (must preserve input order)
+    streaming: bool,
+
     /// Random state for creating hashes
     random_state: RandomState,
 }
 
 impl GroupValuesRows {
-    pub fn try_new(schema: SchemaRef) -> Result<Self> {
+    pub fn try_new(schema: SchemaRef, streaming: bool) -> Result<Self> {
         // Print a debugging message, so it is clear when the (slower) fallback
         // GroupValuesRows is used.
         debug!("Creating GroupValuesRows for schema: {schema}");
@@ -110,6 +113,7 @@ impl GroupValuesRows {
             hashes_buffer: Default::default(),
             rows_buffer,
             sorted_indices: Vec::new(),
+            streaming,
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
         })
     }
@@ -139,12 +143,15 @@ impl GroupValues for GroupValuesRows {
         create_hashes(cols, &self.random_state, batch_hashes)?;
 
         // Sort indices by hash for cache locality and duplicate detection
+        // (only when not streaming, to preserve group index assignment order)
         let sorted_indices = &mut self.sorted_indices;
         sorted_indices.clear();
         sorted_indices.extend(0..n_rows as u32);
-        sorted_indices.sort_unstable_by_key(|&i| batch_hashes[i as usize]);
+        if !self.streaming {
+            sorted_indices.sort_unstable_by_key(|&i| batch_hashes[i as usize]);
+        }
 
-        // Process in sorted hash order
+        // Process in (potentially sorted) hash order
         let mut prev_hash: u64 = 0;
         let mut prev_group: usize = 0;
         let mut has_prev = false;
@@ -202,7 +209,6 @@ impl GroupValues for GroupValuesRows {
             + self.map_size
             + self.rows_buffer.size()
             + self.hashes_buffer.allocated_size()
-            + self.sorted_indices.allocated_size()
     }
 
     fn is_empty(&self) -> bool {

@@ -512,7 +512,19 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
         let sorted_indices = &mut self.sorted_indices;
         sorted_indices.clear();
         sorted_indices.extend(0..n_rows as u32);
-        sorted_indices.sort_unstable_by_key(|&i| batch_hashes[i as usize]);
+
+        // Ensure capacity upfront so the table won't rehash during inserts,
+        // keeping the bucket layout stable for our sort order.
+        self.map.reserve(n_rows, |(hash, _)| *hash);
+
+        // Sort by (bucket_index, hash) for optimal cache locality and
+        // duplicate detection. Rotating left by capacity_bits moves the
+        // bucket-determining low bits to the top of the u64, making them
+        // the primary sort key, while keeping same-hash entries adjacent.
+        let capacity_bits = self.map.capacity().trailing_zeros();
+        sorted_indices.sort_unstable_by_key(|&i| {
+            batch_hashes[i as usize].rotate_left(capacity_bits)
+        });
 
         let mut group_values_len = self.group_values[0].len();
 
@@ -1107,10 +1119,7 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
 
     fn size(&self) -> usize {
         let group_values_size: usize = self.group_values.iter().map(|v| v.size()).sum();
-        group_values_size
-            + self.map_size
-            + self.hashes_buffer.allocated_size()
-            + self.sorted_indices.allocated_size()
+        group_values_size + self.map_size + self.hashes_buffer.allocated_size()
     }
 
     fn is_empty(&self) -> bool {

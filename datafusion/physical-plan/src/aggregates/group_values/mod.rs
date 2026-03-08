@@ -135,12 +135,17 @@ pub fn new_group_values(
     schema: SchemaRef,
     group_ordering: &GroupOrdering,
 ) -> Result<Box<dyn GroupValues>> {
+    let streaming = !matches!(group_ordering, GroupOrdering::None);
+
     if schema.fields.len() == 1 {
         let d = schema.fields[0].data_type();
 
         macro_rules! downcast_helper {
             ($t:ty, $d:ident) => {
-                return Ok(Box::new(GroupValuesPrimitive::<$t>::new($d.clone())))
+                return Ok(Box::new(GroupValuesPrimitive::<$t>::new(
+                    $d.clone(),
+                    streaming,
+                )))
             };
         }
 
@@ -207,6 +212,6 @@ pub fn new_group_values(
             Ok(Box::new(GroupValuesColumn::<true>::try_new(schema)?))
         }
     } else {
-        Ok(Box::new(GroupValuesRows::try_new(schema)?))
+        Ok(Box::new(GroupValuesRows::try_new(schema, streaming)?))
     }
 }
