@@ -36,6 +36,7 @@ use crate::{aggregates, metrics, ExecutionPlan, PhysicalExpr};
 use crate::{RecordBatchStream, SendableRecordBatchStream};
 
 use arrow::array::*;
+use arrow::compute::take;
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::{internal_err, DataFusionError, Result};
@@ -400,6 +401,10 @@ pub(crate) struct GroupedHashAggregateStream {
     /// processed. Reused across batches here to avoid reallocations
     current_group_indices: Vec<usize>,
 
+    /// Reusable buffer for sorting group indices to improve cache
+    /// locality during accumulator updates
+    sort_permutation: Vec<u32>,
+
     /// Accumulators, one for each `AggregateFunctionExpr` in the query
     ///
     /// For example, if the query has aggregates, `SUM(x)`,
@@ -612,6 +617,7 @@ impl GroupedHashAggregateStream {
             reservation,
             group_values,
             current_group_indices: Default::default(),
+            sort_permutation: Default::default(),
             exec_state,
             baseline_metrics,
             batch_size,
@@ -867,6 +873,34 @@ impl GroupedHashAggregateStream {
                 )?;
             }
 
+            // Sort group indices to improve cache locality during accumulator
+            // updates. Without sorting, writes to accumulator state arrays
+            // (which can be large) are scattered, causing cache misses.
+            // The sort permutation is computed once and reused to reorder
+            // values/filters for each accumulator, amortizing the cost.
+            let take_indices = if !self.current_group_indices.is_empty() {
+                let indices = &self.current_group_indices;
+                self.sort_permutation.clear();
+                self.sort_permutation.extend(0..indices.len() as u32);
+                self.sort_permutation
+                    .sort_unstable_by_key(|&i| indices[i as usize]);
+
+                // Reorder group indices using the permutation
+                let sorted: Vec<usize> = self
+                    .sort_permutation
+                    .iter()
+                    .map(|&i| indices[i as usize])
+                    .collect();
+                self.current_group_indices = sorted;
+
+                Some(UInt32Array::from_iter_values(
+                    self.sort_permutation.iter().copied(),
+                ))
+            } else {
+                None
+            };
+            let group_indices = &self.current_group_indices;
+
             // Gather the inputs to call the actual accumulator
             let t = self
                 .accumulators
@@ -875,7 +909,30 @@ impl GroupedHashAggregateStream {
                 .zip(filter_values.iter());
 
             for ((acc, values), opt_filter) in t {
-                let opt_filter = opt_filter.as_ref().map(|filter| filter.as_boolean());
+                // If group indices were sorted, reorder values and filter
+                // to match. Input arrays are batch-sized (~8K elements) so
+                // they fit in cache; the benefit comes from making writes
+                // to the (potentially huge) accumulator state sequential.
+                let (reordered_values, reordered_filter);
+                let (values, opt_filter) = if let Some(perm) = &take_indices {
+                    reordered_values = values
+                        .iter()
+                        .map(|v| take(v.as_ref(), perm, None))
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    reordered_filter = opt_filter
+                        .as_ref()
+                        .map(|f| take(f.as_ref(), perm, None))
+                        .transpose()?;
+                    (
+                        reordered_values.as_slice(),
+                        reordered_filter.as_ref().map(|f| f.as_boolean()),
+                    )
+                } else {
+                    (
+                        values.as_slice(),
+                        opt_filter.as_ref().map(|f| f.as_boolean()),
+                    )
+                };
 
                 // Call the appropriate method on each aggregator with
                 // the entire input row and the relevant group indexes
