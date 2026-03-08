@@ -163,45 +163,54 @@ impl GroupValues for GroupValuesRows {
             // keeping the bucket layout stable for our sort order.
             self.map.reserve(n_rows, |(hash, _)| *hash);
 
-            // Counting sort by bucket index for cache locality when probing
-            // the hash table. hashbrown uses `hash as usize & bucket_mask` for
-            // bucket placement, so we sort on those low bits.
+            // Only apply counting sort when the hash table is large enough to
+            // benefit from improved cache locality (i.e. doesn't fit in L2 cache).
             let num_buckets = self.map.capacity().next_power_of_two();
-            let bucket_mask = num_buckets - 1;
+            // Each bucket holds a control byte + entry: (u64, usize) = 16 bytes + 1
+            let table_bytes = num_buckets * (size_of::<(u64, usize)>() + 1);
+            const L2_CACHE_BYTES: usize = 256 * 1024;
 
-            let sort_bits = 8u32;
-            let num_partitions = 1usize << sort_bits;
-            let bucket_bits = num_buckets.trailing_zeros();
-            let shift = bucket_bits.saturating_sub(sort_bits);
+            if table_bytes > L2_CACHE_BYTES {
+                let bucket_mask = num_buckets - 1;
 
-            // Phase 1: Count elements per partition
-            let bucket_offsets = &mut self.bucket_offsets;
-            bucket_offsets.clear();
-            bucket_offsets.resize(num_partitions, 0);
+                let sort_bits = 8u32;
+                let num_partitions = 1usize << sort_bits;
+                let bucket_bits = num_buckets.trailing_zeros();
+                let shift = bucket_bits.saturating_sub(sort_bits);
 
-            for &hash in batch_hashes.iter() {
-                let partition = ((hash as usize) & bucket_mask) >> shift;
-                bucket_offsets[partition] += 1;
-            }
+                // Phase 1: Count elements per partition
+                let bucket_offsets = &mut self.bucket_offsets;
+                bucket_offsets.clear();
+                bucket_offsets.resize(num_partitions, 0);
 
-            // Phase 2: Prefix sum to get starting offsets
-            let mut sum = 0u32;
-            for count in bucket_offsets.iter_mut() {
-                let c = *count;
-                *count = sum;
-                sum += c;
-            }
+                for &hash in batch_hashes.iter() {
+                    let partition = ((hash as usize) & bucket_mask) >> shift;
+                    bucket_offsets[partition] += 1;
+                }
 
-            // Phase 3: Scatter indices and gather hashes into sorted order
-            sorted_indices.resize(n_rows, 0);
-            gathered_hashes.resize(n_rows, 0);
+                // Phase 2: Prefix sum to get starting offsets
+                let mut sum = 0u32;
+                for count in bucket_offsets.iter_mut() {
+                    let c = *count;
+                    *count = sum;
+                    sum += c;
+                }
 
-            for (i, &hash) in batch_hashes.iter().enumerate() {
-                let partition = ((hash as usize) & bucket_mask) >> shift;
-                let pos = bucket_offsets[partition] as usize;
-                sorted_indices[pos] = i as u32;
-                gathered_hashes[pos] = hash;
-                bucket_offsets[partition] += 1;
+                // Phase 3: Scatter indices and gather hashes into sorted order
+                sorted_indices.resize(n_rows, 0);
+                gathered_hashes.resize(n_rows, 0);
+
+                for (i, &hash) in batch_hashes.iter().enumerate() {
+                    let partition = ((hash as usize) & bucket_mask) >> shift;
+                    let pos = bucket_offsets[partition] as usize;
+                    sorted_indices[pos] = i as u32;
+                    gathered_hashes[pos] = hash;
+                    bucket_offsets[partition] += 1;
+                }
+            } else {
+                // Small table fits in L2 cache; skip sorting overhead
+                sorted_indices.extend(0..n_rows as u32);
+                gathered_hashes.extend_from_slice(batch_hashes);
             }
         } else {
             sorted_indices.extend(0..n_rows as u32);

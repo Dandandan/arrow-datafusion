@@ -521,61 +521,60 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
         // keeping the bucket layout stable for our sort order.
         self.map.reserve(n_rows, |(hash, _)| *hash);
 
-        // Counting sort by bucket index for cache locality when probing
-        // the hash table. hashbrown uses `hash as usize & bucket_mask` for
-        // bucket placement, so we sort on those low bits.
-        //
-        // capacity() returns element capacity (buckets * 7/8), not bucket
-        // count. next_power_of_two() recovers the actual bucket count.
-        let num_buckets = self.map.capacity().next_power_of_two();
-        let bucket_mask = num_buckets - 1;
-
-        // Use a subset of bucket bits for the counting sort to keep the
-        // offsets array small. We partition into 2^sort_bits buckets.
-        // 8 bits = 256 partitions gives good locality without excessive overhead.
-        let sort_bits = 8u32;
-        let num_partitions = 1usize << sort_bits;
-        // num_buckets is a power of two, so trailing_zeros gives log2(num_buckets)
-        // = number of bits used for bucket indexing. We right-shift to keep
-        // only the top `sort_bits` of those bucket-index bits.
-        let bucket_bits = num_buckets.trailing_zeros();
-        let shift = bucket_bits.saturating_sub(sort_bits);
-
-        // Phase 1: Count elements per partition
-        let bucket_offsets = &mut self.bucket_offsets;
-        bucket_offsets.clear();
-        bucket_offsets.resize(num_partitions, 0);
-
-        for &hash in batch_hashes.iter() {
-            let partition = ((hash as usize) & bucket_mask) >> shift;
-            bucket_offsets[partition] += 1;
-        }
-
-        // Phase 2: Prefix sum to get starting offsets
-        let mut sum = 0u32;
-        for count in bucket_offsets.iter_mut() {
-            let c = *count;
-            *count = sum;
-            sum += c;
-        }
-
-        // Phase 3: Scatter indices into sorted order and gather hashes.
-        // We consume bucket_offsets as write cursors (advancing each partition's
-        // offset as we place elements), so no separate copy is needed.
         let sorted_indices = &mut self.sorted_indices;
         sorted_indices.clear();
-        sorted_indices.resize(n_rows, 0);
 
         let gathered_hashes = &mut self.gathered_hashes;
         gathered_hashes.clear();
-        gathered_hashes.resize(n_rows, 0);
 
-        for (i, &hash) in batch_hashes.iter().enumerate() {
-            let partition = ((hash as usize) & bucket_mask) >> shift;
-            let pos = bucket_offsets[partition] as usize;
-            sorted_indices[pos] = i as u32;
-            gathered_hashes[pos] = hash;
-            bucket_offsets[partition] += 1;
+        // Only apply counting sort when the hash table is large enough to
+        // benefit from improved cache locality (i.e. doesn't fit in L2 cache).
+        let num_buckets = self.map.capacity().next_power_of_two();
+        // Each bucket holds a control byte + entry: (u64, GroupIndexView) = 16 bytes + 1
+        let table_bytes = num_buckets * (std::mem::size_of::<(u64, GroupIndexView)>() + 1);
+        const L2_CACHE_BYTES: usize = 256 * 1024;
+
+        if table_bytes > L2_CACHE_BYTES {
+            let bucket_mask = num_buckets - 1;
+
+            let sort_bits = 8u32;
+            let num_partitions = 1usize << sort_bits;
+            let bucket_bits = num_buckets.trailing_zeros();
+            let shift = bucket_bits.saturating_sub(sort_bits);
+
+            // Phase 1: Count elements per partition
+            let bucket_offsets = &mut self.bucket_offsets;
+            bucket_offsets.clear();
+            bucket_offsets.resize(num_partitions, 0);
+
+            for &hash in batch_hashes.iter() {
+                let partition = ((hash as usize) & bucket_mask) >> shift;
+                bucket_offsets[partition] += 1;
+            }
+
+            // Phase 2: Prefix sum to get starting offsets
+            let mut sum = 0u32;
+            for count in bucket_offsets.iter_mut() {
+                let c = *count;
+                *count = sum;
+                sum += c;
+            }
+
+            // Phase 3: Scatter indices into sorted order and gather hashes.
+            sorted_indices.resize(n_rows, 0);
+            gathered_hashes.resize(n_rows, 0);
+
+            for (i, &hash) in batch_hashes.iter().enumerate() {
+                let partition = ((hash as usize) & bucket_mask) >> shift;
+                let pos = bucket_offsets[partition] as usize;
+                sorted_indices[pos] = i as u32;
+                gathered_hashes[pos] = hash;
+                bucket_offsets[partition] += 1;
+            }
+        } else {
+            // Small table fits in L2 cache; skip sorting overhead
+            sorted_indices.extend(0..n_rows as u32);
+            gathered_hashes.extend_from_slice(batch_hashes);
         }
 
         let mut group_values_len = self.group_values[0].len();
