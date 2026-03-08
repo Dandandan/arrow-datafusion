@@ -22,7 +22,7 @@ use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::Result;
 use datafusion_common::tree_node::Transformed;
 use datafusion_expr::logical_plan::LogicalPlan;
-use datafusion_expr::{Aggregate, Expr, Sort, SortExpr};
+use datafusion_expr::{Aggregate, Expr, Sort, SortExpr, Window};
 use std::hash::{Hash, Hasher};
 
 use indexmap::IndexSet;
@@ -88,6 +88,60 @@ impl OptimizerRule for EliminateDuplicatedExpr {
                     fetch: sort.fetch,
                 })))
             }
+            LogicalPlan::Window(window) => {
+                let mut is_transformed = false;
+                let new_window_expr = window
+                    .window_expr
+                    .into_iter()
+                    .map(|expr| {
+                        if let Expr::WindowFunction(mut window_function) = expr {
+                            // remove partition by duplicates
+                            let len = window_function.params.partition_by.len();
+                            let unique_exprs: Vec<Expr> = window_function
+                                .params
+                                .partition_by
+                                .into_iter()
+                                .collect::<IndexSet<_>>()
+                                .into_iter()
+                                .collect();
+                            if len != unique_exprs.len() {
+                                is_transformed = true;
+                            }
+                            window_function.params.partition_by = unique_exprs;
+
+                            // remove order by duplicates
+                            let len = window_function.params.order_by.len();
+                            let unique_exprs: Vec<_> = window_function
+                                .params
+                                .order_by
+                                .into_iter()
+                                .map(SortExprWrapper)
+                                .collect::<IndexSet<_>>()
+                                .into_iter()
+                                .map(|wrapper| wrapper.0)
+                                .collect();
+
+                            if len != unique_exprs.len() {
+                                is_transformed = true;
+                            }
+                            window_function.params.order_by = unique_exprs;
+                            Expr::WindowFunction(window_function)
+                        } else {
+                            expr
+                        }
+                    })
+                    .collect();
+                let plan = LogicalPlan::Window(Window::try_new_with_schema(
+                    new_window_expr,
+                    window.input,
+                    window.schema,
+                )?);
+                if is_transformed {
+                    Ok(Transformed::yes(plan))
+                } else {
+                    Ok(Transformed::no(plan))
+                }
+            }
             LogicalPlan::Aggregate(agg) => {
                 let len = agg.group_expr.len();
 
@@ -121,7 +175,8 @@ mod tests {
     use crate::OptimizerContext;
     use crate::assert_optimized_plan_eq_snapshot;
     use crate::test::*;
-    use datafusion_expr::{col, logical_plan::builder::LogicalPlanBuilder};
+    use datafusion_expr::{col, logical_plan::builder::LogicalPlanBuilder, ExprFunctionExt};
+    use datafusion_functions_window::expr_fn::row_number;
     use std::sync::Arc;
 
     macro_rules! assert_optimized_plan_equal {
@@ -173,6 +228,26 @@ mod tests {
         Limit: skip=5, fetch=10
           Sort: test.a ASC NULLS FIRST, test.b ASC NULLS LAST
             TableScan: test
+        ")
+    }
+
+    #[test]
+    fn eliminate_window_expr() -> Result<()> {
+        let table_scan = test_table_scan().unwrap();
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .window(vec![row_number()
+                .partition_by(vec![col("a"), col("a"), col("b")])
+                .order_by(vec![
+                    col("c").sort(true, true),
+                    col("c").sort(false, false),
+                ])
+                .build()
+                .unwrap()])?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @"
+        WindowAggr: windowExpr=[[row_number() PARTITION BY [test.a, test.b] ORDER BY [test.c ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+          TableScan: test
         ")
     }
 }
