@@ -33,6 +33,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_catalog::Session;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{project_schema, stats::Precision};
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -45,7 +46,7 @@ use async_trait::async_trait;
 struct StatisticsValidation {
     stats: Statistics,
     schema: Arc<Schema>,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl StatisticsValidation {
@@ -59,7 +60,7 @@ impl StatisticsValidation {
         Self {
             stats,
             schema,
-            cache,
+            cache: Arc::new(cache),
         }
     }
 
@@ -158,7 +159,7 @@ impl ExecutionPlan for StatisticsValidation {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -181,16 +182,28 @@ impl ExecutionPlan for StatisticsValidation {
         unimplemented!("This plan only serves for testing statistics")
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(self.stats.clone())
-    }
-
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
         if partition.is_some() {
             Ok(Statistics::new_unknown(&self.schema))
         } else {
             Ok(self.stats.clone())
         }
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &dyn datafusion::physical_plan::PhysicalExpr,
+        ) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        // Visit expressions in the output ordering from equivalence properties
+        let mut tnr = TreeNodeRecursion::Continue;
+        if let Some(ordering) = self.cache.output_ordering() {
+            for sort_expr in ordering {
+                tnr = tnr.visit_sibling(|| f(sort_expr.expr.as_ref()))?;
+            }
+        }
+        Ok(tnr)
     }
 }
 
@@ -214,6 +227,7 @@ fn fully_defined() -> (Statistics, Schema) {
                     min_value: Precision::Exact(ScalarValue::Int32(Some(-24))),
                     sum_value: Precision::Exact(ScalarValue::Int64(Some(10))),
                     null_count: Precision::Exact(0),
+                    byte_size: Precision::Absent,
                 },
                 ColumnStatistics {
                     distinct_count: Precision::Exact(13),
@@ -221,6 +235,7 @@ fn fully_defined() -> (Statistics, Schema) {
                     min_value: Precision::Exact(ScalarValue::Int64(Some(-6783))),
                     sum_value: Precision::Exact(ScalarValue::Int64(Some(10))),
                     null_count: Precision::Exact(5),
+                    byte_size: Precision::Absent,
                 },
             ],
         },
@@ -265,17 +280,19 @@ async fn sql_filter() -> Result<()> {
 #[tokio::test]
 async fn sql_limit() -> Result<()> {
     let (stats, schema) = fully_defined();
-    let col_stats = Statistics::unknown_column(&schema);
     let ctx = init_ctx(stats.clone(), schema)?;
 
     let df = ctx.sql("SELECT * FROM stats_table LIMIT 5").await.unwrap();
     let physical_plan = df.create_physical_plan().await.unwrap();
-    // when the limit is smaller than the original number of lines
-    // we loose all statistics except the for number of rows which becomes the limit
+    // when the limit is smaller than the original number of lines we mark the statistics as inexact
     assert_eq!(
         Statistics {
             num_rows: Precision::Exact(5),
-            column_statistics: col_stats,
+            column_statistics: stats
+                .column_statistics
+                .iter()
+                .map(|c| c.clone().to_inexact())
+                .collect(),
             total_byte_size: Precision::Absent
         },
         physical_plan.partition_statistics(None)?

@@ -17,23 +17,29 @@
   under the License.
 -->
 
-# DataFusion sqllogictest
+# Apache DataFusion sqllogictest
 
-[DataFusion][df] is an extensible query execution framework, written in Rust, that uses Apache Arrow as its in-memory format.
+[Apache DataFusion] is an extensible query execution framework, written in Rust, that uses [Apache Arrow] as its in-memory format.
 
-This crate is a submodule of DataFusion that contains an implementation of [sqllogictest](https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki).
+This crate is a submodule of DataFusion that contains an implementation of [sqllogictest].
 
-[df]: https://crates.io/crates/datafusion
+[apache arrow]: https://arrow.apache.org/
+[apache datafusion]: https://datafusion.apache.org/
+[sqllogictest]: https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki
 
 ## Overview
 
-This crate uses [sqllogictest-rs](https://github.com/risinglightdb/sqllogictest-rs) to parse and run `.slt` files in the
-[`test_files`](test_files) directory of this crate or the [`data/sqlite`](https://github.com/apache/datafusion-testing/tree/main/data/sqlite)
-directory of the [datafusion-testing](https://github.com/apache/datafusion-testing) crate.
+This crate uses [sqllogictest-rs] to parse and run `.slt` files in the [`test_files`] directory of
+this crate or the [`data/sqlite`] directory of the [datafusion-testing] repository.
+
+[sqllogictest-rs]: https://github.com/risinglightdb/sqllogictest-rs
+[`test_files`]: test_files
+[`data/sqlite`]: https://github.com/apache/datafusion-testing/tree/main/data/sqlite
+[datafusion-testing]: https://github.com/apache/datafusion-testing
 
 ## Testing setup
 
-1. `rustup update stable` DataFusion uses the latest stable release of rust
+1. `rustup update stable` DataFusion uses the latest stable release of Rust
 2. `git submodule init`
 3. `git submodule update --init --remote --recursive`
 
@@ -62,6 +68,36 @@ cargo test --test sqllogictests -- ddl --complete
 ```shell
 # Run ddl.slt, printing debug logging to stdout
 RUST_LOG=debug cargo test --test sqllogictests -- ddl
+```
+
+### Per-file timing summary
+
+The sqllogictest runner can emit deterministic per-file elapsed timings to help
+identify slow test files.
+
+By default (`--timing-summary auto`), timing summary output is disabled in local
+TTY runs and shows a top-slowest summary in non-TTY/CI runs.
+
+`--timing-top-n` / `SLT_TIMING_TOP_N` must be a positive integer (`>= 1`).
+
+```shell
+# Show top 10 slowest files (good for CI)
+cargo test --test sqllogictests -- --timing-summary top --timing-top-n 10
+```
+
+```shell
+# Show full per-file timing table
+cargo test --test sqllogictests -- --timing-summary full
+```
+
+```shell
+# Same controls via environment variables
+SLT_TIMING_SUMMARY=top SLT_TIMING_TOP_N=15 cargo test --test sqllogictests
+```
+
+```shell
+# Optional debug logging for per-task slow files (>30s), disabled by default
+SLT_TIMING_DEBUG_SLOW_FILES=1 cargo test --test sqllogictests
 ```
 
 ## Cookbook: Adding Tests
@@ -134,6 +170,17 @@ query TT
 select substr('Andrew Lamb', 1, 6), '|'
 ----
 Andrew |
+```
+
+## Cookbook: Ignoring volatile output
+
+Sometimes parts of a result change every run (timestamps, counters, etc.). To keep the rest of the snapshot checked in, replace those fragments with the `<slt:ignore>` marker inside the expected block. During validation the marker acts like a wildcard, so only the surrounding text must match.
+
+```text
+query TT
+EXPLAIN ANALYZE SELECT * FROM generate_series(100);
+----
+Plan with Metrics LazyMemoryExec: partitions=1, batch_generators=[generate_series: start=0, end=100, batch_size=8192], metrics=[output_rows=101, elapsed_compute=<slt:ignore>, output_bytes=<slt:ignore>]
 ```
 
 # Reference
@@ -290,6 +337,27 @@ directory `test_files/scratch/copy`.
 Tests that need to write temporary files should write (only) to this
 directory to ensure they do not interfere with others concurrently
 running tests.
+
+## Running tests: Substrait round-trip mode
+
+This mode will run all the .slt test files in validation mode, adding a Substrait conversion round-trip for each
+generated DataFusion logical plan (SQL statement → DF logical → Substrait → DF logical → DF physical → execute).
+
+Not all statements will be round-tripped, some statements like CREATE, INSERT, SET or EXPLAIN statements will be
+issued as is, but any other statement will be round-tripped to/from Substrait.
+
+_WARNING_: as there are still a lot of failures in this mode (https://github.com/apache/datafusion/issues/16248),
+it is not enforced in the CI, instead, it needs to be run manually with the following command:
+
+```shell
+cargo test --test sqllogictests -- --substrait-round-trip
+```
+
+For focusing on one specific failing test, a file:line filter can be used:
+
+```shell
+cargo test --test sqllogictests -- --substrait-round-trip binary.slt:23
+```
 
 ## `.slt` file format
 

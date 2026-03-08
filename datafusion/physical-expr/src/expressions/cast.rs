@@ -22,11 +22,12 @@ use std::sync::Arc;
 
 use crate::physical_expr::PhysicalExpr;
 
-use arrow::compute::{can_cast_types, CastOptions};
+use arrow::compute::{CastOptions, can_cast_types};
 use arrow::datatypes::{DataType, DataType::*, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
-use datafusion_common::{not_impl_err, Result};
+use datafusion_common::nested_struct::validate_struct_compatibility;
+use datafusion_common::{Result, not_impl_err};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::interval_arithmetic::Interval;
 use datafusion_expr_common::sort_properties::ExprProperties;
@@ -40,6 +41,22 @@ const DEFAULT_SAFE_CAST_OPTIONS: CastOptions<'static> = CastOptions {
     safe: true,
     format_options: DEFAULT_FORMAT_OPTIONS,
 };
+
+/// Check if struct-to-struct casting is allowed by validating field compatibility.
+///
+/// This function applies the same validation rules as execution time to ensure
+/// planning-time validation matches runtime validation, enabling fail-fast behavior
+/// instead of deferring errors to execution.
+fn can_cast_struct_types(source: &DataType, target: &DataType) -> bool {
+    match (source, target) {
+        (Struct(source_fields), Struct(target_fields)) => {
+            // Apply the same struct compatibility rules as at execution time.
+            // This ensures planning-time validation matches execution-time validation.
+            validate_struct_compatibility(source_fields, target_fields).is_ok()
+        }
+        _ => false,
+    }
+}
 
 /// CAST expression casts an expression to a specific data type and returns a runtime error on invalid cast
 #[derive(Debug, Clone, Eq)]
@@ -97,12 +114,15 @@ impl CastExpr {
     pub fn cast_options(&self) -> &CastOptions<'static> {
         &self.cast_options
     }
-    pub fn is_bigger_cast(&self, src: DataType) -> bool {
-        if src == self.cast_type {
+
+    /// Check if casting from the specified source type to the target type is a
+    /// widening cast (e.g. from `Int8` to `Int16`).
+    pub fn check_bigger_cast(cast_type: &DataType, src: &DataType) -> bool {
+        if cast_type.eq(src) {
             return true;
         }
         matches!(
-            (src, &self.cast_type),
+            (src, cast_type),
             (Int8, Int16 | Int32 | Int64)
                 | (Int16, Int32 | Int64)
                 | (Int32, Int64)
@@ -117,11 +137,16 @@ impl CastExpr {
                 | (Utf8, LargeUtf8)
         )
     }
+
+    /// Check if the cast is a widening cast (e.g. from `Int8` to `Int16`).
+    pub fn is_bigger_cast(&self, src: &DataType) -> bool {
+        Self::check_bigger_cast(&self.cast_type, src)
+    }
 }
 
 impl fmt::Display for CastExpr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "CAST({} AS {:?})", self.expr, self.cast_type)
+        write!(f, "CAST({} AS {})", self.expr, self.cast_type)
     }
 }
 
@@ -183,7 +208,7 @@ impl PhysicalExpr for CastExpr {
         // Get child's datatype:
         let cast_type = child_interval.data_type();
         Ok(Some(vec![
-            interval.cast_to(&cast_type, &DEFAULT_SAFE_CAST_OPTIONS)?
+            interval.cast_to(&cast_type, &DEFAULT_SAFE_CAST_OPTIONS)?,
         ]))
     }
 
@@ -229,8 +254,14 @@ pub fn cast_with_options(
         Ok(Arc::clone(&expr))
     } else if can_cast_types(&expr_type, &cast_type) {
         Ok(Arc::new(CastExpr::new(expr, cast_type, cast_options)))
+    } else if can_cast_struct_types(&expr_type, &cast_type) {
+        // Allow struct-to-struct casts that pass name-based compatibility validation.
+        // This validation is applied at planning time (now) to fail fast, rather than
+        // deferring errors to execution time. The name-based casting logic will be
+        // executed at runtime via ColumnarValue::cast_to.
+        Ok(Arc::new(CastExpr::new(expr, cast_type, cast_options)))
     } else {
-        not_impl_err!("Unsupported CAST from {expr_type:?} to {cast_type:?}")
+        not_impl_err!("Unsupported CAST from {expr_type} to {cast_type}")
     }
 }
 
@@ -254,14 +285,14 @@ mod tests {
 
     use arrow::{
         array::{
-            Array, Decimal128Array, Float32Array, Float64Array, Int16Array, Int32Array,
-            Int64Array, Int8Array, StringArray, Time64NanosecondArray,
+            Array, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
+            Int32Array, Int64Array, StringArray, Time64NanosecondArray,
             TimestampNanosecondArray, UInt32Array,
         },
         datatypes::*,
     };
-    use datafusion_common::assert_contains;
     use datafusion_physical_expr_common::physical_expr::fmt_sql;
+    use insta::assert_snapshot;
 
     // runs an end-to-end test of physical type cast
     // 1. construct a record batch with a column "a" of type A
@@ -281,10 +312,7 @@ mod tests {
                 cast_with_options(col("a", &schema)?, &schema, $TYPE, $CAST_OPTIONS)?;
 
             // verify that its display is correct
-            assert_eq!(
-                format!("CAST(a@0 AS {:?})", $TYPE),
-                format!("{}", expression)
-            );
+            assert_eq!(format!("CAST(a@0 AS {})", $TYPE), format!("{}", expression));
 
             // verify that the expression's type is correct
             assert_eq!(expression.data_type(&schema)?, $TYPE);
@@ -308,7 +336,7 @@ mod tests {
             for (i, x) in $VEC.iter().enumerate() {
                 match x {
                     Some(x) => assert_eq!(result.value(i), *x),
-                    None => assert!(!result.is_valid(i)),
+                    None => assert!(result.is_null(i)),
                 }
             }
         }};
@@ -333,10 +361,7 @@ mod tests {
                 cast_with_options(col("a", &schema)?, &schema, $TYPE, $CAST_OPTIONS)?;
 
             // verify that its display is correct
-            assert_eq!(
-                format!("CAST(a@0 AS {:?})", $TYPE),
-                format!("{}", expression)
-            );
+            assert_eq!(format!("CAST(a@0 AS {})", $TYPE), format!("{}", expression));
 
             // verify that the expression's type is correct
             assert_eq!(expression.data_type(&schema)?, $TYPE);
@@ -363,7 +388,7 @@ mod tests {
             for (i, x) in $VEC.iter().enumerate() {
                 match x {
                     Some(x) => assert_eq!(result.value(i), *x),
-                    None => assert!(!result.is_valid(i)),
+                    None => assert!(result.is_null(i)),
                 }
             }
         }};
@@ -436,12 +461,9 @@ mod tests {
         )?;
         let expression =
             cast_with_options(col("a", &schema)?, &schema, Decimal128(6, 2), None)?;
-        let e = expression.evaluate(&batch).unwrap_err(); // panics on OK
-        assert_contains!(
-            e.to_string(),
-            "Arrow error: Invalid argument error: 12345679 is too large to store in a Decimal128 of precision 6. Max is 999999"
-        );
-
+        let e = expression.evaluate(&batch).unwrap_err().strip_backtrace(); // panics on OK
+        assert_snapshot!(e, @"Arrow error: Invalid argument error: 123456.79 is too large to store in a Decimal128 of precision 6. Max is 9999.99");
+        // safe cast should return null
         let expression_safe = cast_with_options(
             col("a", &schema)?,
             &schema,
@@ -741,6 +763,9 @@ mod tests {
         Ok(())
     }
 
+    // Tests for timestamp timezone casting have been moved to timestamps.slt
+    // See the "Casting between timestamp with and without timezone" section
+
     #[test]
     fn invalid_cast() {
         // Ensure a useful error happens at plan time if invalid casts are used
@@ -766,9 +791,10 @@ mod tests {
         match result {
             Ok(_) => panic!("expected error"),
             Err(e) => {
-                assert!(e
-                    .to_string()
-                    .contains("Cannot cast string '9.1' to value of Int32 type"))
+                assert!(
+                    e.to_string()
+                        .contains("Cannot cast string '9.1' to value of Int32 type")
+                )
             }
         }
         Ok(())

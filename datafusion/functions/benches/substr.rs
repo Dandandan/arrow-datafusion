@@ -15,17 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-extern crate criterion;
-
 use arrow::array::{ArrayRef, Int64Array, OffsetSizeTrait};
 use arrow::datatypes::{DataType, Field};
 use arrow::util::bench_util::{
     create_string_array_with_len, create_string_view_array_with_len,
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion, SamplingMode};
+use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
 use datafusion_common::DataFusionError;
+use datafusion_common::config::ConfigOptions;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs};
 use datafusion_functions::unicode;
+use std::hint::black_box;
 use std::sync::Arc;
 
 fn create_args_without_count<O: OffsetSizeTrait>(
@@ -97,6 +97,7 @@ fn create_args_with_count<O: OffsetSizeTrait>(
     }
 }
 
+#[expect(clippy::needless_pass_by_value)]
 fn invoke_substr_with_args(
     args: Vec<ColumnarValue>,
     number_rows: usize,
@@ -106,12 +107,14 @@ fn invoke_substr_with_args(
         .enumerate()
         .map(|(idx, arg)| Field::new(format!("arg_{idx}"), arg.data_type(), true).into())
         .collect::<Vec<_>>();
+    let config_options = Arc::new(ConfigOptions::default());
 
     unicode::substr().invoke_with_args(ScalarFunctionArgs {
         args: args.clone(),
         arg_fields,
         number_rows,
         return_field: Field::new("f", DataType::Utf8View, true).into(),
+        config_options: Arc::clone(&config_options),
     })
 }
 

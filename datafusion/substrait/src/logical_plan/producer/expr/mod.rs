@@ -37,13 +37,13 @@ pub use window_function::*;
 
 use crate::logical_plan::producer::utils::flatten_names;
 use crate::logical_plan::producer::{
-    to_substrait_named_struct, DefaultSubstraitProducer, SubstraitProducer,
+    DefaultSubstraitProducer, SubstraitProducer, to_substrait_named_struct,
 };
 use datafusion::arrow::datatypes::Field;
-use datafusion::common::{internal_err, not_impl_err, DFSchemaRef};
+use datafusion::common::{DFSchemaRef, internal_err, not_impl_err};
 use datafusion::execution::SessionState;
-use datafusion::logical_expr::expr::Alias;
 use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::expr::Alias;
 use substrait::proto::expression_reference::ExprType;
 use substrait::proto::{Expression, ExpressionReference, ExtendedExpression};
 use substrait::version;
@@ -60,6 +60,9 @@ use substrait::version;
 ///
 /// Substrait also requires the input schema of the expressions to be included in the
 /// message.  The field names of the input schema will be serialized.
+// Silence deprecation warnings for `extension_uris` during the uri -> urn migration
+// See: https://github.com/substrait-io/substrait/issues/856
+#[expect(deprecated)]
 pub fn to_substrait_extended_expr(
     exprs: &[(&Expr, &Field)],
     schema: &DFSchemaRef,
@@ -78,13 +81,14 @@ pub fn to_substrait_extended_expr(
             })
         })
         .collect::<datafusion::common::Result<Vec<_>>>()?;
-    let substrait_schema = to_substrait_named_struct(schema)?;
+    let substrait_schema = to_substrait_named_struct(&mut producer, schema)?;
 
     let extensions = producer.get_extensions();
     Ok(Box::new(ExtendedExpression {
         advanced_extensions: None,
         expected_type_urls: vec![],
         extension_uris: vec![],
+        extension_urns: vec![],
         extensions: extensions.into(),
         version: Some(version::version_with_producer("datafusion")),
         referred_expr: substrait_exprs,
@@ -109,7 +113,7 @@ pub fn to_substrait_rex(
         Expr::ScalarVariable(_, _) => {
             not_impl_err!("Cannot convert {expr:?} to Substrait")
         }
-        Expr::Literal(expr) => producer.handle_literal(expr),
+        Expr::Literal(expr, _) => producer.handle_literal(expr),
         Expr::BinaryExpr(expr) => producer.handle_binary_expr(expr, schema),
         Expr::Like(expr) => producer.handle_like(expr, schema),
         Expr::SimilarTo(_) => not_impl_err!("Cannot convert {expr:?} to Substrait"),
@@ -137,6 +141,7 @@ pub fn to_substrait_rex(
         Expr::InList(expr) => producer.handle_in_list(expr, schema),
         Expr::Exists(expr) => not_impl_err!("Cannot convert {expr:?} to Substrait"),
         Expr::InSubquery(expr) => producer.handle_in_subquery(expr, schema),
+        Expr::SetComparison(expr) => producer.handle_set_comparison(expr, schema),
         Expr::ScalarSubquery(expr) => {
             not_impl_err!("Cannot convert {expr:?} to Substrait")
         }
@@ -172,7 +177,7 @@ mod tests {
         let state = SessionStateBuilder::default().build();
 
         // One expression, empty input schema
-        let expr = Expr::Literal(ScalarValue::Int32(Some(42)));
+        let expr = Expr::Literal(ScalarValue::Int32(Some(42)), None);
         let field = Field::new("out", DataType::Int32, false);
         let empty_schema = DFSchemaRef::new(DFSchema::empty());
         let substrait =
