@@ -215,12 +215,16 @@ where
         self.map.reserve(sorted_indices.len(), |&(_, h)| h);
 
         // Sort by (bucket_index, hash) for optimal cache locality and
-        // duplicate detection. Rotating left by capacity_bits moves the
+        // duplicate detection. Rotating left by bucket_bits moves the
         // bucket-determining low bits to the top of the u64, making them
         // the primary sort key, while keeping same-hash entries adjacent.
-        let capacity_bits = self.map.capacity().trailing_zeros();
+        //
+        // capacity() returns element capacity (buckets * 7/8), not bucket
+        // count. next_power_of_two() recovers the actual bucket count.
+        let bucket_bits =
+            self.map.capacity().next_power_of_two().trailing_zeros();
         sorted_indices
-            .sort_unstable_by_key(|&i| hashes[i as usize].rotate_left(capacity_bits));
+            .sort_unstable_by_key(|&i| hashes[i as usize].rotate_left(bucket_bits));
 
         // Process in sorted bucket order
         let mut prev_hash: u64 = 0;
