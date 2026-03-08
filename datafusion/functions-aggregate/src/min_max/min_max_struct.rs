@@ -98,6 +98,72 @@ impl GroupsAccumulator for MinMaxStructAccumulator {
         }
     }
 
+    fn update_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        let array = &values[0];
+        assert_eq!(array.data_type(), &self.inner.data_type);
+
+        fn struct_min(a: &StructArray, b: &StructArray) -> bool {
+            matches!(partial_cmp_struct(a, b), Some(Ordering::Less))
+        }
+
+        fn struct_max(a: &StructArray, b: &StructArray) -> bool {
+            matches!(partial_cmp_struct(a, b), Some(Ordering::Greater))
+        }
+
+        let cmp_fn: fn(&StructArray, &StructArray) -> bool =
+            if self.is_min { struct_min } else { struct_max };
+
+        let struct_array = array.as_struct();
+        self.inner.min_max.resize(total_num_groups, None);
+        let mut locations = vec![MinMaxLocation::ExistingMinMax; total_num_groups];
+
+        for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+            let idx = idx as usize;
+            if array.is_null(idx) {
+                continue;
+            }
+            if let Some(filter) = opt_filter {
+                if filter.is_null(idx) || !filter.value(idx) {
+                    continue;
+                }
+            }
+            let new_val = struct_array.slice(idx, 1);
+
+            let existing_val = match &locations[group_index] {
+                MinMaxLocation::Input(existing_val) => existing_val,
+                MinMaxLocation::ExistingMinMax => {
+                    let Some(existing_val) = self.inner.min_max[group_index].as_ref()
+                    else {
+                        locations[group_index] = MinMaxLocation::Input(new_val);
+                        continue;
+                    };
+                    existing_val
+                }
+            };
+
+            if cmp_fn(&new_val, existing_val) {
+                locations[group_index] = MinMaxLocation::Input(new_val);
+            }
+        }
+
+        for (group_index, location) in locations.iter().enumerate() {
+            match location {
+                MinMaxLocation::ExistingMinMax => {}
+                MinMaxLocation::Input(new_val) => {
+                    self.inner.set_value(group_index, new_val)
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
         let (_, min_maxes) = self.inner.emit_to(emit_to);
         let fields = match &self.inner.data_type {
@@ -137,6 +203,24 @@ impl GroupsAccumulator for MinMaxStructAccumulator {
     ) -> Result<()> {
         // min/max are their own states (no transition needed)
         self.update_batch(values, group_indices, opt_filter, total_num_groups)
+    }
+
+    fn merge_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        // min/max are their own states (no transition needed)
+        self.update_batch_with_indices(
+            values,
+            indices,
+            group_indices,
+            opt_filter,
+            total_num_groups,
+        )
     }
 
     fn convert_to_state(

@@ -288,6 +288,114 @@ impl NullState {
         }
     }
 
+    /// Like [`Self::accumulate`], but only processes the rows at the given
+    /// `indices` positions in `values`.
+    ///
+    /// `group_indices[i]` corresponds to `values[indices[i]]`.
+    pub fn accumulate_with_indices<T, F>(
+        &mut self,
+        group_indices: &[usize],
+        values: &PrimitiveArray<T>,
+        indices: &[u32],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+        mut value_fn: F,
+    ) where
+        T: ArrowPrimitiveType + Send,
+        F: FnMut(usize, T::Native) + Send,
+    {
+        if let SeenValues::All { num_values } = &mut self.seen_values
+            && opt_filter.is_none()
+            && values.null_count() == 0
+        {
+            accumulate_with_indices(group_indices, values, indices, None, value_fn);
+            *num_values = total_num_groups;
+            return;
+        }
+
+        let seen_values = self.seen_values.get_builder(total_num_groups);
+        accumulate_with_indices(
+            group_indices,
+            values,
+            indices,
+            opt_filter,
+            |group_index, value| {
+                seen_values.set_bit(group_index, true);
+                value_fn(group_index, value);
+            },
+        );
+    }
+
+    /// Like [`Self::accumulate_boolean`], but only processes the rows at the
+    /// given `indices` positions in `values`.
+    ///
+    /// `group_indices[i]` corresponds to `values[indices[i]]`.
+    pub fn accumulate_boolean_with_indices<F>(
+        &mut self,
+        group_indices: &[usize],
+        values: &BooleanArray,
+        indices: &[u32],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+        mut value_fn: F,
+    ) where
+        F: FnMut(usize, bool) + Send,
+    {
+        let data = values.values();
+        assert_eq!(group_indices.len(), indices.len());
+
+        if let SeenValues::All { num_values } = &mut self.seen_values
+            && opt_filter.is_none()
+            && values.null_count() == 0
+        {
+            for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+                value_fn(group_index, data.value(idx as usize));
+            }
+            *num_values = total_num_groups;
+            return;
+        }
+
+        let seen_values = self.seen_values.get_builder(total_num_groups);
+
+        match (values.null_count() > 0, opt_filter) {
+            (false, None) => {
+                for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+                    seen_values.set_bit(group_index, true);
+                    value_fn(group_index, data.value(idx as usize));
+                }
+            }
+            (true, None) => {
+                let nulls = values.nulls().unwrap();
+                for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+                    let idx = idx as usize;
+                    if nulls.is_valid(idx) {
+                        seen_values.set_bit(group_index, true);
+                        value_fn(group_index, data.value(idx));
+                    }
+                }
+            }
+            (false, Some(filter)) => {
+                for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+                    let idx = idx as usize;
+                    if !filter.is_null(idx) && filter.value(idx) {
+                        seen_values.set_bit(group_index, true);
+                        value_fn(group_index, data.value(idx));
+                    }
+                }
+            }
+            (true, Some(filter)) => {
+                let nulls = values.nulls().unwrap();
+                for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+                    let idx = idx as usize;
+                    if nulls.is_valid(idx) && !filter.is_null(idx) && filter.value(idx) {
+                        seen_values.set_bit(group_index, true);
+                        value_fn(group_index, data.value(idx));
+                    }
+                }
+            }
+        }
+    }
+
     /// Creates the a [`NullBuffer`] representing which group_indices
     /// should have null values (because they never saw any values)
     /// for the `emit_to` rows.
@@ -669,6 +777,108 @@ pub fn accumulate_indices<F>(
                         index_fn(group_index)
                     }
                 });
+        }
+    }
+}
+
+/// Like [`accumulate`], but only processes the rows at the given `indices`
+/// positions in `values`.
+///
+/// `group_indices[i]` corresponds to `values[indices[i]]`.
+/// `opt_filter`, if present, is full-length and is checked at `indices[i]`.
+pub fn accumulate_with_indices<T, F>(
+    group_indices: &[usize],
+    values: &PrimitiveArray<T>,
+    indices: &[u32],
+    opt_filter: Option<&BooleanArray>,
+    mut value_fn: F,
+) where
+    T: ArrowPrimitiveType + Send,
+    F: FnMut(usize, T::Native) + Send,
+{
+    let data: &[T::Native] = values.values();
+    assert_eq!(group_indices.len(), indices.len());
+
+    match (values.null_count() > 0, opt_filter) {
+        (false, None) => {
+            for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+                value_fn(group_index, data[idx as usize]);
+            }
+        }
+        (true, None) => {
+            let nulls = values.nulls().unwrap();
+            for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+                let idx = idx as usize;
+                if nulls.is_valid(idx) {
+                    value_fn(group_index, data[idx]);
+                }
+            }
+        }
+        (false, Some(filter)) => {
+            for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+                let idx = idx as usize;
+                if !filter.is_null(idx) && filter.value(idx) {
+                    value_fn(group_index, data[idx]);
+                }
+            }
+        }
+        (true, Some(filter)) => {
+            let nulls = values.nulls().unwrap();
+            for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+                let idx = idx as usize;
+                if nulls.is_valid(idx) && !filter.is_null(idx) && filter.value(idx) {
+                    value_fn(group_index, data[idx]);
+                }
+            }
+        }
+    }
+}
+
+/// Like [`accumulate_multiple`], but only processes the rows at the given
+/// `indices` positions in `value_columns`.
+///
+/// `group_indices[i]` corresponds to row `indices[i]` in all value columns.
+pub fn accumulate_multiple_with_indices<T, F>(
+    group_indices: &[usize],
+    value_columns: &[&PrimitiveArray<T>],
+    indices: &[u32],
+    opt_filter: Option<&BooleanArray>,
+    mut value_fn: F,
+) where
+    T: ArrowPrimitiveType + Send,
+    F: FnMut(usize, usize, &[&PrimitiveArray<T>]) + Send,
+{
+    assert_eq!(group_indices.len(), indices.len());
+
+    let combined_nulls = value_columns
+        .iter()
+        .map(|arr| arr.logical_nulls())
+        .fold(None, |acc, nulls| {
+            NullBuffer::union(acc.as_ref(), nulls.as_ref())
+        });
+
+    let valid_indices = match (combined_nulls, opt_filter) {
+        (None, None) => None,
+        (None, Some(filter)) => Some(filter.clone()),
+        (Some(nulls), None) => Some(BooleanArray::new(nulls.inner().clone(), None)),
+        (Some(nulls), Some(filter)) => {
+            let combined = nulls.inner() & filter.values();
+            Some(BooleanArray::new(combined, None))
+        }
+    };
+
+    match valid_indices {
+        None => {
+            for (&group_idx, &idx) in group_indices.iter().zip(indices.iter()) {
+                value_fn(group_idx, idx as usize, value_columns);
+            }
+        }
+        Some(valid_indices) => {
+            for (&group_idx, &idx) in group_indices.iter().zip(indices.iter()) {
+                if valid_indices.value(idx as usize) {
+                    value_fn(group_idx, idx as usize, value_columns);
+                }
+            }
         }
     }
 }

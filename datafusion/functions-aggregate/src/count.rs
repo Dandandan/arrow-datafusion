@@ -598,6 +598,38 @@ impl GroupsAccumulator for CountGroupsAccumulator {
         Ok(())
     }
 
+    fn update_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        assert_eq!(values.len(), 1, "single argument to update_batch");
+        let values = &values[0];
+
+        self.counts.resize(total_num_groups, 0);
+        let nulls = values.logical_nulls();
+        for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+            let idx = idx as usize;
+            if let Some(ref nulls) = nulls {
+                if !nulls.is_valid(idx) {
+                    continue;
+                }
+            }
+            if let Some(filter) = opt_filter {
+                if filter.is_null(idx) || !filter.value(idx) {
+                    continue;
+                }
+            }
+            let count = unsafe { self.counts.get_unchecked_mut(group_index) };
+            *count += 1;
+        }
+
+        Ok(())
+    }
+
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
@@ -621,6 +653,27 @@ impl GroupsAccumulator for CountGroupsAccumulator {
                 self.counts[group_index] += partial_count;
             },
         );
+
+        Ok(())
+    }
+
+    fn merge_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        _opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        assert_eq!(values.len(), 1, "one argument to merge_batch");
+        let partial_counts = values[0].as_primitive::<Int64Type>();
+        assert_eq!(partial_counts.null_count(), 0);
+        let partial_counts = partial_counts.values();
+
+        self.counts.resize(total_num_groups, 0);
+        for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+            self.counts[group_index] += partial_counts[idx as usize];
+        }
 
         Ok(())
     }

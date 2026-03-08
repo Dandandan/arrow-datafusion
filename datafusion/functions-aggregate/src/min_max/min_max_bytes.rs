@@ -199,6 +199,130 @@ impl GroupsAccumulator for MinMaxBytesAccumulator {
         }
     }
 
+    fn update_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        let array = &values[0];
+        assert_eq!(array.data_type(), &self.inner.data_type);
+
+        // Helper: check if row at `idx` should be included (not null, not filtered)
+        let is_valid_row = |idx: usize| -> bool {
+            if array.is_null(idx) {
+                return false;
+            }
+            if let Some(f) = opt_filter {
+                if f.is_null(idx) || !f.value(idx) {
+                    return false;
+                }
+            }
+            true
+        };
+
+        fn string_min(a: &[u8], b: &[u8]) -> bool {
+            unsafe {
+                let a = std::str::from_utf8_unchecked(a);
+                let b = std::str::from_utf8_unchecked(b);
+                a < b
+            }
+        }
+        fn string_max(a: &[u8], b: &[u8]) -> bool {
+            unsafe {
+                let a = std::str::from_utf8_unchecked(a);
+                let b = std::str::from_utf8_unchecked(b);
+                a > b
+            }
+        }
+        fn binary_min(a: &[u8], b: &[u8]) -> bool {
+            a < b
+        }
+        fn binary_max(a: &[u8], b: &[u8]) -> bool {
+            a > b
+        }
+
+        // Create indexed iterator that yields Option<&[u8]> for each
+        // (group_index, index) pair
+        macro_rules! indexed_str_update {
+            ($array_accessor:expr, $cmp:expr) => {{
+                let typed_array = $array_accessor;
+                let iter = indices.iter().map(|&idx| {
+                    let idx = idx as usize;
+                    if is_valid_row(idx) {
+                        Some(typed_array.value(idx).as_bytes())
+                    } else {
+                        None
+                    }
+                });
+                self.inner
+                    .update_batch(iter, group_indices, total_num_groups, $cmp)
+            }};
+        }
+
+        macro_rules! indexed_bin_update {
+            ($array_accessor:expr, $cmp:expr) => {{
+                let typed_array = $array_accessor;
+                let iter = indices.iter().map(|&idx| {
+                    let idx = idx as usize;
+                    if is_valid_row(idx) {
+                        Some(typed_array.value(idx))
+                    } else {
+                        None
+                    }
+                });
+                self.inner
+                    .update_batch(iter, group_indices, total_num_groups, $cmp)
+            }};
+        }
+
+        match (self.is_min, &self.inner.data_type) {
+            (true, &DataType::Utf8) => {
+                indexed_str_update!(array.as_string::<i32>(), string_min)
+            }
+            (true, &DataType::LargeUtf8) => {
+                indexed_str_update!(array.as_string::<i64>(), string_min)
+            }
+            (true, &DataType::Utf8View) => {
+                indexed_str_update!(array.as_string_view(), string_min)
+            }
+            (false, &DataType::Utf8) => {
+                indexed_str_update!(array.as_string::<i32>(), string_max)
+            }
+            (false, &DataType::LargeUtf8) => {
+                indexed_str_update!(array.as_string::<i64>(), string_max)
+            }
+            (false, &DataType::Utf8View) => {
+                indexed_str_update!(array.as_string_view(), string_max)
+            }
+            (true, &DataType::Binary) => {
+                indexed_bin_update!(array.as_binary::<i32>(), binary_min)
+            }
+            (true, &DataType::LargeBinary) => {
+                indexed_bin_update!(array.as_binary::<i64>(), binary_min)
+            }
+            (true, &DataType::BinaryView) => {
+                indexed_bin_update!(array.as_binary_view(), binary_min)
+            }
+            (false, &DataType::Binary) => {
+                indexed_bin_update!(array.as_binary::<i32>(), binary_max)
+            }
+            (false, &DataType::LargeBinary) => {
+                indexed_bin_update!(array.as_binary::<i64>(), binary_max)
+            }
+            (false, &DataType::BinaryView) => {
+                indexed_bin_update!(array.as_binary_view(), binary_max)
+            }
+            _ => internal_err!(
+                "Unexpected combination for MinMaxBytesAccumulator: ({:?}, {:?})",
+                self.is_min,
+                self.inner.data_type
+            ),
+        }
+    }
+
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
         let (data_capacity, min_maxes) = self.inner.emit_to(emit_to);
 
@@ -312,6 +436,24 @@ impl GroupsAccumulator for MinMaxBytesAccumulator {
     ) -> Result<()> {
         // min/max are their own states (no transition needed)
         self.update_batch(values, group_indices, opt_filter, total_num_groups)
+    }
+
+    fn merge_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        // min/max are their own states (no transition needed)
+        self.update_batch_with_indices(
+            values,
+            indices,
+            group_indices,
+            opt_filter,
+            total_num_groups,
+        )
     }
 
     fn convert_to_state(

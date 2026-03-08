@@ -34,7 +34,8 @@ use datafusion_expr::{
 };
 use datafusion_functions_aggregate_common::utils::GenericDistinctBuffer;
 use datafusion_functions_aggregate_common::{
-    aggregate::groups_accumulator::accumulate::accumulate, stats::StatsType,
+    aggregate::groups_accumulator::accumulate::{accumulate, accumulate_with_indices},
+    stats::StatsType,
 };
 use datafusion_macros::user_doc;
 use std::mem::{size_of, size_of_val};
@@ -525,6 +526,38 @@ impl GroupsAccumulator for VarianceGroupsAccumulator {
         Ok(())
     }
 
+    fn update_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        assert_eq!(values.len(), 1, "single argument to update_batch");
+        let values = as_float64_array(&values[0])?;
+
+        self.resize(total_num_groups);
+        accumulate_with_indices(
+            group_indices,
+            values,
+            indices,
+            opt_filter,
+            |group_index, value| {
+                let (new_count, new_mean, new_m2) = update(
+                    self.counts[group_index],
+                    self.means[group_index],
+                    self.m2s[group_index],
+                    value,
+                );
+                self.counts[group_index] = new_count;
+                self.means[group_index] = new_mean;
+                self.m2s[group_index] = new_m2;
+            },
+        );
+        Ok(())
+    }
+
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
@@ -563,6 +596,45 @@ impl GroupsAccumulator for VarianceGroupsAccumulator {
                 self.m2s[group_index] = new_m2;
             },
         );
+        Ok(())
+    }
+
+    fn merge_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        _opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        assert_eq!(values.len(), 3, "three arguments to merge_batch");
+        let partial_counts = as_uint64_array(&values[0])?;
+        let partial_means = as_float64_array(&values[1])?;
+        let partial_m2s = as_float64_array(&values[2])?;
+
+        assert_eq!(partial_counts.null_count(), 0);
+        assert_eq!(partial_means.null_count(), 0);
+        assert_eq!(partial_m2s.null_count(), 0);
+
+        self.resize(total_num_groups);
+        for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+            let idx = idx as usize;
+            let partial_count = partial_counts.value(idx);
+            if partial_count == 0 {
+                continue;
+            }
+            let (new_count, new_mean, new_m2) = merge(
+                self.counts[group_index],
+                self.means[group_index],
+                self.m2s[group_index],
+                partial_count,
+                partial_means.value(idx),
+                partial_m2s.value(idx),
+            );
+            self.counts[group_index] = new_count;
+            self.means[group_index] = new_mean;
+            self.m2s[group_index] = new_m2;
+        }
         Ok(())
     }
 

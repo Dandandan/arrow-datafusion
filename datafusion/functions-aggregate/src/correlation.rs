@@ -33,7 +33,9 @@ use arrow::{
     datatypes::{DataType, Field},
 };
 use datafusion_expr::{EmitTo, GroupsAccumulator};
-use datafusion_functions_aggregate_common::aggregate::groups_accumulator::accumulate::accumulate_multiple;
+use datafusion_functions_aggregate_common::aggregate::groups_accumulator::accumulate::{
+    accumulate_multiple, accumulate_multiple_with_indices,
+};
 use log::debug;
 
 use crate::covariance::CovarianceAccumulator;
@@ -410,6 +412,44 @@ impl GroupsAccumulator for CorrelationGroupsAccumulator {
         Ok(())
     }
 
+    fn update_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        self.count.resize(total_num_groups, 0);
+        self.sum_x.resize(total_num_groups, 0.0);
+        self.sum_y.resize(total_num_groups, 0.0);
+        self.sum_xy.resize(total_num_groups, 0.0);
+        self.sum_xx.resize(total_num_groups, 0.0);
+        self.sum_yy.resize(total_num_groups, 0.0);
+
+        let array_x = downcast_array::<Float64Array>(&values[0]);
+        let array_y = downcast_array::<Float64Array>(&values[1]);
+
+        accumulate_multiple_with_indices(
+            group_indices,
+            &[&array_x, &array_y],
+            indices,
+            opt_filter,
+            |group_index, batch_index, columns| {
+                let x = columns[0].value(batch_index);
+                let y = columns[1].value(batch_index);
+                self.count[group_index] += 1;
+                self.sum_x[group_index] += x;
+                self.sum_y[group_index] += y;
+                self.sum_xy[group_index] += x * y;
+                self.sum_xx[group_index] += x * x;
+                self.sum_yy[group_index] += y * y;
+            },
+        );
+
+        Ok(())
+    }
+
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
         // Drain the state vectors for the groups being emitted
         let counts = emit_to.take_needed(&mut self.count);
@@ -538,6 +578,46 @@ impl GroupsAccumulator for CorrelationGroupsAccumulator {
                 self.sum_yy[group_index] += values[4];
             },
         );
+
+        Ok(())
+    }
+
+    fn merge_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        self.count.resize(total_num_groups, 0);
+        self.sum_x.resize(total_num_groups, 0.0);
+        self.sum_y.resize(total_num_groups, 0.0);
+        self.sum_xy.resize(total_num_groups, 0.0);
+        self.sum_xx.resize(total_num_groups, 0.0);
+        self.sum_yy.resize(total_num_groups, 0.0);
+
+        let partial_counts = values[0].as_primitive::<UInt64Type>();
+        let partial_sum_x = values[1].as_primitive::<Float64Type>();
+        let partial_sum_y = values[2].as_primitive::<Float64Type>();
+        let partial_sum_xy = values[3].as_primitive::<Float64Type>();
+        let partial_sum_xx = values[4].as_primitive::<Float64Type>();
+        let partial_sum_yy = values[5].as_primitive::<Float64Type>();
+
+        assert!(
+            opt_filter.is_none(),
+            "aggregate filter should be applied in partial stage, there should be no filter in final stage"
+        );
+
+        for (&group_index, &idx) in group_indices.iter().zip(indices.iter()) {
+            let idx = idx as usize;
+            self.count[group_index] += partial_counts.value(idx);
+            self.sum_x[group_index] += partial_sum_x.value(idx);
+            self.sum_y[group_index] += partial_sum_y.value(idx);
+            self.sum_xy[group_index] += partial_sum_xy.value(idx);
+            self.sum_xx[group_index] += partial_sum_xx.value(idx);
+            self.sum_yy[group_index] += partial_sum_yy.value(idx);
+        }
 
         Ok(())
     }

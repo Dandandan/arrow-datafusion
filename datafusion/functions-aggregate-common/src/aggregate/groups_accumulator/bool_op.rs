@@ -104,6 +104,38 @@ where
         Ok(())
     }
 
+    fn update_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        assert_eq!(values.len(), 1, "single argument to update_batch");
+        let values = values[0].as_boolean();
+
+        if self.values.len() < total_num_groups {
+            let new_groups = total_num_groups - self.values.len();
+            self.values.append_n(new_groups, self.identity);
+        }
+
+        self.null_state.accumulate_boolean_with_indices(
+            group_indices,
+            values,
+            indices,
+            opt_filter,
+            total_num_groups,
+            |group_index, new_value| {
+                let current_value = self.values.get_bit(group_index);
+                let value = (self.bool_fn)(current_value, new_value);
+                self.values.set_bit(group_index, value);
+            },
+        );
+
+        Ok(())
+    }
+
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
         let values = self.values.finish();
 
@@ -137,6 +169,24 @@ where
     ) -> Result<()> {
         // update / merge are the same
         self.update_batch(values, group_indices, opt_filter, total_num_groups)
+    }
+
+    fn merge_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        // update / merge are the same
+        self.update_batch_with_indices(
+            values,
+            indices,
+            group_indices,
+            opt_filter,
+            total_num_groups,
+        )
     }
 
     fn size(&self) -> usize {

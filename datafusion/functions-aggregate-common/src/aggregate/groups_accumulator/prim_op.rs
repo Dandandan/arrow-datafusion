@@ -115,6 +115,34 @@ where
         Ok(())
     }
 
+    fn update_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        assert_eq!(values.len(), 1, "single argument to update_batch");
+        let values = values[0].as_primitive::<T>();
+
+        self.values.resize(total_num_groups, self.starting_value);
+
+        self.null_state.accumulate_with_indices(
+            group_indices,
+            values,
+            indices,
+            opt_filter,
+            total_num_groups,
+            |group_index, new_value| {
+                let value = unsafe { self.values.get_unchecked_mut(group_index) };
+                (self.prim_fn)(value, new_value);
+            },
+        );
+
+        Ok(())
+    }
+
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
         let values = emit_to.take_needed(&mut self.values);
         let nulls = self.null_state.build(emit_to);
@@ -136,6 +164,24 @@ where
     ) -> Result<()> {
         // update / merge are the same
         self.update_batch(values, group_indices, opt_filter, total_num_groups)
+    }
+
+    fn merge_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        // update / merge are the same
+        self.update_batch_with_indices(
+            values,
+            indices,
+            group_indices,
+            opt_filter,
+            total_num_groups,
+        )
     }
 
     /// Converts an input batch directly to a state batch

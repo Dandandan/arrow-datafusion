@@ -592,6 +592,54 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
         Ok(())
     }
 
+    fn update_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        assert_eq!(values.len(), 1, "single argument to update_batch");
+        let input = &values[0];
+
+        self.num_groups = self.num_groups.max(total_num_groups);
+
+        let nulls = if self.ignore_nulls {
+            input.logical_nulls()
+        } else {
+            None
+        };
+
+        let mut entries = Vec::new();
+
+        for (&group_idx, &idx) in group_indices.iter().zip(indices.iter()) {
+            let idx = idx as usize;
+            // Skip filtered rows
+            if let Some(filter) = opt_filter
+                && (filter.is_null(idx) || !filter.value(idx))
+            {
+                continue;
+            }
+
+            // Skip null values when ignore_nulls is set
+            if let Some(ref nulls) = nulls
+                && nulls.is_null(idx)
+            {
+                continue;
+            }
+
+            entries.push((group_idx as u32, idx as u32));
+        }
+
+        if !entries.is_empty() {
+            self.batches.push(Arc::clone(input));
+            self.batch_entries.push(entries);
+        }
+
+        Ok(())
+    }
+
     /// Produce a `ListArray` ordered by group index: the list at
     /// position N contains the aggregated values for group N.
     ///
@@ -698,6 +746,44 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
             }
             let start = list_offsets[row_idx] as u32;
             let end = list_offsets[row_idx + 1] as u32;
+            for pos in start..end {
+                entries.push((group_idx as u32, pos));
+            }
+        }
+
+        if !entries.is_empty() {
+            self.batches.push(Arc::clone(list_values));
+            self.batch_entries.push(entries);
+        }
+
+        Ok(())
+    }
+
+    fn merge_batch_with_indices(
+        &mut self,
+        values: &[ArrayRef],
+        indices: &[u32],
+        group_indices: &[usize],
+        _opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        assert_eq!(values.len(), 1, "one argument to merge_batch");
+        let input_list = values[0].as_list::<i32>();
+
+        self.num_groups = self.num_groups.max(total_num_groups);
+
+        let list_values = input_list.values();
+        let list_offsets = input_list.offsets();
+
+        let mut entries = Vec::new();
+
+        for (&group_idx, &idx) in group_indices.iter().zip(indices.iter()) {
+            let idx = idx as usize;
+            if input_list.is_null(idx) {
+                continue;
+            }
+            let start = list_offsets[idx] as u32;
+            let end = list_offsets[idx + 1] as u32;
             for pos in start..end {
                 entries.push((group_idx as u32, pos));
             }
