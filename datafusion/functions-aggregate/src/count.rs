@@ -39,6 +39,7 @@ use datafusion_expr::{
     WindowFunctionDefinition,
     expr::WindowFunction,
     function::{AccumulatorArgs, StateFieldsArgs},
+    groups_accumulator::GroupIndex,
     utils::format_state_name,
 };
 use datafusion_functions_aggregate_common::aggregate::{
@@ -574,7 +575,7 @@ impl GroupsAccumulator for CountGroupsAccumulator {
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -590,7 +591,8 @@ impl GroupsAccumulator for CountGroupsAccumulator {
             opt_filter,
             |group_index| {
                 // SAFETY: group_index is guaranteed to be in bounds
-                let count = unsafe { self.counts.get_unchecked_mut(group_index) };
+                let count =
+                    unsafe { self.counts.get_unchecked_mut(group_index as usize) };
                 *count += 1;
             },
         );
@@ -601,7 +603,7 @@ impl GroupsAccumulator for CountGroupsAccumulator {
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         // Since aggregate filter should be applied in partial stage, in final stage there should be no filter
         _opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
@@ -618,7 +620,7 @@ impl GroupsAccumulator for CountGroupsAccumulator {
         self.counts.resize(total_num_groups, 0);
         group_indices.iter().zip(partial_counts.iter()).for_each(
             |(&group_index, partial_count)| {
-                self.counts[group_index] += partial_count;
+                self.counts[group_index as usize] += partial_count;
             },
         );
 

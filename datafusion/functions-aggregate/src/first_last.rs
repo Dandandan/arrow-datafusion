@@ -48,6 +48,7 @@ use datafusion_expr::utils::{AggregateOrderSensitivity, format_state_name};
 use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Documentation, EmitTo, Expr, ExprFunctionExt,
     GroupsAccumulator, ReversedUDAF, Signature, SortExpr, Volatility,
+    groups_accumulator::GroupIndex,
 };
 use datafusion_functions_aggregate_common::utils::get_sort_options;
 use datafusion_macros::user_doc;
@@ -528,7 +529,7 @@ where
     fn get_filtered_min_of_each_group(
         &mut self,
         orderings: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         vals: &PrimitiveArray<T>,
         is_set_arr: Option<&BooleanArray>,
@@ -557,7 +558,7 @@ where
         };
 
         for (idx_in_val, group_idx) in group_indices.iter().enumerate() {
-            let group_idx = *group_idx;
+            let group_idx = *group_idx as usize;
 
             let passed_filter = opt_filter.is_none_or(|x| x.value(idx_in_val));
             let is_set = is_set_arr.is_none_or(|x| x.value(idx_in_val));
@@ -616,7 +617,7 @@ where
         &mut self,
         // e.g. first_value(a order by b): values_and_order_cols will be [a, b]
         values_and_order_cols: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -692,7 +693,7 @@ where
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -1699,7 +1700,7 @@ mod tests {
 
         group_acc.update_batch(
             &val_with_orderings,
-            &[0, 1, 2, 1],
+            &[0u32, 1, 2, 1],
             Some(&BooleanArray::from(vec![true, true, false, true])),
             3,
         )?;
@@ -1724,7 +1725,7 @@ mod tests {
 
         group_acc.merge_batch(
             &state,
-            &[0, 1, 2],
+            &[0u32, 1, 2],
             Some(&BooleanArray::from(vec![true, false, false])),
             3,
         )?;
@@ -1738,7 +1739,7 @@ mod tests {
         val_with_orderings.push(Arc::new(Int64Array::from(vec![6, 6])));
         val_with_orderings.push(Arc::new(Int64Array::from(vec![6, 6])));
 
-        group_acc.update_batch(&val_with_orderings, &[1, 2], None, 4)?;
+        group_acc.update_batch(&val_with_orderings, &[1u32, 2], None, 4)?;
 
         let binding = group_acc.evaluate(EmitTo::All)?;
         let eval_result = binding.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1815,7 +1816,7 @@ mod tests {
                 group_acc.compute_size_of_orderings()
             );
 
-            group_acc.merge_batch(&s, &Vec::from_iter(0..s[0].len()), None, 100)?;
+            group_acc.merge_batch(&s, &Vec::from_iter(0..s[0].len() as u32), None, 100)?;
             assert_eq!(
                 group_acc.size_of_orderings,
                 group_acc.compute_size_of_orderings()
@@ -1874,7 +1875,7 @@ mod tests {
 
         group_acc.update_batch(
             &val_with_orderings,
-            &[0, 1, 2, 1],
+            &[0u32, 1, 2, 1],
             Some(&BooleanArray::from(vec![true, true, false, true])),
             3,
         )?;
@@ -1890,7 +1891,7 @@ mod tests {
 
         group_acc.merge_batch(
             &state,
-            &[0, 1, 2],
+            &[0u32, 1, 2],
             Some(&BooleanArray::from(vec![true, false, false])),
             3,
         )?;
@@ -1899,7 +1900,7 @@ mod tests {
         val_with_orderings.push(Arc::new(Int64Array::from(vec![66, 6])));
         val_with_orderings.push(Arc::new(Int64Array::from(vec![66, 6])));
 
-        group_acc.update_batch(&val_with_orderings, &[1, 2], None, 4)?;
+        group_acc.update_batch(&val_with_orderings, &[1u32, 2], None, 4)?;
 
         let binding = group_acc.evaluate(EmitTo::All)?;
         let eval_result = binding.as_any().downcast_ref::<Int64Array>().unwrap();

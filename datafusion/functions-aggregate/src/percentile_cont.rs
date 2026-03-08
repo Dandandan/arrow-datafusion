@@ -45,7 +45,7 @@ use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Coercion, Documentation, Expr, Signature,
     TypeSignatureClass, Volatility,
 };
-use datafusion_expr::{EmitTo, GroupsAccumulator};
+use datafusion_expr::{EmitTo, GroupsAccumulator, groups_accumulator::GroupIndex};
 use datafusion_expr::{
     expr::{AggregateFunction, Sort},
     function::{AccumulatorArgs, AggregateFunctionSimplification, StateFieldsArgs},
@@ -510,7 +510,7 @@ where
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -526,7 +526,7 @@ where
             values,
             opt_filter,
             |group_index, new_value| {
-                self.group_values[group_index].push(new_value);
+                self.group_values[group_index as usize].push(new_value);
             },
         );
 
@@ -536,7 +536,7 @@ where
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         // Since aggregate filter should be applied in partial stage, in final stage there should be no filter
         _opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
@@ -555,7 +555,7 @@ where
             .for_each(|(&group_index, values_opt)| {
                 if let Some(values) = values_opt {
                     let values = values.as_primitive::<T>();
-                    self.group_values[group_index].extend(values.values().iter());
+                    self.group_values[group_index as usize].extend(values.values().iter());
                 }
             });
 

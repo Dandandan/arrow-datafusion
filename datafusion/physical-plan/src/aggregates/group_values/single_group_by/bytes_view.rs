@@ -17,7 +17,7 @@
 
 use crate::aggregates::group_values::GroupValues;
 use arrow::array::{Array, ArrayRef};
-use datafusion_expr::EmitTo;
+use datafusion_expr::{EmitTo, GroupIndex};
 use datafusion_physical_expr::binary_map::OutputType;
 use datafusion_physical_expr_common::binary_view_map::ArrowBytesViewMap;
 use std::mem::size_of;
@@ -46,7 +46,7 @@ impl GroupValues for GroupValuesBytesView {
     fn intern(
         &mut self,
         cols: &[ArrayRef],
-        groups: &mut Vec<usize>,
+        groups: &mut Vec<GroupIndex>,
     ) -> datafusion_common::Result<()> {
         assert_eq!(cols.len(), 1);
 
@@ -65,7 +65,7 @@ impl GroupValues for GroupValuesBytesView {
             },
             // called for each group
             |group_idx| {
-                groups.push(group_idx);
+                groups.push(group_idx as GroupIndex);
             },
         );
 

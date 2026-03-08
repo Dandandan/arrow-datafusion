@@ -21,7 +21,7 @@ use arrow::array::{
     ArrayRef, AsArray as _, BooleanArray, BooleanBufferBuilder, NullBufferBuilder,
 };
 use datafusion_common::Result;
-use datafusion_expr::EmitTo;
+use datafusion_expr::{EmitTo, GroupIndex};
 use std::{mem::size_of, sync::Arc};
 
 #[derive(Debug)]
@@ -42,7 +42,7 @@ impl GroupValuesBoolean {
 }
 
 impl GroupValues for GroupValuesBoolean {
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<GroupIndex>) -> Result<()> {
         let array = cols[0].as_boolean();
         groups.clear();
 
@@ -77,7 +77,7 @@ impl GroupValues for GroupValuesBoolean {
                 }
             };
 
-            groups.push(index);
+            groups.push(index as GroupIndex);
         }
 
         Ok(())

@@ -25,7 +25,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, i256};
 use datafusion_common::Result;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
-use datafusion_expr::EmitTo;
+use datafusion_expr::{EmitTo, GroupIndex};
 use half::f16;
 use hashbrown::hash_table::HashTable;
 use std::mem::size_of;
@@ -112,7 +112,7 @@ impl<T: ArrowPrimitiveType> GroupValues for GroupValuesPrimitive<T>
 where
     T::Native: HashValue,
 {
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<GroupIndex>) -> Result<()> {
         assert_eq!(cols.len(), 1);
         groups.clear();
 
@@ -145,7 +145,7 @@ where
                     }
                 }
             };
-            groups.push(group_id)
+            groups.push(group_id as GroupIndex)
         }
         Ok(())
     }

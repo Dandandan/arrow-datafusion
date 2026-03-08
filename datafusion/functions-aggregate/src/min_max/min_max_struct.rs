@@ -27,7 +27,7 @@ use datafusion_common::{
     Result, internal_err,
     scalar::{copy_array_data, partial_cmp_struct},
 };
-use datafusion_expr::{EmitTo, GroupsAccumulator};
+use datafusion_expr::{EmitTo, GroupsAccumulator, groups_accumulator::GroupIndex};
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::nulls::apply_filter_as_nulls;
 
 /// Accumulator for MIN/MAX operations on Struct data types.
@@ -63,7 +63,7 @@ impl GroupsAccumulator for MinMaxStructAccumulator {
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -131,7 +131,7 @@ impl GroupsAccumulator for MinMaxStructAccumulator {
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -217,7 +217,7 @@ impl MinMaxStructState {
     fn update_batch<F>(
         &mut self,
         array: &StructArray,
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         total_num_groups: usize,
         mut cmp: F,
     ) -> Result<()>
@@ -232,7 +232,7 @@ impl MinMaxStructState {
 
         // Figure out the new min value for each group
         for (index, group_index) in (0..array.len()).zip(group_indices.iter()) {
-            let group_index = *group_index;
+            let group_index = *group_index as usize;
             if array.is_null(index) {
                 continue;
             }
@@ -354,7 +354,7 @@ mod tests {
         let mut max_accumulator =
             MinMaxStructAccumulator::new_max(array.data_type().clone());
         let values = vec![Arc::new(array) as ArrayRef];
-        let group_indices = vec![0, 0, 0];
+        let group_indices: Vec<GroupIndex> = vec![0, 0, 0];
 
         min_accumulator
             .update_batch(&values, &group_indices, None, 1)
@@ -392,7 +392,7 @@ mod tests {
         let mut max_accumulator =
             MinMaxStructAccumulator::new_max(array.data_type().clone());
         let values = vec![Arc::new(array) as ArrayRef];
-        let group_indices = vec![0, 0, 0];
+        let group_indices: Vec<GroupIndex> = vec![0, 0, 0];
 
         min_accumulator
             .update_batch(&values, &group_indices, None, 1)
@@ -432,7 +432,7 @@ mod tests {
         let mut max_accumulator =
             MinMaxStructAccumulator::new_max(array.data_type().clone());
         let values = vec![Arc::new(array) as ArrayRef];
-        let group_indices = vec![0, 0, 0];
+        let group_indices: Vec<GroupIndex> = vec![0, 0, 0];
 
         min_accumulator
             .update_batch(&values, &group_indices, None, 1)
@@ -470,7 +470,7 @@ mod tests {
         let mut max_accumulator =
             MinMaxStructAccumulator::new_max(array.data_type().clone());
         let values = vec![Arc::new(array) as ArrayRef];
-        let group_indices = vec![0, 1, 0, 1];
+        let group_indices: Vec<GroupIndex> = vec![0, 1, 0, 1];
 
         min_accumulator
             .update_batch(&values, &group_indices, None, 2)
@@ -515,7 +515,7 @@ mod tests {
         let mut max_accumulator =
             MinMaxStructAccumulator::new_max(array.data_type().clone());
         let values = vec![Arc::new(array) as ArrayRef];
-        let group_indices = vec![0, 0, 0, 0];
+        let group_indices: Vec<GroupIndex> = vec![0, 0, 0, 0];
 
         min_accumulator
             .update_batch(&values, &group_indices, Some(&filter), 1)

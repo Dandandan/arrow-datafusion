@@ -20,6 +20,15 @@
 use arrow::array::{ArrayRef, BooleanArray};
 use datafusion_common::{Result, not_impl_err};
 
+/// Type alias for group indices used in aggregation.
+///
+/// Using `u32` instead of `usize` halves the memory needed to store group
+/// indices on 64-bit platforms, improving cache utilization during aggregation.
+/// A `u32` supports up to ~4 billion groups which is more than sufficient in
+/// practice — 4 billion groups times even a single byte of accumulator state
+/// would exceed available memory long before this limit is reached.
+pub type GroupIndex = u32;
+
 /// Describes how many rows should be emitted during grouping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmitTo {
@@ -132,7 +141,7 @@ pub trait GroupsAccumulator: Send {
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()>;
@@ -193,7 +202,7 @@ pub trait GroupsAccumulator: Send {
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()>;

@@ -31,8 +31,8 @@ use arrow_schema::FieldRef;
 use datafusion::common::{ScalarValue, cast::as_float64_array};
 use datafusion::error::Result;
 use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupsAccumulator, Signature,
-    expr::AggregateFunction,
+    Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupIndex, GroupsAccumulator,
+    Signature, expr::AggregateFunction,
     function::{AccumulatorArgs, AggregateFunctionSimplification, StateFieldsArgs},
     simplify::SimplifyContext,
 };
@@ -241,7 +241,7 @@ impl GroupsAccumulator for GeometricMeanGroupsAccumulator {
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&arrow::array::BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -258,10 +258,10 @@ impl GroupsAccumulator for GeometricMeanGroupsAccumulator {
             opt_filter,
             total_num_groups,
             |group_index, new_value| {
-                let prod = &mut self.prods[group_index];
+                let prod = &mut self.prods[group_index as usize];
                 *prod = prod.mul_wrapping(new_value);
 
-                self.counts[group_index] += 1;
+                self.counts[group_index as usize] += 1;
             },
         );
 
@@ -272,7 +272,7 @@ impl GroupsAccumulator for GeometricMeanGroupsAccumulator {
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&arrow::array::BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -288,7 +288,7 @@ impl GroupsAccumulator for GeometricMeanGroupsAccumulator {
             opt_filter,
             total_num_groups,
             |group_index, partial_count| {
-                self.counts[group_index] += partial_count;
+                self.counts[group_index as usize] += partial_count;
             },
         );
 
@@ -300,7 +300,7 @@ impl GroupsAccumulator for GeometricMeanGroupsAccumulator {
             opt_filter,
             total_num_groups,
             |group_index, new_value: <Float64Type as ArrowPrimitiveType>::Native| {
-                let prod = &mut self.prods[group_index];
+                let prod = &mut self.prods[group_index as usize];
                 *prod = prod.mul_wrapping(new_value);
             },
         );

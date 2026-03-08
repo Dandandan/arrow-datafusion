@@ -19,7 +19,7 @@ use std::mem::size_of;
 
 use arrow::array::ArrayRef;
 use datafusion_common::Result;
-use datafusion_expr::EmitTo;
+use datafusion_expr::{EmitTo, GroupIndex};
 
 mod full;
 mod partial;
@@ -93,7 +93,7 @@ impl GroupOrdering {
     pub fn new_groups(
         &mut self,
         batch_group_values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         total_num_groups: usize,
     ) -> Result<()> {
         match self {

@@ -33,6 +33,7 @@ use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Documentation, GroupsAccumulator, Signature,
     Volatility,
+    groups_accumulator::GroupIndex,
 };
 use datafusion_functions_aggregate_common::stats::StatsType;
 use datafusion_macros::user_doc;
@@ -328,7 +329,7 @@ impl GroupsAccumulator for StddevGroupsAccumulator {
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&arrow::array::BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -339,7 +340,7 @@ impl GroupsAccumulator for StddevGroupsAccumulator {
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&arrow::array::BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {

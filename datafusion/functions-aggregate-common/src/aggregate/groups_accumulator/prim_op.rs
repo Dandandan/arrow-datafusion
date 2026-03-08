@@ -24,7 +24,7 @@ use arrow::compute;
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::datatypes::DataType;
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
-use datafusion_expr_common::groups_accumulator::{EmitTo, GroupsAccumulator};
+use datafusion_expr_common::groups_accumulator::{EmitTo, GroupIndex, GroupsAccumulator};
 
 use super::accumulate::NullState;
 
@@ -89,7 +89,7 @@ where
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -107,7 +107,7 @@ where
             total_num_groups,
             |group_index, new_value| {
                 // SAFETY: group_index is guaranteed to be in bounds
-                let value = unsafe { self.values.get_unchecked_mut(group_index) };
+                let value = unsafe { self.values.get_unchecked_mut(group_index as usize) };
                 (self.prim_fn)(value, new_value);
             },
         );
@@ -130,7 +130,7 @@ where
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {

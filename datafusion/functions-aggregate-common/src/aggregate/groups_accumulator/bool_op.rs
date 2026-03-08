@@ -21,7 +21,7 @@ use crate::aggregate::groups_accumulator::nulls::filtered_null_mask;
 use arrow::array::{ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder};
 use arrow::buffer::BooleanBuffer;
 use datafusion_common::Result;
-use datafusion_expr_common::groups_accumulator::{EmitTo, GroupsAccumulator};
+use datafusion_expr_common::groups_accumulator::{EmitTo, GroupIndex, GroupsAccumulator};
 
 use super::accumulate::NullState;
 
@@ -74,7 +74,7 @@ where
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -95,9 +95,9 @@ where
             opt_filter,
             total_num_groups,
             |group_index, new_value| {
-                let current_value = self.values.get_bit(group_index);
+                let current_value = self.values.get_bit(group_index as usize);
                 let value = (self.bool_fn)(current_value, new_value);
-                self.values.set_bit(group_index, value);
+                self.values.set_bit(group_index as usize, value);
             },
         );
 
@@ -131,7 +131,7 @@ where
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {

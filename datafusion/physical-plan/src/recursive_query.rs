@@ -41,6 +41,7 @@ use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Result, internal_datafusion_err, not_impl_err};
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_expr::GroupIndex;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
@@ -440,7 +441,7 @@ struct DistinctDeduplicator {
     /// Grouped rows used for distinct
     group_values: Box<dyn GroupValues>,
     reservation: MemoryReservation,
-    intern_output_buffer: Vec<usize>,
+    intern_output_buffer: Vec<GroupIndex>,
 }
 
 impl DistinctDeduplicator {
@@ -476,14 +477,14 @@ impl DistinctDeduplicator {
 
 /// Return a mask, each element being true if, and only if, the element is greater than all previous elements and greater or equal than the provided max_already_seen_group_id
 fn new_groups_mask(
-    values: &[usize],
+    values: &[GroupIndex],
     mut max_already_seen_group_id: usize,
 ) -> BooleanArray {
     let mut output = BooleanBuilder::with_capacity(values.len());
     for value in values {
-        if *value >= max_already_seen_group_id {
+        if *value as usize >= max_already_seen_group_id {
             output.append_value(true);
-            max_already_seen_group_id = *value + 1; // We want to be increasing
+            max_already_seen_group_id = *value as usize + 1; // We want to be increasing
         } else {
             output.append_value(false);
         }

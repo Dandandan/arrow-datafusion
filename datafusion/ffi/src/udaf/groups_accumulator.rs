@@ -26,7 +26,7 @@ use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::error::ArrowError;
 use arrow::ffi::to_ffi;
 use datafusion_common::error::{DataFusionError, Result};
-use datafusion_expr::{EmitTo, GroupsAccumulator};
+use datafusion_expr::{EmitTo, GroupIndex, GroupsAccumulator};
 
 use crate::arrow_wrappers::{WrappedArray, WrappedSchema};
 use crate::util::FFIResult;
@@ -41,7 +41,7 @@ pub struct FFI_GroupsAccumulator {
     pub update_batch: unsafe extern "C" fn(
         accumulator: &mut Self,
         values: RVec<WrappedArray>,
-        group_indices: RVec<usize>,
+        group_indices: RVec<u32>,
         opt_filter: ROption<WrappedArray>,
         total_num_groups: usize,
     ) -> FFIResult<()>,
@@ -62,7 +62,7 @@ pub struct FFI_GroupsAccumulator {
     pub merge_batch: unsafe extern "C" fn(
         accumulator: &mut Self,
         values: RVec<WrappedArray>,
-        group_indices: RVec<usize>,
+        group_indices: RVec<u32>,
         opt_filter: ROption<WrappedArray>,
         total_num_groups: usize,
     ) -> FFIResult<()>,
@@ -132,14 +132,14 @@ fn process_opt_filter(opt_filter: ROption<WrappedArray>) -> Result<Option<Boolea
 unsafe extern "C" fn update_batch_fn_wrapper(
     accumulator: &mut FFI_GroupsAccumulator,
     values: RVec<WrappedArray>,
-    group_indices: RVec<usize>,
+    group_indices: RVec<u32>,
     opt_filter: ROption<WrappedArray>,
     total_num_groups: usize,
 ) -> FFIResult<()> {
     unsafe {
         let accumulator = accumulator.inner_mut();
         let values = rresult_return!(process_values(values));
-        let group_indices: Vec<usize> = group_indices.into_iter().collect();
+        let group_indices: Vec<GroupIndex> = group_indices.into_iter().collect();
         let opt_filter = rresult_return!(process_opt_filter(opt_filter));
 
         rresult!(accumulator.update_batch(
@@ -191,14 +191,14 @@ unsafe extern "C" fn state_fn_wrapper(
 unsafe extern "C" fn merge_batch_fn_wrapper(
     accumulator: &mut FFI_GroupsAccumulator,
     values: RVec<WrappedArray>,
-    group_indices: RVec<usize>,
+    group_indices: RVec<u32>,
     opt_filter: ROption<WrappedArray>,
     total_num_groups: usize,
 ) -> FFIResult<()> {
     unsafe {
         let accumulator = accumulator.inner_mut();
         let values = rresult_return!(process_values(values));
-        let group_indices: Vec<usize> = group_indices.into_iter().collect();
+        let group_indices: Vec<GroupIndex> = group_indices.into_iter().collect();
         let opt_filter = rresult_return!(process_opt_filter(opt_filter));
 
         rresult!(accumulator.merge_batch(
@@ -305,7 +305,7 @@ impl GroupsAccumulator for ForeignGroupsAccumulator {
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -314,7 +314,7 @@ impl GroupsAccumulator for ForeignGroupsAccumulator {
                 .iter()
                 .map(WrappedArray::try_from)
                 .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
-            let group_indices = group_indices.iter().cloned().collect();
+            let group_indices: RVec<u32> = group_indices.iter().cloned().collect();
             let opt_filter = opt_filter
                 .map(|bool_array| to_ffi(&bool_array.to_data()))
                 .transpose()?
@@ -368,7 +368,7 @@ impl GroupsAccumulator for ForeignGroupsAccumulator {
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -377,7 +377,7 @@ impl GroupsAccumulator for ForeignGroupsAccumulator {
                 .iter()
                 .map(WrappedArray::try_from)
                 .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
-            let group_indices = group_indices.iter().cloned().collect();
+            let group_indices: RVec<u32> = group_indices.iter().cloned().collect();
             let opt_filter = opt_filter
                 .map(|bool_array| to_ffi(&bool_array.to_data()))
                 .transpose()?
@@ -486,7 +486,7 @@ mod tests {
             create_array!(Boolean, vec![true, true, true, true, false, false]);
         foreign_accum.update_batch(
             &[values],
-            &[0, 0, 1, 1, 2, 2],
+            &[0u32, 0, 1, 1, 2, 2],
             Some(opt_filter.as_ref()),
             3,
         )?;
@@ -508,7 +508,7 @@ mod tests {
             vec![make_array(create_array!(Boolean, vec![false]).to_data())];
 
         let opt_filter = create_array!(Boolean, vec![true]);
-        foreign_accum.merge_batch(&second_states, &[0], Some(opt_filter.as_ref()), 1)?;
+        foreign_accum.merge_batch(&second_states, &[0u32], Some(opt_filter.as_ref()), 1)?;
         let groups_bool = foreign_accum.evaluate(EmitTo::All)?;
         assert_eq!(groups_bool.len(), 1);
         assert_eq!(

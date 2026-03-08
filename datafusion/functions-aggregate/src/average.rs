@@ -38,7 +38,7 @@ use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Coercion, Documentation, EmitTo, Expr,
     GroupsAccumulator, ReversedUDAF, Signature, TypeSignature, TypeSignatureClass,
-    Volatility,
+    Volatility, groups_accumulator::GroupIndex,
 };
 use datafusion_functions_aggregate_common::aggregate::avg_distinct::{
     DecimalDistinctAvgAccumulator, Float64DistinctAvgAccumulator,
@@ -805,7 +805,7 @@ where
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -821,6 +821,7 @@ where
             opt_filter,
             total_num_groups,
             |group_index, new_value| {
+                let group_index = group_index as usize;
                 // SAFETY: group_index is guaranteed to be in bounds
                 let sum = unsafe { self.sums.get_unchecked_mut(group_index) };
                 *sum = sum.add_wrapping(new_value);
@@ -892,7 +893,7 @@ where
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -908,6 +909,7 @@ where
             opt_filter,
             total_num_groups,
             |group_index, partial_count| {
+                let group_index = group_index as usize;
                 // SAFETY: group_index is guaranteed to be in bounds
                 let count = unsafe { self.counts.get_unchecked_mut(group_index) };
                 *count += partial_count;
@@ -922,6 +924,7 @@ where
             opt_filter,
             total_num_groups,
             |group_index, new_value: <T as ArrowPrimitiveType>::Native| {
+                let group_index = group_index as usize;
                 // SAFETY: group_index is guaranteed to be in bounds
                 let sum = unsafe { self.sums.get_unchecked_mut(group_index) };
                 *sum = sum.add_wrapping(new_value);

@@ -25,7 +25,7 @@ use arrow_ord::partition::partition;
 use datafusion_common::utils::{compare_rows, get_row_at_idx};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
-use datafusion_expr::EmitTo;
+use datafusion_expr::{EmitTo, GroupIndex};
 
 /// Tracks grouping state when the data is ordered by some subset of
 /// the group keys.
@@ -208,7 +208,7 @@ impl GroupOrderingPartial {
     pub fn new_groups(
         &mut self,
         batch_group_values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         total_num_groups: usize,
     ) -> Result<()> {
         assert!(total_num_groups > 0);
@@ -236,7 +236,7 @@ impl GroupOrderingPartial {
         let ranges = partition(&sort_keys)?.ranges();
         let last_range = ranges.last().unwrap();
 
-        let range_current_sort = group_indices[last_range.start];
+        let range_current_sort = group_indices[last_range.start] as usize;
         let range_sort_key = get_row_at_idx(&sort_keys, last_range.start)?;
 
         let (current_sort, sort_key) = if last_range.start == 0 {
@@ -284,7 +284,7 @@ mod tests {
             Arc::new(Int32Array::from(vec![2, 1, 3])),
         ];
 
-        let group_indices = vec![0, 1, 2];
+        let group_indices: Vec<GroupIndex> = vec![0, 1, 2];
         let total_num_groups = 3;
 
         group_ordering.new_groups(
@@ -307,7 +307,7 @@ mod tests {
             Arc::new(Int32Array::from(vec![3, 3, 3])),
             Arc::new(Int32Array::from(vec![2, 1, 7])),
         ];
-        let group_indices = vec![3, 4, 5];
+        let group_indices: Vec<GroupIndex> = vec![3, 4, 5];
         let total_num_groups = 6;
 
         group_ordering.new_groups(
@@ -330,7 +330,7 @@ mod tests {
             Arc::new(Int32Array::from(vec![4, 4, 4])),
             Arc::new(Int32Array::from(vec![1, 1, 1])),
         ];
-        let group_indices = vec![6, 7, 8];
+        let group_indices: Vec<GroupIndex> = vec![6, 7, 8];
         let total_num_groups = 9;
 
         group_ordering.new_groups(

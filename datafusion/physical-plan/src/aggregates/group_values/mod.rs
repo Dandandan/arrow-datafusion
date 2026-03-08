@@ -26,7 +26,7 @@ use arrow::array::{ArrayRef, downcast_primitive};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion_common::Result;
 
-use datafusion_expr::EmitTo;
+use datafusion_expr::{EmitTo, GroupIndex};
 
 pub mod multi_group_by;
 
@@ -85,7 +85,7 @@ pub(crate) use metrics::GroupByMetrics;
 /// # Group Ids
 ///
 /// Each distinct group in a hash aggregation is identified by a unique group id
-/// (usize) which is assigned by instances of this trait. Group ids are
+/// ([`GroupIndex`]) which is assigned by instances of this trait. Group ids are
 /// continuous without gaps, starting from 0.
 pub trait GroupValues: Send {
     /// Calculates the group id for each input row of `cols`, assigning new
@@ -97,7 +97,7 @@ pub trait GroupValues: Send {
     /// If a row has the same value as a previous row, the same group id is
     /// assigned. If a row has a new value, the next available group id is
     /// assigned.
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()>;
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<GroupIndex>) -> Result<()>;
 
     /// Returns the number of bytes of memory used by this [`GroupValues`]
     fn size(&self) -> usize;

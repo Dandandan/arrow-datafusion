@@ -23,7 +23,7 @@ use arrow::array::{Array, BooleanArray, BooleanBufferBuilder, PrimitiveArray};
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::ArrowPrimitiveType;
 
-use datafusion_expr_common::groups_accumulator::EmitTo;
+use datafusion_expr_common::groups_accumulator::{EmitTo, GroupIndex};
 
 /// If the input has nulls, then the accumulator must potentially
 /// handle each input null value specially (e.g. for `SUM` to mark the
@@ -162,14 +162,14 @@ impl NullState {
     /// 1. `self.seen_values[group_index]` to true for all rows that had a non null value
     pub fn accumulate<T, F>(
         &mut self,
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         values: &PrimitiveArray<T>,
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
         mut value_fn: F,
     ) where
         T: ArrowPrimitiveType + Send,
-        F: FnMut(usize, T::Native) + Send,
+        F: FnMut(GroupIndex, T::Native) + Send,
     {
         // skip null handling if no nulls in input or accumulator
         if let SeenValues::All { num_values } = &mut self.seen_values
@@ -183,7 +183,7 @@ impl NullState {
 
         let seen_values = self.seen_values.get_builder(total_num_groups);
         accumulate(group_indices, values, opt_filter, |group_index, value| {
-            seen_values.set_bit(group_index, true);
+            seen_values.set_bit(group_index as usize, true);
             value_fn(group_index, value);
         });
     }
@@ -200,13 +200,13 @@ impl NullState {
     /// more details on other arguments.
     pub fn accumulate_boolean<F>(
         &mut self,
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         values: &BooleanArray,
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
         mut value_fn: F,
     ) where
-        F: FnMut(usize, bool) + Send,
+        F: FnMut(GroupIndex, bool) + Send,
     {
         let data = values.values();
         assert_eq!(data.len(), group_indices.len());
@@ -235,7 +235,7 @@ impl NullState {
                 // buffer is big enough (start everything at valid)
                 group_indices.iter().zip(data.iter()).for_each(
                     |(&group_index, new_value)| {
-                        seen_values.set_bit(group_index, true);
+                        seen_values.set_bit(group_index as usize, true);
                         value_fn(group_index, new_value)
                     },
                 )
@@ -249,7 +249,7 @@ impl NullState {
                     .zip(nulls.iter())
                     .for_each(|((&group_index, new_value), is_valid)| {
                         if is_valid {
-                            seen_values.set_bit(group_index, true);
+                            seen_values.set_bit(group_index as usize, true);
                             value_fn(group_index, new_value);
                         }
                     })
@@ -264,7 +264,7 @@ impl NullState {
                     .zip(filter.iter())
                     .for_each(|((&group_index, new_value), filter_value)| {
                         if let Some(true) = filter_value {
-                            seen_values.set_bit(group_index, true);
+                            seen_values.set_bit(group_index as usize, true);
                             value_fn(group_index, new_value);
                         }
                     })
@@ -280,7 +280,7 @@ impl NullState {
                         if let Some(true) = filter_value
                             && let Some(new_value) = new_value
                         {
-                            seen_values.set_bit(group_index, true);
+                            seen_values.set_bit(group_index as usize, true);
                             value_fn(group_index, new_value)
                         }
                     })
@@ -368,13 +368,13 @@ impl NullState {
 /// value_fn(0, 300)
 /// ```
 pub fn accumulate<T, F>(
-    group_indices: &[usize],
+    group_indices: &[GroupIndex],
     values: &PrimitiveArray<T>,
     opt_filter: Option<&BooleanArray>,
     mut value_fn: F,
 ) where
     T: ArrowPrimitiveType + Send,
-    F: FnMut(usize, T::Native) + Send,
+    F: FnMut(GroupIndex, T::Native) + Send,
 {
     let data: &[T::Native] = values.values();
     assert_eq!(data.len(), group_indices.len());
@@ -483,13 +483,13 @@ pub fn accumulate<T, F>(
 ///     * `batch_idx`: The index of the current row in the input arrays
 ///     * `columns`: Reference to all input arrays for accessing values
 pub fn accumulate_multiple<T, F>(
-    group_indices: &[usize],
+    group_indices: &[GroupIndex],
     value_columns: &[&PrimitiveArray<T>],
     opt_filter: Option<&BooleanArray>,
     mut value_fn: F,
 ) where
     T: ArrowPrimitiveType + Send,
-    F: FnMut(usize, usize, &[&PrimitiveArray<T>]) + Send,
+    F: FnMut(GroupIndex, usize, &[&PrimitiveArray<T>]) + Send,
 {
     // Calculate `valid_indices` to accumulate, non-valid indices are ignored.
     // `valid_indices` is a bit mask corresponding to the `group_indices`. An index
@@ -546,12 +546,12 @@ pub fn accumulate_multiple<T, F>(
 /// See [`NullState::accumulate`], for more details on other
 /// arguments.
 pub fn accumulate_indices<F>(
-    group_indices: &[usize],
+    group_indices: &[GroupIndex],
     nulls: Option<&NullBuffer>,
     opt_filter: Option<&BooleanArray>,
     mut index_fn: F,
 ) where
-    F: FnMut(usize) + Send,
+    F: FnMut(GroupIndex) + Send,
 {
     match (nulls, opt_filter) {
         (None, None) => {
@@ -840,7 +840,7 @@ mod test {
         /// Calls `NullState::accumulate` and `accumulate_indices` to
         /// ensure it generates the correct values.
         fn accumulate_test(
-            group_indices: &[usize],
+            group_indices: &[GroupIndex],
             values: &UInt32Array,
             opt_filter: Option<&BooleanArray>,
             total_num_groups: usize,
@@ -869,7 +869,7 @@ mod test {
         /// This is effectively a different implementation of
         /// accumulate that we compare with the above implementation
         fn accumulate_values_test(
-            group_indices: &[usize],
+            group_indices: &[GroupIndex],
             values: &UInt32Array,
             opt_filter: Option<&BooleanArray>,
             total_num_groups: usize,
@@ -944,7 +944,7 @@ mod test {
         // Calls `accumulate_indices`
         // and opt_filter and ensures it calls the right values
         fn accumulate_indices_test(
-            group_indices: &[usize],
+            group_indices: &[GroupIndex],
             nulls: Option<&NullBuffer>,
             opt_filter: Option<&BooleanArray>,
         ) {
@@ -998,7 +998,7 @@ mod test {
         /// This is effectively a different implementation of
         /// accumulate_boolean that we compare with the above implementation
         fn accumulate_boolean_test(
-            group_indices: &[usize],
+            group_indices: &[GroupIndex],
             values: &BooleanArray,
             opt_filter: Option<&BooleanArray>,
             total_num_groups: usize,

@@ -28,8 +28,8 @@ use datafusion_common::{Result, ScalarValue, not_impl_err};
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
-    Accumulator, AggregateUDFImpl, Coercion, EmitTo, GroupsAccumulator, ReversedUDAF,
-    Signature, TypeSignatureClass, Volatility,
+    Accumulator, AggregateUDFImpl, Coercion, EmitTo, GroupIndex, GroupsAccumulator,
+    ReversedUDAF, Signature, TypeSignatureClass, Volatility,
 };
 use std::{any::Any, sync::Arc};
 
@@ -251,7 +251,7 @@ where
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         _opt_filter: Option<&arrow::array::BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -266,6 +266,7 @@ where
         let iter = group_indices.iter().zip(data.iter());
         if values.null_count() == 0 {
             for (&group_index, &value) in iter {
+                let group_index = group_index as usize;
                 let sum = &mut self.sums[group_index];
                 *sum = (*sum).add_wrapping(value);
                 self.counts[group_index] += 1;
@@ -275,6 +276,7 @@ where
                 if values.is_null(idx) {
                     continue;
                 }
+                let group_index = group_index as usize;
                 let sum = &mut self.sums[group_index];
                 *sum = (*sum).add_wrapping(value);
 
@@ -288,7 +290,7 @@ where
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         _opt_filter: Option<&arrow::array::BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -300,14 +302,14 @@ where
         self.counts.resize(total_num_groups, 0);
         let iter1 = group_indices.iter().zip(partial_counts.values().iter());
         for (&group_index, &partial_count) in iter1 {
-            self.counts[group_index] += partial_count;
+            self.counts[group_index as usize] += partial_count;
         }
 
         // update sums
         self.sums.resize(total_num_groups, T::default_value());
         let iter2 = group_indices.iter().zip(partial_sums.values().iter());
         for (&group_index, &new_value) in iter2 {
-            let sum = &mut self.sums[group_index];
+            let sum = &mut self.sums[group_index as usize];
             *sum = sum.add_wrapping(new_value);
         }
 

@@ -56,8 +56,9 @@ use datafusion_common::{cast::as_primitive_array, exec_err};
 
 use datafusion_expr::expr::WindowFunction;
 use datafusion_expr::{
-    AggregateUDFImpl, Expr, GroupsAccumulator, LogicalPlanBuilder, SimpleAggregateUDF,
-    WindowFunctionDefinition, col, create_udaf, function::AccumulatorArgs,
+    AggregateUDFImpl, Expr, GroupIndex, GroupsAccumulator, LogicalPlanBuilder,
+    SimpleAggregateUDF, WindowFunctionDefinition, col, create_udaf,
+    function::AccumulatorArgs,
 };
 use datafusion_functions_aggregate::average::AvgAccumulator;
 
@@ -852,7 +853,7 @@ impl GroupsAccumulator for TestGroupsAccumulator {
     fn update_batch(
         &mut self,
         _values: &[ArrayRef],
-        _group_indices: &[usize],
+        _group_indices: &[GroupIndex],
         _opt_filter: Option<&arrow::array::BooleanArray>,
         _total_num_groups: usize,
     ) -> Result<()> {
@@ -876,7 +877,7 @@ impl GroupsAccumulator for TestGroupsAccumulator {
     fn merge_batch(
         &mut self,
         _values: &[ArrayRef],
-        _group_indices: &[usize],
+        _group_indices: &[GroupIndex],
         _opt_filter: Option<&arrow::array::BooleanArray>,
         _total_num_groups: usize,
     ) -> Result<()> {

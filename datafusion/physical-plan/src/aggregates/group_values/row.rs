@@ -24,7 +24,7 @@ use arrow::row::{RowConverter, Rows, SortField};
 use datafusion_common::Result;
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_execution::memory_pool::proxy::{HashTableAllocExt, VecAllocExt};
-use datafusion_expr::EmitTo;
+use datafusion_expr::{EmitTo, GroupIndex};
 use hashbrown::hash_table::HashTable;
 use log::debug;
 use std::mem::size_of;
@@ -112,7 +112,7 @@ impl GroupValuesRows {
 }
 
 impl GroupValues for GroupValuesRows {
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<GroupIndex>) -> Result<()> {
         // Convert the group keys into the row format
         let group_rows = &mut self.rows_buffer;
         group_rows.clear();
@@ -164,7 +164,7 @@ impl GroupValues for GroupValuesRows {
                     group_idx
                 }
             };
-            groups.push(group_idx);
+            groups.push(group_idx as GroupIndex);
         }
 
         self.group_values = Some(group_values);

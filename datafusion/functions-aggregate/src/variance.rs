@@ -30,6 +30,7 @@ use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Documentation, GroupsAccumulator, Signature,
     Volatility,
     function::{AccumulatorArgs, StateFieldsArgs},
+    groups_accumulator::GroupIndex,
     utils::format_state_name,
 };
 use datafusion_functions_aggregate_common::utils::GenericDistinctBuffer;
@@ -451,7 +452,7 @@ impl VarianceGroupsAccumulator {
     }
 
     fn merge<F>(
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         counts: &UInt64Array,
         means: &Float64Array,
         m2s: &Float64Array,
@@ -470,7 +471,7 @@ impl VarianceGroupsAccumulator {
             .zip(means.values().iter())
             .zip(m2s.values().iter())
             .for_each(|(((&group_index, &count), &mean), &m2)| {
-                value_fn(group_index, count, mean, m2);
+                value_fn(group_index as usize, count, mean, m2);
             });
     }
 
@@ -503,7 +504,7 @@ impl GroupsAccumulator for VarianceGroupsAccumulator {
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -512,6 +513,7 @@ impl GroupsAccumulator for VarianceGroupsAccumulator {
 
         self.resize(total_num_groups);
         accumulate(group_indices, values, opt_filter, |group_index, value| {
+            let group_index = group_index as usize;
             let (new_count, new_mean, new_m2) = update(
                 self.counts[group_index],
                 self.means[group_index],
@@ -528,7 +530,7 @@ impl GroupsAccumulator for VarianceGroupsAccumulator {
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         // Since aggregate filter should be applied in partial stage, in final stage there should be no filter
         _opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
@@ -551,16 +553,16 @@ impl GroupsAccumulator for VarianceGroupsAccumulator {
                     return;
                 }
                 let (new_count, new_mean, new_m2) = merge(
-                    self.counts[group_index],
-                    self.means[group_index],
-                    self.m2s[group_index],
+                    self.counts[group_index as usize],
+                    self.means[group_index as usize],
+                    self.m2s[group_index as usize],
                     partial_count,
                     partial_mean,
                     partial_m2,
                 );
-                self.counts[group_index] = new_count;
-                self.means[group_index] = new_mean;
-                self.m2s[group_index] = new_m2;
+                self.counts[group_index as usize] = new_count;
+                self.means[group_index as usize] = new_mean;
+                self.m2s[group_index as usize] = new_m2;
             },
         );
         Ok(())
@@ -674,8 +676,8 @@ mod tests {
             Arc::new(Float64Array::from(vec![1.0])),
         ];
         let mut acc = VarianceGroupsAccumulator::new(StatsType::Sample);
-        acc.merge_batch(&state_1, &[0], None, 1)?;
-        acc.merge_batch(&state_2, &[0], None, 1)?;
+        acc.merge_batch(&state_1, &[0u32], None, 1)?;
+        acc.merge_batch(&state_2, &[0u32], None, 1)?;
         let result = acc.evaluate(EmitTo::All)?;
         let result = result.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(result.len(), 1);

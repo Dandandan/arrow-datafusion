@@ -32,7 +32,7 @@ use arrow::{
     array::ArrayRef,
     datatypes::{DataType, Field},
 };
-use datafusion_expr::{EmitTo, GroupsAccumulator};
+use datafusion_expr::{EmitTo, GroupsAccumulator, groups_accumulator::GroupIndex};
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::accumulate::accumulate_multiple;
 use log::debug;
 
@@ -319,7 +319,7 @@ impl CorrelationGroupsAccumulator {
 /// intermediate states created within the accumulator, instead of inputs from
 /// outside.
 fn accumulate_correlation_states(
-    group_indices: &[usize],
+    group_indices: &[GroupIndex],
     state_arrays: (
         &UInt64Array,  // count
         &Float64Array, // sum_x
@@ -328,7 +328,7 @@ fn accumulate_correlation_states(
         &Float64Array, // sum_xx
         &Float64Array, // sum_yy
     ),
-    mut value_fn: impl FnMut(usize, u64, &[f64]),
+    mut value_fn: impl FnMut(GroupIndex, u64, &[f64]),
 ) {
     let (counts, sum_x, sum_y, sum_xy, sum_xx, sum_yy) = state_arrays;
 
@@ -377,7 +377,7 @@ impl GroupsAccumulator for CorrelationGroupsAccumulator {
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -396,6 +396,7 @@ impl GroupsAccumulator for CorrelationGroupsAccumulator {
             &[&array_x, &array_y],
             opt_filter,
             |group_index, batch_index, columns| {
+                let group_index = group_index as usize;
                 let x = columns[0].value(batch_index);
                 let y = columns[1].value(batch_index);
                 self.count[group_index] += 1;
@@ -494,7 +495,7 @@ impl GroupsAccumulator for CorrelationGroupsAccumulator {
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -530,6 +531,7 @@ impl GroupsAccumulator for CorrelationGroupsAccumulator {
                 partial_sum_yy,
             ),
             |group_index, count, values| {
+                let group_index = group_index as usize;
                 self.count[group_index] += count;
                 self.sum_x[group_index] += values[0];
                 self.sum_y[group_index] += values[1];
@@ -560,7 +562,7 @@ mod tests {
     #[test]
     fn test_accumulate_correlation_states() {
         // Test data
-        let group_indices = vec![0, 1, 0, 1];
+        let group_indices: Vec<GroupIndex> = vec![0, 1, 0, 1];
         let counts = UInt64Array::from(vec![1, 2, 3, 4]);
         let sum_x = Float64Array::from(vec![10.0, 20.0, 30.0, 40.0]);
         let sum_y = Float64Array::from(vec![1.0, 2.0, 3.0, 4.0]);
@@ -578,10 +580,10 @@ mod tests {
         );
 
         let expected = vec![
-            (0, 1, vec![10.0, 1.0, 10.0, 100.0, 1.0]),
-            (1, 2, vec![20.0, 2.0, 40.0, 400.0, 4.0]),
-            (0, 3, vec![30.0, 3.0, 90.0, 900.0, 9.0]),
-            (1, 4, vec![40.0, 4.0, 160.0, 1600.0, 16.0]),
+            (0u32, 1, vec![10.0, 1.0, 10.0, 100.0, 1.0]),
+            (1u32, 2, vec![20.0, 2.0, 40.0, 400.0, 4.0]),
+            (0u32, 3, vec![30.0, 3.0, 90.0, 900.0, 9.0]),
+            (1u32, 4, vec![40.0, 4.0, 160.0, 1600.0, 16.0]),
         ];
         assert_eq!(accumulated, expected);
 

@@ -43,7 +43,7 @@ use arrow::datatypes::{
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::{Result, internal_datafusion_err, not_impl_err};
 use datafusion_execution::memory_pool::proxy::{HashTableAllocExt, VecAllocExt};
-use datafusion_expr::EmitTo;
+use datafusion_expr::{EmitTo, GroupIndex};
 use datafusion_physical_expr::binary_map::OutputType;
 
 use hashbrown::hash_table::HashTable;
@@ -321,7 +321,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
     fn scalarized_intern(
         &mut self,
         cols: &[ArrayRef],
-        groups: &mut Vec<usize>,
+        groups: &mut Vec<GroupIndex>,
     ) -> Result<()> {
         let n_rows = cols[0].len();
 
@@ -402,7 +402,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                     group_idx
                 }
             };
-            groups.push(group_idx);
+            groups.push(group_idx as GroupIndex);
         }
 
         Ok(())
@@ -422,13 +422,13 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
     fn vectorized_intern(
         &mut self,
         cols: &[ArrayRef],
-        groups: &mut Vec<usize>,
+        groups: &mut Vec<GroupIndex>,
     ) -> Result<()> {
         let n_rows = cols[0].len();
 
         // tracks to which group each of the input rows belongs
         groups.clear();
-        groups.resize(n_rows, usize::MAX);
+        groups.resize(n_rows, GroupIndex::MAX);
 
         let mut batch_hashes = mem::take(&mut self.hashes_buffer);
         batch_hashes.clear();
@@ -489,7 +489,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
     fn collect_vectorized_process_context(
         &mut self,
         batch_hashes: &[u64],
-        groups: &mut [usize],
+        groups: &mut [GroupIndex],
     ) {
         self.vectorized_operation_buffers.append_row_indices.clear();
         self.vectorized_operation_buffers
@@ -526,7 +526,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                     .push(row);
 
                 // Set group index to row in `groups`
-                groups[row] = current_group_idx;
+                groups[row] = current_group_idx as GroupIndex;
 
                 group_values_len += 1;
                 continue;
@@ -593,7 +593,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
     ///    and perform `scalarized_intern` for them after.
     ///    Usually, such `rows` having same hash but different value with `exists rows`
     ///    are very few.
-    fn vectorized_equal_to(&mut self, cols: &[ArrayRef], groups: &mut [usize]) {
+    fn vectorized_equal_to(&mut self, cols: &[ArrayRef], groups: &mut [GroupIndex]) {
         assert_eq!(
             self.vectorized_operation_buffers
                 .equal_to_group_indices
@@ -648,7 +648,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             // Equal to case, set the `group_indices` to `rows` in `groups`
             if equal_to_result {
                 groups[row] =
-                    self.vectorized_operation_buffers.equal_to_group_indices[idx];
+                    self.vectorized_operation_buffers.equal_to_group_indices[idx] as GroupIndex;
             }
             current_row_equal_to_result |= equal_to_result;
 
@@ -716,7 +716,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
         &mut self,
         cols: &[ArrayRef],
         batch_hashes: &[u64],
-        groups: &mut [usize],
+        groups: &mut [GroupIndex],
     ) -> Result<()> {
         if self
             .vectorized_operation_buffers
@@ -789,7 +789,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                 *group_index_view = new_group_index_view;
             }
 
-            groups[row] = group_idx;
+            groups[row] = group_idx as GroupIndex;
         }
 
         self.map = map;
@@ -801,7 +801,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
         group_index_view: &GroupIndexView,
         cols: &[ArrayRef],
         row: usize,
-        groups: &mut [usize],
+        groups: &mut [GroupIndex],
     ) -> bool {
         // Check if this row exists in `group_values`
         fn check_row_equal(
@@ -827,7 +827,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                 }
 
                 if check_result {
-                    groups[row] = group_idx;
+                    groups[row] = group_idx as GroupIndex;
                     return true;
                 }
             }
@@ -842,7 +842,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                 }
             }
 
-            groups[row] = group_idx;
+            groups[row] = group_idx as GroupIndex;
             true
         }
     }
@@ -889,7 +889,7 @@ macro_rules! instantiate_primitive {
 }
 
 impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<GroupIndex>) -> Result<()> {
         if self.group_values.is_empty() {
             let mut v = Vec::with_capacity(cols.len());
 

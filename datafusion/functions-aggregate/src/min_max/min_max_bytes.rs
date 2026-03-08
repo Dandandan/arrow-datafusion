@@ -22,7 +22,7 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 use datafusion_common::hash_map::Entry;
 use datafusion_common::{HashMap, Result, internal_err};
-use datafusion_expr::{EmitTo, GroupsAccumulator};
+use datafusion_expr::{EmitTo, GroupsAccumulator, groups_accumulator::GroupIndex};
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::nulls::apply_filter_as_nulls;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -66,7 +66,7 @@ impl GroupsAccumulator for MinMaxBytesAccumulator {
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -306,7 +306,7 @@ impl GroupsAccumulator for MinMaxBytesAccumulator {
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -431,7 +431,7 @@ impl MinMaxBytesState {
     fn update_batch<'a, F, I>(
         &mut self,
         iter: I,
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         total_num_groups: usize,
         mut cmp: F,
     ) -> Result<()>
@@ -447,7 +447,7 @@ impl MinMaxBytesState {
 
         // Figure out the new min value for each group
         for (new_val, group_index) in iter.into_iter().zip(group_indices.iter()) {
-            let group_index = *group_index;
+            let group_index = *group_index as usize;
             let Some(new_val) = new_val else {
                 continue; // skip nulls
             };

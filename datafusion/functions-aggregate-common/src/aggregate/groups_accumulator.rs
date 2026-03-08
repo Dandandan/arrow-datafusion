@@ -34,7 +34,7 @@ use arrow::{
 };
 use datafusion_common::{Result, ScalarValue, arrow_datafusion_err};
 use datafusion_expr_common::accumulator::Accumulator;
-use datafusion_expr_common::groups_accumulator::{EmitTo, GroupsAccumulator};
+use datafusion_expr_common::groups_accumulator::{EmitTo, GroupIndex, GroupsAccumulator};
 
 /// An adapter that implements [`GroupsAccumulator`] for any [`Accumulator`]
 ///
@@ -186,7 +186,7 @@ impl GroupsAccumulatorAdapter {
     fn invoke_per_accumulator<F>(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
         f: F,
@@ -201,8 +201,8 @@ impl GroupsAccumulatorAdapter {
         // figure out which input rows correspond to which groups.
         // Note that self.state.indices starts empty for all groups
         // (it is cleared out below)
-        for (idx, group_index) in group_indices.iter().enumerate() {
-            self.states[*group_index].indices.push(idx as u32);
+        for (idx, &group_index) in group_indices.iter().enumerate() {
+            self.states[group_index as usize].indices.push(idx as u32);
         }
 
         // groups_with_rows holds a list of group indexes that have
@@ -299,7 +299,7 @@ impl GroupsAccumulator for GroupsAccumulatorAdapter {
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -374,7 +374,7 @@ impl GroupsAccumulator for GroupsAccumulatorAdapter {
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {

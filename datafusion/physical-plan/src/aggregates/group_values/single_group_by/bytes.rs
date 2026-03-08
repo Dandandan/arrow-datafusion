@@ -21,7 +21,7 @@ use crate::aggregates::group_values::GroupValues;
 
 use arrow::array::{Array, ArrayRef, OffsetSizeTrait};
 use datafusion_common::Result;
-use datafusion_expr::EmitTo;
+use datafusion_expr::{EmitTo, GroupIndex};
 use datafusion_physical_expr_common::binary_map::{ArrowBytesMap, OutputType};
 
 /// A [`GroupValues`] storing single column of Utf8/LargeUtf8/Binary/LargeBinary values
@@ -45,7 +45,7 @@ impl<O: OffsetSizeTrait> GroupValuesBytes<O> {
 }
 
 impl<O: OffsetSizeTrait> GroupValues for GroupValuesBytes<O> {
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<GroupIndex>) -> Result<()> {
         assert_eq!(cols.len(), 1);
 
         // look up / add entries in the table
@@ -63,7 +63,7 @@ impl<O: OffsetSizeTrait> GroupValues for GroupValuesBytes<O> {
             },
             // called for each group
             |group_idx| {
-                groups.push(group_idx);
+                groups.push(group_idx as GroupIndex);
             },
         );
 

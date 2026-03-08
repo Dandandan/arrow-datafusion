@@ -44,7 +44,7 @@ use datafusion_common::{
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion_expr::{EmitTo, GroupsAccumulator};
+use datafusion_expr::{EmitTo, GroupIndex, GroupsAccumulator};
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{GroupsAccumulatorAdapter, PhysicalSortExpr};
@@ -412,7 +412,7 @@ pub(crate) struct GroupedHashAggregateStream {
 
     /// scratch space for the current input [`RecordBatch`] being
     /// processed. Reused across batches here to avoid reallocations
-    current_group_indices: Vec<usize>,
+    current_group_indices: Vec<GroupIndex>,
 
     /// Accumulators, one for each `AggregateFunctionExpr` in the query
     ///

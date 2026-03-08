@@ -39,7 +39,7 @@ use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Documentation, EmitTo, GroupsAccumulator, Signature,
-    Volatility,
+    Volatility, groups_accumulator::GroupIndex,
 };
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::nulls::filter_to_nulls;
 use datafusion_functions_aggregate_common::merge_arrays::merge_ordered_arrays;
@@ -548,7 +548,7 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -580,7 +580,7 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
                 continue;
             }
 
-            entries.push((group_idx as u32, row_idx as u32));
+            entries.push((group_idx, row_idx as u32));
         }
 
         // We only need to record the batch if it was non-empty.
@@ -677,7 +677,7 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
-        group_indices: &[usize],
+        group_indices: &[GroupIndex],
         _opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
@@ -699,7 +699,7 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
             let start = list_offsets[row_idx] as u32;
             let end = list_offsets[row_idx + 1] as u32;
             for pos in start..end {
-                entries.push((group_idx as u32, pos));
+                entries.push((group_idx, pos));
             }
         }
 
