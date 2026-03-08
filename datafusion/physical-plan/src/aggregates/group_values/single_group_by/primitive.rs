@@ -93,16 +93,10 @@ pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
     values: Vec<T::Native>,
     /// The random state used to generate hashes
     random_state: RandomState,
-    /// Whether this is in streaming mode (must preserve input order for group indices)
-    streaming: bool,
-    /// Reused buffer for sorted indices during intern
-    sorted_indices: Vec<u32>,
-    /// Reused buffer for hashes during intern
-    hashes_buffer: Vec<u64>,
 }
 
 impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
-    pub fn new(data_type: DataType, streaming: bool) -> Self {
+    pub fn new(data_type: DataType) -> Self {
         assert!(PrimitiveArray::<T>::is_compatible(&data_type));
         Self {
             data_type,
@@ -110,24 +104,17 @@ impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
             values: Vec::with_capacity(128),
             null_group: None,
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
-            streaming,
-            sorted_indices: Vec::new(),
-            hashes_buffer: Vec::new(),
         }
     }
 }
 
-impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T>
+impl<T: ArrowPrimitiveType> GroupValues for GroupValuesPrimitive<T>
 where
     T::Native: HashValue,
 {
-    /// Sequential (non-sorting) intern for streaming mode.
-    /// Preserves input order for group index assignment.
-    fn intern_sequential(
-        &mut self,
-        cols: &[ArrayRef],
-        groups: &mut Vec<usize>,
-    ) -> Result<()> {
+    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+        assert_eq!(cols.len(), 1);
+
         groups.clear();
         for v in cols[0].as_primitive::<T>() {
             let group_id = match v {
@@ -160,114 +147,6 @@ where
             };
             groups.push(group_id)
         }
-        Ok(())
-    }
-}
-
-impl<T: ArrowPrimitiveType> GroupValues for GroupValuesPrimitive<T>
-where
-    T::Native: HashValue,
-{
-    fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
-        assert_eq!(cols.len(), 1);
-
-        // In streaming mode, must preserve input order for group index
-        // assignment (required by GroupOrdering).
-        if self.streaming {
-            return self.intern_sequential(cols, groups);
-        }
-
-        let n_rows = cols[0].len();
-        groups.clear();
-        groups.resize(n_rows, 0);
-
-        let array = cols[0].as_primitive::<T>();
-        let state = &self.random_state;
-
-        // Compute hashes for all rows and handle nulls
-        let hashes = &mut self.hashes_buffer;
-        hashes.clear();
-        hashes.resize(n_rows, 0);
-
-        let mut sorted_indices = std::mem::take(&mut self.sorted_indices);
-        sorted_indices.clear();
-        sorted_indices.reserve(n_rows);
-
-        for (i, v) in array.iter().enumerate() {
-            match v {
-                None => {
-                    let group_id = *self.null_group.get_or_insert_with(|| {
-                        let group_id = self.values.len();
-                        self.values.push(Default::default());
-                        group_id
-                    });
-                    groups[i] = group_id;
-                }
-                Some(key) => {
-                    hashes[i] = key.hash(state);
-                    sorted_indices.push(i as u32);
-                }
-            }
-        }
-
-        // Ensure capacity upfront so the table won't rehash during inserts,
-        // keeping the bucket layout stable for our sort order.
-        self.map.reserve(sorted_indices.len(), |&(_, h)| h);
-
-        // Sort by (bucket_index, hash) for optimal cache locality and
-        // duplicate detection. Rotating left by bucket_bits moves the
-        // bucket-determining low bits to the top of the u64, making them
-        // the primary sort key, while keeping same-hash entries adjacent.
-        //
-        // capacity() returns element capacity (buckets * 7/8), not bucket
-        // count. next_power_of_two() recovers the actual bucket count.
-        let bucket_bits =
-            self.map.capacity().next_power_of_two().trailing_zeros();
-        sorted_indices
-            .sort_unstable_by_key(|&i| hashes[i as usize].rotate_left(bucket_bits));
-
-        // Process in sorted bucket order
-        let mut prev_hash: u64 = 0;
-        let mut prev_group: usize = 0;
-        let mut has_prev = false;
-
-        for &idx in &sorted_indices {
-            let row = idx as usize;
-            let hash = hashes[row];
-            let key = array.value(row);
-
-            // Fast path: same hash as previous row, check value equality directly
-            if has_prev && hash == prev_hash {
-                if unsafe { self.values.get_unchecked(prev_group).is_eq(key) } {
-                    groups[row] = prev_group;
-                    continue;
-                }
-            }
-
-            // Normal path: probe hash table
-            let insert = self.map.entry(
-                hash,
-                |&(g, h)| unsafe { hash == h && self.values.get_unchecked(g).is_eq(key) },
-                |&(_, h)| h,
-            );
-
-            let group_id = match insert {
-                hashbrown::hash_table::Entry::Occupied(o) => o.get().0,
-                hashbrown::hash_table::Entry::Vacant(v) => {
-                    let g = self.values.len();
-                    v.insert((g, hash));
-                    self.values.push(key);
-                    g
-                }
-            };
-
-            groups[row] = group_id;
-            prev_hash = hash;
-            prev_group = group_id;
-            has_prev = true;
-        }
-
-        self.sorted_indices = sorted_indices;
         Ok(())
     }
 

@@ -142,10 +142,7 @@ pub fn new_group_values(
 
         macro_rules! downcast_helper {
             ($t:ty, $d:ident) => {
-                return Ok(Box::new(GroupValuesPrimitive::<$t>::new(
-                    $d.clone(),
-                    streaming,
-                )))
+                return Ok(Box::new(GroupValuesPrimitive::<$t>::new($d.clone())))
             };
         }
 

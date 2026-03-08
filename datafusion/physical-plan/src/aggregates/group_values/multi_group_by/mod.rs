@@ -221,6 +221,12 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     /// Reused buffer for sorted indices during intern
     sorted_indices: Vec<u32>,
 
+    /// Reused buffer for gathered hashes in sorted order
+    gathered_hashes: Vec<u64>,
+
+    /// Reused buffer for counting sort bucket offsets
+    bucket_offsets: Vec<u32>,
+
     /// Random state for creating hashes
     random_state: RandomState,
 }
@@ -275,6 +281,8 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             group_values: vec![],
             hashes_buffer: Default::default(),
             sorted_indices: Vec::new(),
+            gathered_hashes: Vec::new(),
+            bucket_offsets: Vec::new(),
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
         })
     }
@@ -507,28 +515,68 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             .equal_to_group_indices
             .clear();
 
-        // Sort indices by hash for cache locality and duplicate detection
         let n_rows = batch_hashes.len();
-        let sorted_indices = &mut self.sorted_indices;
-        sorted_indices.clear();
-        sorted_indices.extend(0..n_rows as u32);
 
         // Ensure capacity upfront so the table won't rehash during inserts,
         // keeping the bucket layout stable for our sort order.
         self.map.reserve(n_rows, |(hash, _)| *hash);
 
-        // Sort by (bucket_index, hash) for optimal cache locality and
-        // duplicate detection. Rotating left by bucket_bits moves the
-        // bucket-determining low bits to the top of the u64, making them
-        // the primary sort key, while keeping same-hash entries adjacent.
+        // Counting sort by bucket index for cache locality when probing
+        // the hash table. hashbrown uses `hash as usize & bucket_mask` for
+        // bucket placement, so we sort on those low bits.
         //
         // capacity() returns element capacity (buckets * 7/8), not bucket
         // count. next_power_of_two() recovers the actual bucket count.
-        let bucket_bits =
-            self.map.capacity().next_power_of_two().trailing_zeros();
-        sorted_indices.sort_unstable_by_key(|&i| {
-            batch_hashes[i as usize].rotate_left(bucket_bits)
-        });
+        let num_buckets = self.map.capacity().next_power_of_two();
+        let bucket_mask = num_buckets - 1;
+
+        // Use a subset of bucket bits for the counting sort to keep the
+        // offsets array small. We partition into 2^sort_bits buckets.
+        // 8 bits = 256 partitions gives good locality without excessive overhead.
+        let sort_bits = 8u32;
+        let num_partitions = 1usize << sort_bits;
+        // num_buckets is a power of two, so trailing_zeros gives log2(num_buckets)
+        // = number of bits used for bucket indexing. We right-shift to keep
+        // only the top `sort_bits` of those bucket-index bits.
+        let bucket_bits = num_buckets.trailing_zeros();
+        let shift = bucket_bits.saturating_sub(sort_bits);
+
+        // Phase 1: Count elements per partition
+        let bucket_offsets = &mut self.bucket_offsets;
+        bucket_offsets.clear();
+        bucket_offsets.resize(num_partitions, 0);
+
+        for &hash in batch_hashes.iter() {
+            let partition = ((hash as usize) & bucket_mask) >> shift;
+            bucket_offsets[partition] += 1;
+        }
+
+        // Phase 2: Prefix sum to get starting offsets
+        let mut sum = 0u32;
+        for count in bucket_offsets.iter_mut() {
+            let c = *count;
+            *count = sum;
+            sum += c;
+        }
+
+        // Phase 3: Scatter indices into sorted order and gather hashes.
+        // We consume bucket_offsets as write cursors (advancing each partition's
+        // offset as we place elements), so no separate copy is needed.
+        let sorted_indices = &mut self.sorted_indices;
+        sorted_indices.clear();
+        sorted_indices.resize(n_rows, 0);
+
+        let gathered_hashes = &mut self.gathered_hashes;
+        gathered_hashes.clear();
+        gathered_hashes.resize(n_rows, 0);
+
+        for (i, &hash) in batch_hashes.iter().enumerate() {
+            let partition = ((hash as usize) & bucket_mask) >> shift;
+            let pos = bucket_offsets[partition] as usize;
+            sorted_indices[pos] = i as u32;
+            gathered_hashes[pos] = hash;
+            bucket_offsets[partition] += 1;
+        }
 
         let mut group_values_len = self.group_values[0].len();
 
@@ -537,9 +585,9 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
         let mut prev_group_idx: usize = 0;
         let mut has_prev = false;
 
-        for &idx in sorted_indices.iter() {
+        for (sorted_pos, &idx) in sorted_indices.iter().enumerate() {
             let row = idx as usize;
-            let target_hash = batch_hashes[row];
+            let target_hash = gathered_hashes[sorted_pos];
 
             // Fast path: same hash as previous row in sorted order.
             // Skip hash table probe and add directly to equal_to list.

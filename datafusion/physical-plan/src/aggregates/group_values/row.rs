@@ -77,6 +77,12 @@ pub struct GroupValuesRows {
     /// Reused buffer for sorted indices during intern
     sorted_indices: Vec<u32>,
 
+    /// Reused buffer for gathered hashes in sorted order
+    gathered_hashes: Vec<u64>,
+
+    /// Reused buffer for counting sort bucket offsets
+    bucket_offsets: Vec<u32>,
+
     /// Whether this is in streaming mode (must preserve input order)
     streaming: bool,
 
@@ -113,6 +119,8 @@ impl GroupValuesRows {
             hashes_buffer: Default::default(),
             rows_buffer,
             sorted_indices: Vec::new(),
+            gathered_hashes: Vec::new(),
+            bucket_offsets: Vec::new(),
             streaming,
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
         })
@@ -142,13 +150,62 @@ impl GroupValues for GroupValuesRows {
         batch_hashes.resize(n_rows, 0);
         create_hashes(cols, &self.random_state, batch_hashes)?;
 
-        // Sort indices by hash for cache locality and duplicate detection
+        // Sort indices by hash bucket for cache locality and duplicate detection
         // (only when not streaming, to preserve group index assignment order)
         let sorted_indices = &mut self.sorted_indices;
         sorted_indices.clear();
-        sorted_indices.extend(0..n_rows as u32);
+
+        let gathered_hashes = &mut self.gathered_hashes;
+        gathered_hashes.clear();
+
         if !self.streaming {
-            sorted_indices.sort_unstable_by_key(|&i| batch_hashes[i as usize]);
+            // Ensure capacity upfront so the table won't rehash during inserts,
+            // keeping the bucket layout stable for our sort order.
+            self.map.reserve(n_rows, |(hash, _)| *hash);
+
+            // Counting sort by bucket index for cache locality when probing
+            // the hash table. hashbrown uses `hash as usize & bucket_mask` for
+            // bucket placement, so we sort on those low bits.
+            let num_buckets = self.map.capacity().next_power_of_two();
+            let bucket_mask = num_buckets - 1;
+
+            let sort_bits = 8u32;
+            let num_partitions = 1usize << sort_bits;
+            let bucket_bits = num_buckets.trailing_zeros();
+            let shift = bucket_bits.saturating_sub(sort_bits);
+
+            // Phase 1: Count elements per partition
+            let bucket_offsets = &mut self.bucket_offsets;
+            bucket_offsets.clear();
+            bucket_offsets.resize(num_partitions, 0);
+
+            for &hash in batch_hashes.iter() {
+                let partition = ((hash as usize) & bucket_mask) >> shift;
+                bucket_offsets[partition] += 1;
+            }
+
+            // Phase 2: Prefix sum to get starting offsets
+            let mut sum = 0u32;
+            for count in bucket_offsets.iter_mut() {
+                let c = *count;
+                *count = sum;
+                sum += c;
+            }
+
+            // Phase 3: Scatter indices and gather hashes into sorted order
+            sorted_indices.resize(n_rows, 0);
+            gathered_hashes.resize(n_rows, 0);
+
+            for (i, &hash) in batch_hashes.iter().enumerate() {
+                let partition = ((hash as usize) & bucket_mask) >> shift;
+                let pos = bucket_offsets[partition] as usize;
+                sorted_indices[pos] = i as u32;
+                gathered_hashes[pos] = hash;
+                bucket_offsets[partition] += 1;
+            }
+        } else {
+            sorted_indices.extend(0..n_rows as u32);
+            gathered_hashes.extend_from_slice(batch_hashes);
         }
 
         // Process in (potentially sorted) hash order
@@ -156,9 +213,9 @@ impl GroupValues for GroupValuesRows {
         let mut prev_group: usize = 0;
         let mut has_prev = false;
 
-        for &idx in sorted_indices.iter() {
+        for (sorted_pos, &idx) in sorted_indices.iter().enumerate() {
             let row = idx as usize;
-            let target_hash = batch_hashes[row];
+            let target_hash = gathered_hashes[sorted_pos];
 
             // Fast path: same hash as previous row, check row equality directly
             if has_prev && target_hash == prev_hash {
