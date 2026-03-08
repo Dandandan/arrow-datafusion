@@ -38,6 +38,71 @@ use row::GroupValuesRows;
 
 pub(crate) use single_group_by::primitive::HashValue;
 
+/// Counting sort of row indices by hash bucket for cache-friendly probing.
+/// Populates `sorted_indices` and `gathered_hashes` in bucket order.
+pub(crate) fn count_sort(
+    hashes: &[u64],
+    sorted_indices: &mut Vec<u32>,
+    gathered_hashes: &mut Vec<u64>,
+    bucket_offsets: &mut Vec<u32>,
+    num_buckets: usize,
+) {
+    let n_rows = hashes.len();
+    let bucket_mask = num_buckets - 1;
+
+    let sort_bits = 8u32;
+    let num_partitions = 1usize << sort_bits;
+    let bucket_bits = num_buckets.trailing_zeros();
+    let shift = bucket_bits.saturating_sub(sort_bits);
+
+    // Phase 1: Count elements per partition
+    bucket_offsets.clear();
+    bucket_offsets.resize(num_partitions, 0);
+
+    for &hash in hashes.iter() {
+        let partition = ((hash as usize) & bucket_mask) >> shift;
+        bucket_offsets[partition] += 1;
+    }
+
+    // Phase 2: Prefix sum to get starting offsets
+    let mut sum = 0u32;
+    for count in bucket_offsets.iter_mut() {
+        let c = *count;
+        *count = sum;
+        sum += c;
+    }
+
+    // Phase 3: Scatter indices and gather hashes into sorted order
+    sorted_indices.resize(n_rows, 0);
+    gathered_hashes.resize(n_rows, 0);
+
+    for (i, &hash) in hashes.iter().enumerate() {
+        let partition = ((hash as usize) & bucket_mask) >> shift;
+        let pos = bucket_offsets[partition] as usize;
+        sorted_indices[pos] = i as u32;
+        gathered_hashes[pos] = hash;
+        bucket_offsets[partition] += 1;
+    }
+}
+
+/// Count unique hash values in a count-sorted hash slice.
+/// Identical hashes always land in the same partition, so they
+/// are adjacent after count sort.
+pub(crate) fn count_unique(gathered_hashes: &[u64]) -> usize {
+    if gathered_hashes.is_empty() {
+        return 0;
+    }
+    let mut count = 1;
+    let mut prev = gathered_hashes[0];
+    for &h in &gathered_hashes[1..] {
+        if h != prev {
+            count += 1;
+            prev = h;
+        }
+    }
+    count
+}
+
 use crate::aggregates::{
     group_values::single_group_by::{
         boolean::GroupValuesBoolean, bytes::GroupValuesBytes,

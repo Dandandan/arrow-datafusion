@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::aggregates::group_values::GroupValues;
+use crate::aggregates::group_values::{GroupValues, count_sort, count_unique};
 use ahash::RandomState;
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::{
@@ -142,59 +142,53 @@ where
             hashes_buffer.push(raw_values[i].hash(state));
         }
 
-        // Reserve capacity upfront so the table won't rehash during inserts,
-        // keeping the bucket layout stable for our sort order.
-        self.map.reserve(n_rows, |&(_, h)| h);
-
         let sorted_indices = &mut self.sorted_indices;
         sorted_indices.clear();
 
         let gathered_hashes = &mut self.gathered_hashes;
         gathered_hashes.clear();
 
-        // Only apply counting sort when the hash table is large enough to
-        // benefit from improved cache locality (i.e. doesn't fit in L2 cache).
+        // Estimate table size to decide whether counting sort is worthwhile.
+        // Each bucket holds a control byte + entry: (usize, u64) = 16 + 1 bytes.
         let num_buckets = self.map.capacity().next_power_of_two();
-        // Each bucket holds a control byte + entry: (usize, u64) = 16 bytes + 1
         let table_bytes = num_buckets * (size_of::<(usize, u64)>() + 1);
         const L2_CACHE_BYTES: usize = 256 * 1024;
 
         if table_bytes > L2_CACHE_BYTES {
-            let bucket_mask = num_buckets - 1;
+            // Count sort, then count unique hashes from the sorted result
+            // to get a tight reserve estimate (avoids over-allocating the
+            // table which would hurt cache locality).
+            let mut num_buckets = num_buckets;
+            count_sort(
+                hashes_buffer,
+                sorted_indices,
+                gathered_hashes,
+                &mut self.bucket_offsets,
+                num_buckets,
+            );
 
-            let sort_bits = 8u32;
-            let num_partitions = 1usize << sort_bits;
-            let bucket_bits = num_buckets.trailing_zeros();
-            let shift = bucket_bits.saturating_sub(sort_bits);
+            // Count uniques: identical hashes land in the same partition,
+            // so they are adjacent after the count sort.
+            let unique_count = count_unique(gathered_hashes);
 
-            // Phase 1: Count elements per partition
-            let bucket_offsets = &mut self.bucket_offsets;
-            bucket_offsets.clear();
-            bucket_offsets.resize(num_partitions, 0);
+            // Reserve capacity so the table won't rehash during inserts,
+            // keeping the bucket layout stable for our sort order.
+            self.map.reserve(unique_count, |&(_, h)| h);
 
-            for &hash in hashes_buffer.iter() {
-                let partition = ((hash as usize) & bucket_mask) >> shift;
-                bucket_offsets[partition] += 1;
-            }
-
-            // Phase 2: Prefix sum to get starting offsets
-            let mut sum = 0u32;
-            for count in bucket_offsets.iter_mut() {
-                let c = *count;
-                *count = sum;
-                sum += c;
-            }
-
-            // Phase 3: Scatter indices and gather hashes into sorted order
-            sorted_indices.resize(n_rows, 0);
-            gathered_hashes.resize(n_rows, 0);
-
-            for (i, &hash) in hashes_buffer.iter().enumerate() {
-                let partition = ((hash as usize) & bucket_mask) >> shift;
-                let pos = bucket_offsets[partition] as usize;
-                sorted_indices[pos] = i as u32;
-                gathered_hashes[pos] = hash;
-                bucket_offsets[partition] += 1;
+            // If reserve changed the bucket count, redo the count sort
+            // with the new layout.
+            let new_num_buckets = self.map.capacity().next_power_of_two();
+            if new_num_buckets != num_buckets {
+                num_buckets = new_num_buckets;
+                sorted_indices.clear();
+                gathered_hashes.clear();
+                count_sort(
+                    hashes_buffer,
+                    sorted_indices,
+                    gathered_hashes,
+                    &mut self.bucket_offsets,
+                    num_buckets,
+                );
             }
         } else {
             // Small table fits in L2 cache; skip sorting overhead

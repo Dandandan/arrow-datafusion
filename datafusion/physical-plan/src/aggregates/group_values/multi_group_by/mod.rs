@@ -517,10 +517,6 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
 
         let n_rows = batch_hashes.len();
 
-        // Ensure capacity upfront so the table won't rehash during inserts,
-        // keeping the bucket layout stable for our sort order.
-        self.map.reserve(n_rows, |(hash, _)| *hash);
-
         let sorted_indices = &mut self.sorted_indices;
         sorted_indices.clear();
 
@@ -535,41 +531,36 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
         const L2_CACHE_BYTES: usize = 256 * 1024;
 
         if table_bytes > L2_CACHE_BYTES {
-            let bucket_mask = num_buckets - 1;
+            use super::{count_sort, count_unique};
 
-            let sort_bits = 8u32;
-            let num_partitions = 1usize << sort_bits;
-            let bucket_bits = num_buckets.trailing_zeros();
-            let shift = bucket_bits.saturating_sub(sort_bits);
+            let mut num_buckets = num_buckets;
+            count_sort(
+                batch_hashes,
+                sorted_indices,
+                gathered_hashes,
+                &mut self.bucket_offsets,
+                num_buckets,
+            );
 
-            // Phase 1: Count elements per partition
-            let bucket_offsets = &mut self.bucket_offsets;
-            bucket_offsets.clear();
-            bucket_offsets.resize(num_partitions, 0);
+            let unique_count = count_unique(gathered_hashes);
 
-            for &hash in batch_hashes.iter() {
-                let partition = ((hash as usize) & bucket_mask) >> shift;
-                bucket_offsets[partition] += 1;
-            }
+            // Reserve capacity so the table won't rehash during inserts,
+            // keeping the bucket layout stable for our sort order.
+            self.map.reserve(unique_count, |(hash, _)| *hash);
 
-            // Phase 2: Prefix sum to get starting offsets
-            let mut sum = 0u32;
-            for count in bucket_offsets.iter_mut() {
-                let c = *count;
-                *count = sum;
-                sum += c;
-            }
-
-            // Phase 3: Scatter indices into sorted order and gather hashes.
-            sorted_indices.resize(n_rows, 0);
-            gathered_hashes.resize(n_rows, 0);
-
-            for (i, &hash) in batch_hashes.iter().enumerate() {
-                let partition = ((hash as usize) & bucket_mask) >> shift;
-                let pos = bucket_offsets[partition] as usize;
-                sorted_indices[pos] = i as u32;
-                gathered_hashes[pos] = hash;
-                bucket_offsets[partition] += 1;
+            // If reserve changed the bucket count, redo the count sort
+            let new_num_buckets = self.map.capacity().next_power_of_two();
+            if new_num_buckets != num_buckets {
+                num_buckets = new_num_buckets;
+                sorted_indices.clear();
+                gathered_hashes.clear();
+                count_sort(
+                    batch_hashes,
+                    sorted_indices,
+                    gathered_hashes,
+                    &mut self.bucket_offsets,
+                    num_buckets,
+                );
             }
         } else {
             // Small table fits in L2 cache; skip sorting overhead
