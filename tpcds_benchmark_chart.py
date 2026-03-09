@@ -48,15 +48,14 @@ width = 0.38
 bars1 = ax1.bar(x - width/2, main_ms, width, label='main', color='#4C72B0', alpha=0.85)
 bars2 = ax1.bar(x + width/2, morsel_ms, width, label='morsel-driven', color='#DD8452', alpha=0.85)
 
-ax1.set_yscale('log')
-ax1.set_ylabel('Execution Time (ms, log scale)', fontsize=12)
+ax1.set_ylabel('Execution Time (ms)', fontsize=12)
 ax1.set_xticks(x)
 ax1.set_xticklabels([str(q) for q in queries], fontsize=7, rotation=90)
 ax1.set_xlabel('TPC-DS Query', fontsize=12)
 ax1.legend(fontsize=11, loc='upper left')
-ax1.grid(axis='y', alpha=0.3, which='both')
+ax1.grid(axis='y', alpha=0.3)
 ax1.set_xlim(-0.7, len(queries) - 0.3)
-ax1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f'{v:,.0f}'))
+ax1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f'{v:,.0f}' if v >= 1 else f'{v:.1f}'))
 
 # Summary annotation
 ax1.annotate(
