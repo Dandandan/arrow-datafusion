@@ -655,45 +655,8 @@ impl FileOpener for ParquetOpener {
                     predicate_cache_records,
                 },
                 |mut state| async move {
-                    loop {
-                        match state.decoder.try_decode() {
-                            Ok(DecodeResult::NeedsData(ranges)) => {
-                                match state.reader.get_byte_ranges(ranges.clone()).await {
-                                    Ok(data) => {
-                                        if let Err(e) =
-                                            state.decoder.push_ranges(ranges, data)
-                                        {
-                                            return Some((
-                                                Err(DataFusionError::from(e)),
-                                                state,
-                                            ));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        return Some((
-                                            Err(DataFusionError::from(e)),
-                                            state,
-                                        ));
-                                    }
-                                }
-                            }
-                            Ok(DecodeResult::Data(batch)) => {
-                                copy_arrow_reader_metrics(
-                                    &state.arrow_reader_metrics,
-                                    &state.predicate_cache_inner_records,
-                                    &state.predicate_cache_records,
-                                );
-                                let result = state.project_batch(&batch);
-                                return Some((result, state));
-                            }
-                            Ok(DecodeResult::Finished) => {
-                                return None;
-                            }
-                            Err(e) => {
-                                return Some((Err(DataFusionError::from(e)), state));
-                            }
-                        }
-                    }
+                    let result = state.transition().await;
+                    result.map(|r| (r, state))
                 },
             )
             .fuse();
@@ -728,6 +691,39 @@ struct PushDecoderStreamState {
 }
 
 impl PushDecoderStreamState {
+    async fn transition(&mut self) -> Option<Result<RecordBatch>> {
+        loop {
+            match self.decoder.try_decode() {
+                Ok(DecodeResult::NeedsData(ranges)) => {
+                    match self.reader.get_byte_ranges(ranges.clone()).await {
+                        Ok(data) => {
+                            if let Err(e) = self.decoder.push_ranges(ranges, data) {
+                                return Some(Err(DataFusionError::from(e)));
+                            }
+                        }
+                        Err(e) => {
+                            return Some(Err(DataFusionError::from(e)));
+                        }
+                    }
+                }
+                Ok(DecodeResult::Data(batch)) => {
+                    copy_arrow_reader_metrics(
+                        &self.arrow_reader_metrics,
+                        &self.predicate_cache_inner_records,
+                        &self.predicate_cache_records,
+                    );
+                    return Some(self.project_batch(&batch));
+                }
+                Ok(DecodeResult::Finished) => {
+                    return None;
+                }
+                Err(e) => {
+                    return Some(Err(DataFusionError::from(e)));
+                }
+            }
+        }
+    }
+
     fn project_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mut batch = self.projector.project_batch(batch)?;
         if self.replace_schema {
