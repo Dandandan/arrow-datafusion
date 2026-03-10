@@ -680,6 +680,12 @@ impl FileOpener for ParquetOpener {
     }
 }
 
+/// State for a stream that decodes a single Parquet file using a push-based decoder.
+///
+/// The [`transition`](Self::transition) method drives the decoder in a loop: it requests
+/// byte ranges from the [`AsyncFileReader`], pushes the fetched data into the
+/// [`ParquetPushDecoder`], and yields projected [`RecordBatch`]es until the file is
+/// fully consumed.
 struct PushDecoderStreamState {
     decoder: ParquetPushDecoder,
     reader: Box<dyn AsyncFileReader>,
@@ -692,6 +698,14 @@ struct PushDecoderStreamState {
 }
 
 impl PushDecoderStreamState {
+    /// Advances the decoder state machine until the next [`RecordBatch`] is
+    /// produced, the file is fully consumed, or an error occurs.
+    ///
+    /// On each iteration the decoder is polled via [`ParquetPushDecoder::try_decode`]:
+    /// - [`NeedsData`](DecodeResult::NeedsData) – the requested byte ranges are
+    ///   fetched from the [`AsyncFileReader`] and fed back into the decoder.
+    /// - [`Data`](DecodeResult::Data) – a decoded batch is projected and returned.
+    /// - [`Finished`](DecodeResult::Finished) – signals end-of-stream (`None`).
     async fn transition(&mut self) -> Option<Result<RecordBatch>> {
         loop {
             match self.decoder.try_decode() {
