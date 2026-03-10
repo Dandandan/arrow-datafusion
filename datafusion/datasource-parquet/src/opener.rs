@@ -695,23 +695,17 @@ impl PushDecoderStreamState {
         loop {
             match self.decoder.try_decode() {
                 Ok(DecodeResult::NeedsData(ranges)) => {
-                    match self.reader.get_byte_ranges(ranges.clone()).await {
-                        Ok(data) => {
-                            if let Err(e) = self.decoder.push_ranges(ranges, data) {
-                                return Some(Err(DataFusionError::from(e)));
-                            }
-                        }
-                        Err(e) => {
-                            return Some(Err(DataFusionError::from(e)));
-                        }
+                    let fetch = async {
+                        let data = self.reader.get_byte_ranges(ranges.clone()).await?;
+                        self.decoder.push_ranges(ranges, data)?;
+                        Ok::<_, parquet::errors::ParquetError>(())
+                    };
+                    if let Err(e) = fetch.await {
+                        return Some(Err(DataFusionError::from(e)));
                     }
                 }
                 Ok(DecodeResult::Data(batch)) => {
-                    copy_arrow_reader_metrics(
-                        &self.arrow_reader_metrics,
-                        &self.predicate_cache_inner_records,
-                        &self.predicate_cache_records,
-                    );
+                    self.copy_arrow_reader_metrics();
                     return Some(self.project_batch(&batch));
                 }
                 Ok(DecodeResult::Finished) => {
@@ -721,6 +715,17 @@ impl PushDecoderStreamState {
                     return Some(Err(DataFusionError::from(e)));
                 }
             }
+        }
+    }
+
+    /// Copies metrics from ArrowReaderMetrics (the metrics collected by the
+    /// arrow-rs parquet reader) to the parquet file metrics for DataFusion
+    fn copy_arrow_reader_metrics(&self) {
+        if let Some(v) = self.arrow_reader_metrics.records_read_from_inner() {
+            self.predicate_cache_inner_records.set(v);
+        }
+        if let Some(v) = self.arrow_reader_metrics.records_read_from_cache() {
+            self.predicate_cache_records.set(v);
         }
     }
 
@@ -736,22 +741,6 @@ impl PushDecoderStreamState {
             )?;
         }
         Ok(batch)
-    }
-}
-
-/// Copies metrics from ArrowReaderMetrics (the metrics collected by the
-/// arrow-rs parquet reader) to the parquet file metrics for DataFusion
-fn copy_arrow_reader_metrics(
-    arrow_reader_metrics: &ArrowReaderMetrics,
-    predicate_cache_inner_records: &Gauge,
-    predicate_cache_records: &Gauge,
-) {
-    if let Some(v) = arrow_reader_metrics.records_read_from_inner() {
-        predicate_cache_inner_records.set(v);
-    }
-
-    if let Some(v) = arrow_reader_metrics.records_read_from_cache() {
-        predicate_cache_records.set(v);
     }
 }
 
