@@ -24,11 +24,12 @@ use crate::{
     apply_file_schema_type_coercions, coerce_int96_to_resolution, row_filter,
 };
 use arrow::array::{RecordBatch, RecordBatchOptions};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Schema};
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
-use datafusion_physical_expr::projection::ProjectionExprs;
+use datafusion_physical_expr::projection::{ProjectionExprs, Projector};
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
+use parquet::errors::ParquetError;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -64,7 +65,7 @@ use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, RowSelectionPolicy,
 };
 use parquet::arrow::async_reader::AsyncFileReader;
-use parquet::arrow::push_decoder::ParquetPushDecoderBuilder;
+use parquet::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader, RowGroupMetaData};
 
@@ -680,10 +681,10 @@ impl FileOpener for ParquetOpener {
 }
 
 struct PushDecoderStreamState {
-    decoder: parquet::arrow::push_decoder::ParquetPushDecoder,
+    decoder: ParquetPushDecoder,
     reader: Box<dyn AsyncFileReader>,
-    projector: datafusion_physical_expr::projection::Projector,
-    output_schema: Arc<arrow::datatypes::Schema>,
+    projector: Projector,
+    output_schema: Arc<Schema>,
     replace_schema: bool,
     arrow_reader_metrics: ArrowReaderMetrics,
     predicate_cache_inner_records: Gauge,
@@ -698,7 +699,7 @@ impl PushDecoderStreamState {
                     let fetch = async {
                         let data = self.reader.get_byte_ranges(ranges.clone()).await?;
                         self.decoder.push_ranges(ranges, data)?;
-                        Ok::<_, parquet::errors::ParquetError>(())
+                        Ok::<_, ParquetError>(())
                     };
                     if let Err(e) = fetch.await {
                         return Some(Err(DataFusionError::from(e)));
