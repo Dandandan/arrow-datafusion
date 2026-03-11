@@ -75,19 +75,38 @@ impl MaybeNullBufferBuilder {
     /// Returns a NullBuffer representing the first `n` rows accumulated so far
     /// shifting any remaining down by `n`
     pub fn take_n(&mut self, n: usize) -> Option<NullBuffer> {
-        // Copy over the values at  n..len-1 values to the start of a
-        // new builder and leave it in self
-        //
-        // TODO: it would be great to use something like `set_bits` from arrow here.
-        let mut new_builder = NullBufferBuilder::new(self.nulls.len());
-        for i in n..self.nulls.len() {
-            new_builder.append(self.nulls.is_valid(i));
-        }
-        std::mem::swap(&mut new_builder, &mut self.nulls);
+        let total_len = self.nulls.len();
+        let remaining_len = total_len - n;
 
-        // take only first n values from the original builder
-        new_builder.truncate(n);
-        new_builder.finish()
+        // Fast path for when there are no nulls
+        if !self.might_have_nulls() {
+            self.nulls = NullBufferBuilder::new(remaining_len);
+            self.nulls.append_n_non_nulls(remaining_len);
+            return None;
+        }
+
+        // Slow path: use bitwise operations from Arrow to shift bits
+        let mut old_builder =
+            std::mem::replace(&mut self.nulls, NullBufferBuilder::new(remaining_len));
+        let finished = old_builder.finish();
+
+        match finished {
+            Some(nb) => {
+                let first_n = nb.slice(0, n);
+                let remaining = nb.slice(n, remaining_len);
+                self.nulls.append_buffer(&remaining);
+
+                if first_n.null_count() > 0 {
+                    Some(first_n)
+                } else {
+                    None
+                }
+            }
+            None => {
+                self.nulls.append_n_non_nulls(remaining_len);
+                None
+            }
+        }
     }
 
     /// Returns true if this builder might have any nulls
