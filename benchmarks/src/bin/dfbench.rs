@@ -40,6 +40,10 @@ use datafusion_benchmarks::{
 #[derive(Debug, Parser)]
 #[command(about = "benchmark command")]
 struct Cli {
+    /// Pin each tokio worker thread to a distinct CPU core for more stable benchmarks
+    #[arg(long = "pin-threads")]
+    pin_threads: bool,
+
     #[command(subcommand)]
     command: Options,
 }
@@ -58,12 +62,7 @@ enum Options {
     Tpcds(tpcds::RunOpt),
 }
 
-// Main benchmark runner entrypoint
-#[tokio::main]
-pub async fn main() -> Result<()> {
-    env_logger::init();
-
-    let cli = Cli::parse();
+async fn run_command(cli: Cli) -> Result<()> {
     match cli.command {
         Options::Cancellation(opt) => opt.run().await,
         Options::Clickbench(opt) => opt.run().await,
@@ -76,4 +75,29 @@ pub async fn main() -> Result<()> {
         Options::Tpch(opt) => Box::pin(opt.run()).await,
         Options::Tpcds(opt) => Box::pin(opt.run()).await,
     }
+}
+
+// Main benchmark runner entrypoint
+pub fn main() -> Result<()> {
+    env_logger::init();
+
+    let cli = Cli::parse();
+    let pin_threads = cli.pin_threads;
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+
+    if pin_threads {
+        let core_ids = core_affinity::get_core_ids().expect("failed to get core IDs");
+        let core_ids =
+            std::sync::Arc::new(std::sync::Mutex::new(core_ids.into_iter().cycle()));
+        builder.on_thread_start(move || {
+            let core_id = core_ids.lock().unwrap().next().unwrap();
+            core_affinity::set_for_current(core_id);
+        });
+        eprintln!("Thread pinning enabled");
+    }
+
+    let runtime = builder.build().expect("failed to build tokio runtime");
+    runtime.block_on(run_command(cli))
 }

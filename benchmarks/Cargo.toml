@@ -41,6 +41,7 @@ mimalloc_extended = ["libmimalloc-sys/extended"]
 [dependencies]
 arrow = { workspace = true }
 clap = { version = "4.5.60", features = ["derive"] }
+core_affinity = "0.8"
 datafusion = { workspace = true, default-features = true }
 datafusion-common = { workspace = true, default-features = true }
 env_logger = { workspace = true }
