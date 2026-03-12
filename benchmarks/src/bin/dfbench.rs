@@ -89,6 +89,12 @@ pub fn main() -> Result<()> {
 
     if pin_threads {
         let core_ids = core_affinity::get_core_ids().expect("failed to get core IDs");
+
+        // Spawn a dedicated IO thread per core, pinned to the same core
+        // as the corresponding tokio worker.
+        datafusion_benchmarks::same_thread_local::init_io_thread_pool(&core_ids);
+        datafusion_benchmarks::same_thread_local::enable_same_thread_io();
+
         let core_ids =
             std::sync::Arc::new(std::sync::Mutex::new(core_ids.into_iter().cycle()));
         builder.on_thread_start(move || {
@@ -96,10 +102,7 @@ pub fn main() -> Result<()> {
             core_affinity::set_for_current(core_id);
         });
 
-        // Use same-thread IO so file reads stay on the pinned core
-        datafusion_benchmarks::same_thread_local::enable_same_thread_io();
-
-        eprintln!("Thread pinning enabled (with same-thread IO)");
+        eprintln!("Thread pinning enabled (with per-core IO threads)");
     }
 
     let runtime = builder.build().expect("failed to build tokio runtime");

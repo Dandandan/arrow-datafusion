@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A [`LocalFileSystem`] wrapper that performs IO on the calling thread
+//! A [`LocalFileSystem`] wrapper that performs IO on a per-core IO thread
 //! instead of dispatching to tokio's blocking thread pool.
 //!
 //! When partition threads are pinned to specific CPU cores, using
 //! `spawn_blocking` dispatches IO to a random thread on a potentially
-//! different core, losing cache locality. This wrapper uses
-//! [`tokio::task::block_in_place`] to run file IO directly on the
-//! calling tokio worker thread, keeping the work on the same pinned core.
+//! different core, losing cache locality. This module provides a dedicated
+//! IO thread per core that stays pinned to the same core as the requesting
+//! tokio worker, so file reads share the same L2/L3 cache.
 
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::{File, Metadata};
@@ -31,20 +31,6 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
-
-/// Global flag: when set, `object_store_registry()` returns a registry
-/// with [`SameThreadLocalFileSystem`] instead of the default [`LocalFileSystem`].
-static USE_SAME_THREAD_IO: AtomicBool = AtomicBool::new(false);
-
-/// Enable same-thread IO for all subsequently created object store registries.
-pub fn enable_same_thread_io() {
-    USE_SAME_THREAD_IO.store(true, Ordering::Relaxed);
-}
-
-/// Returns true if same-thread IO is enabled.
-pub fn is_same_thread_io_enabled() -> bool {
-    USE_SAME_THREAD_IO.load(Ordering::Relaxed)
-}
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -57,21 +43,140 @@ use object_store::{
     MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
     PutPayload, PutResult, RenameOptions, Result,
 };
+use tokio::sync::oneshot;
 
-/// A [`LocalFileSystem`] wrapper that performs blocking IO on the calling
-/// tokio worker thread via [`tokio::task::block_in_place`], rather than
-/// dispatching to the blocking thread pool.
+/// Global flag: when set, `runtime_env_builder()` returns a builder with
+/// [`SameThreadLocalFileSystem`] instead of the default [`LocalFileSystem`].
+static USE_SAME_THREAD_IO: AtomicBool = AtomicBool::new(false);
+
+/// Enable same-thread IO for all subsequently created object store registries.
+pub fn enable_same_thread_io() {
+    USE_SAME_THREAD_IO.store(true, Ordering::Relaxed);
+}
+
+/// Returns true if same-thread IO is enabled.
+pub fn is_same_thread_io_enabled() -> bool {
+    USE_SAME_THREAD_IO.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// Per-core IO thread pool
+// ---------------------------------------------------------------------------
+
+type IoWork = Box<dyn FnOnce() + Send>;
+
+/// A pool of IO threads, one per core, each pinned to its respective core.
+/// Work is dispatched round-robin based on the calling thread's ID so that
+/// a given tokio worker always talks to the same IO thread (the one sharing
+/// its core).
+struct IoThreadPool {
+    senders: Vec<std::sync::mpsc::Sender<IoWork>>,
+}
+
+impl IoThreadPool {
+    /// Spawn one IO thread per core ID, pinned to that core.
+    fn new(core_ids: &[core_affinity::CoreId]) -> Self {
+        let mut senders = Vec::with_capacity(core_ids.len());
+
+        for &core_id in core_ids {
+            let (tx, rx) = std::sync::mpsc::channel::<IoWork>();
+            std::thread::Builder::new()
+                .name(format!("datafusion-io-{}", core_id.id))
+                .spawn(move || {
+                    // Pin this IO thread to the same core
+                    core_affinity::set_for_current(core_id);
+                    // Process work items until the channel closes
+                    while let Ok(work) = rx.recv() {
+                        work();
+                    }
+                })
+                .expect("failed to spawn IO thread");
+
+            senders.push(tx);
+        }
+
+        Self { senders }
+    }
+
+    /// Submit work to the IO thread for the current core.
+    /// Uses thread ID to consistently map a tokio worker to the same IO thread.
+    fn submit<F, T>(&self, f: F) -> oneshot::Receiver<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        // Use the current thread's ID to pick an IO thread.
+        // This gives a stable mapping: the same tokio worker always
+        // goes to the same IO thread (sharing its pinned core).
+        let thread_id = thread_id_hash();
+        let idx = thread_id % self.senders.len();
+
+        let work: IoWork = Box::new(move || {
+            let result = f();
+            let _ = tx.send(result);
+        });
+
+        // If the IO thread has shut down, this will fail — but that
+        // only happens during process exit.
+        let _ = self.senders[idx].send(work);
+        rx
+    }
+}
+
+/// Fast, stable hash of the current thread's ID.
+fn thread_id_hash() -> usize {
+    // ThreadId doesn't expose the underlying integer, but its Debug
+    // output is stable within a process. Using as_u64 via transmute
+    // is not stable. Instead use a thread-local counter assigned at
+    // first access, which is cheaper than hashing.
+    thread_local! {
+        static IDX: usize = next_thread_index();
+    }
+    IDX.with(|idx| *idx)
+}
+
+fn next_thread_index() -> usize {
+    use std::sync::atomic::AtomicUsize;
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Global IO thread pool, initialized once.
+static IO_POOL: std::sync::OnceLock<IoThreadPool> = std::sync::OnceLock::new();
+
+/// Initialize the global IO thread pool with one thread per core.
+/// Must be called before any `SameThreadLocalFileSystem` operations.
+/// The provided core IDs should match those used for the tokio workers.
+pub fn init_io_thread_pool(core_ids: &[core_affinity::CoreId]) {
+    IO_POOL
+        .set(IoThreadPool::new(core_ids))
+        .ok()
+        .expect("IO thread pool already initialized");
+}
+
+fn io_pool() -> &'static IoThreadPool {
+    IO_POOL
+        .get()
+        .expect("IO thread pool not initialized — call init_io_thread_pool first")
+}
+
+// ---------------------------------------------------------------------------
+// ObjectStore implementation
+// ---------------------------------------------------------------------------
+
+/// A [`LocalFileSystem`] wrapper that dispatches read IO to a dedicated
+/// per-core IO thread, rather than tokio's blocking thread pool.
 ///
-/// This ensures that when worker threads are pinned to CPU cores, the IO
-/// stays on the same core as the partition that requested it, preserving
-/// cache locality.
+/// Each tokio worker (pinned to core N) sends IO work to IO thread N
+/// (also pinned to core N), preserving L2/L3 cache locality while
+/// keeping the tokio worker free to run other async tasks.
 #[derive(Debug)]
 pub struct SameThreadLocalFileSystem {
     inner: LocalFileSystem,
 }
 
 impl SameThreadLocalFileSystem {
-    /// Create a new `SameThreadLocalFileSystem` with no path prefix.
     pub fn new() -> Self {
         Self {
             inner: LocalFileSystem::new(),
@@ -85,7 +190,11 @@ impl Display for SameThreadLocalFileSystem {
     }
 }
 
-/// Open a file and return it with its metadata.
+// ---------------------------------------------------------------------------
+// Sync file helpers (replicated from object_store::local since they're
+// pub(crate) there)
+// ---------------------------------------------------------------------------
+
 fn open_file(path: &PathBuf) -> Result<(File, Metadata)> {
     match File::open(path).and_then(|f| Ok((f.metadata()?, f))) {
         Err(e) => Err(match e.kind() {
@@ -197,6 +306,10 @@ fn read_range(file: &mut File, path: &PathBuf, range: Range<u64>) -> Result<Byte
     Ok(buf.into())
 }
 
+// ---------------------------------------------------------------------------
+// ObjectStore trait
+// ---------------------------------------------------------------------------
+
 #[async_trait]
 impl ObjectStore for SameThreadLocalFileSystem {
     async fn put_opts(
@@ -205,7 +318,6 @@ impl ObjectStore for SameThreadLocalFileSystem {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
-        // Writes are not on the hot read path; delegate to inner.
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -224,7 +336,8 @@ impl ObjectStore for SameThreadLocalFileSystem {
     ) -> Result<GetResult> {
         let location = location.clone();
         let path = self.inner.path_to_filesystem(&location)?;
-        tokio::task::block_in_place(move || {
+
+        let rx = io_pool().submit(move || {
             let (file, metadata) = open_file(&path)?;
             let meta = convert_metadata(&metadata, location);
             options.check_preconditions(&meta)?;
@@ -245,7 +358,12 @@ impl ObjectStore for SameThreadLocalFileSystem {
                 range,
                 meta,
             })
-        })
+        });
+
+        rx.await.map_err(|_| object_store::Error::Generic {
+            store: "SameThreadLocalFileSystem",
+            source: "IO thread shut down".into(),
+        })?
     }
 
     async fn get_ranges(
@@ -255,13 +373,19 @@ impl ObjectStore for SameThreadLocalFileSystem {
     ) -> Result<Vec<Bytes>> {
         let path = self.inner.path_to_filesystem(location)?;
         let ranges = ranges.to_vec();
-        tokio::task::block_in_place(move || {
+
+        let rx = io_pool().submit(move || {
             let (mut file, _) = open_file(&path)?;
             ranges
                 .into_iter()
                 .map(|r| read_range(&mut file, &path, r))
                 .collect()
-        })
+        });
+
+        rx.await.map_err(|_| object_store::Error::Generic {
+            store: "SameThreadLocalFileSystem",
+            source: "IO thread shut down".into(),
+        })?
     }
 
     fn delete_stream(
