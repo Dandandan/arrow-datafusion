@@ -105,18 +105,17 @@ impl FileStream {
     fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
         loop {
             match &mut self.state {
-                FileStreamState::Idle => {
-                    self.file_stream_metrics.time_opening.start();
-
-                    match self.start_next_file().transpose() {
-                        Ok(Some(future)) => self.state = FileStreamState::Open { future },
-                        Ok(None) => return Poll::Ready(None),
-                        Err(e) => {
-                            self.state = FileStreamState::Error;
-                            return Poll::Ready(Some(Err(e)));
-                        }
+                FileStreamState::Idle => match self.start_next_file().transpose() {
+                    Ok(Some(future)) => {
+                        self.file_stream_metrics.time_opening.start();
+                        self.state = FileStreamState::Open { future };
                     }
-                }
+                    Ok(None) => return Poll::Ready(None),
+                    Err(e) => {
+                        self.state = FileStreamState::Error;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                },
                 FileStreamState::Open { future } => match ready!(future.poll_unpin(cx)) {
                     Ok(reader) => {
                         self.file_stream_metrics.files_opened.add(1);
