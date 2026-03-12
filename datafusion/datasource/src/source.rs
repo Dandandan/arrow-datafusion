@@ -20,7 +20,9 @@
 use std::any::Any;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_plan::execution_plan::{
@@ -36,16 +38,20 @@ use datafusion_physical_plan::{
 use itertools::Itertools;
 
 use crate::file_scan_config::FileScanConfig;
+use crate::file_stream::WorkQueue;
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Constraints, Result, Statistics};
-use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::SortOrderPushdownResult;
 use datafusion_physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
 };
+use futures::Stream;
 
 /// A source of data, typically a list of files or memory
 ///
@@ -126,6 +132,7 @@ pub trait DataSource: Send + Sync + Debug {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream>;
+
     fn as_any(&self) -> &dyn Any;
     /// Format this source for display in explain plans
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result;
@@ -157,7 +164,7 @@ pub trait DataSource: Send + Sync + Debug {
 
     /// Returns statistics for a specific partition, or aggregate statistics
     /// across all partitions if `partition` is `None`.
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics>;
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>>;
 
     /// Return a copy of this DataSource with a new fetch limit
     fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn DataSource>>;
@@ -341,25 +348,59 @@ impl ExecutionPlan for DataSourceExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let stream = self.data_source.open(partition, Arc::clone(&context))?;
+        let morsel_config = self
+            .data_source
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+            .filter(|c| c.morsel_driven);
+
+        let (stream, queue) = if let Some(config) = morsel_config {
+            let key = Arc::as_ptr(&self.data_source) as *const () as usize;
+            let object_store = context
+                .runtime_env()
+                .object_store(&config.object_store_url)?;
+            let batch_size = config
+                .batch_size
+                .unwrap_or_else(|| context.session_config().batch_size());
+            let source = config.file_source.with_batch_size(batch_size);
+            let opener_for_queue =
+                source.create_file_opener(object_store, config, partition)?;
+            let num_partitions = context.session_config().target_partitions();
+            let queue = context.get_or_insert_shared_state(key, || {
+                let all_files = config
+                    .file_groups
+                    .iter()
+                    .flat_map(|g| g.files().iter().cloned())
+                    .collect();
+                WorkQueue::new(all_files, num_partitions, Some(opener_for_queue))
+            });
+            let stream =
+                config.open_with_queue(partition, &context, Some(Arc::clone(&queue)))?;
+            (stream, Some(queue))
+        } else {
+            (
+                self.data_source.open(partition, Arc::clone(&context))?,
+                None,
+            )
+        };
+
         let batch_size = context.session_config().batch_size();
         log::debug!(
             "Batch splitting enabled for partition {partition}: batch_size={batch_size}"
         );
         let metrics = self.data_source.metrics();
         let split_metrics = SplitMetrics::new(&metrics, partition);
-        Ok(Box::pin(BatchSplitStream::new(
-            stream,
-            batch_size,
-            split_metrics,
-        )))
+        Ok(Box::pin(DataSourceExecStream {
+            inner: Box::pin(BatchSplitStream::new(stream, batch_size, split_metrics)),
+            _shared_queue: queue,
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.data_source.metrics().clone_inner())
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.data_source.partition_statistics(partition)
     }
 
@@ -459,6 +500,30 @@ impl ExecutionPlan for DataSourceExec {
                 Arc::new(self.clone().with_data_source(new_data_source))
                     as Arc<dyn ExecutionPlan>
             })
+    }
+}
+
+struct DataSourceExecStream {
+    inner: SendableRecordBatchStream,
+    /// Holds a strong reference to the morsel queue so it stays alive
+    /// as long as any partition stream exists.
+    _shared_queue: Option<Arc<WorkQueue>>,
+}
+
+impl Stream for DataSourceExecStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+impl RecordBatchStream for DataSourceExecStream {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
     }
 }
 
