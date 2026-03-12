@@ -1803,6 +1803,9 @@ name = "datafusion-benchmarks"
 version = "52.2.0"
 dependencies = [
  "arrow",
+ "async-trait",
+ "bytes",
+ "chrono",
  "clap",
  "core_affinity",
  "datafusion",
@@ -1822,6 +1825,7 @@ dependencies = [
  "snmalloc-rs",
  "tokio",
  "tokio-util",
+ "url",
 ]
 
 [[package]]

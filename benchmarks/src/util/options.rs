@@ -22,11 +22,14 @@ use datafusion::{
     execution::{
         disk_manager::DiskManagerBuilder,
         memory_pool::{FairSpillPool, GreedyMemoryPool, MemoryPool, TrackConsumersPool},
+        object_store::{DefaultObjectStoreRegistry, ObjectStoreRegistry},
         runtime_env::RuntimeEnvBuilder,
     },
     prelude::SessionConfig,
 };
 use datafusion_common::{DataFusionError, Result};
+
+use crate::same_thread_local::{SameThreadLocalFileSystem, is_same_thread_io_enabled};
 
 // Common benchmark options (don't use doc comments otherwise this doc
 // shows up in help files)
@@ -90,6 +93,17 @@ impl CommonOpt {
     /// Return an appropriately configured `RuntimeEnvBuilder`
     pub fn runtime_env_builder(&self) -> Result<RuntimeEnvBuilder> {
         let mut rt_builder = RuntimeEnvBuilder::new();
+
+        // When same-thread IO is enabled (via --pin-threads), register a
+        // LocalFileSystem that does IO on the calling thread instead of
+        // dispatching to the blocking pool, preserving core pinning.
+        if is_same_thread_io_enabled() {
+            let registry = DefaultObjectStoreRegistry::new();
+            let url = url::Url::parse("file://").expect("valid url");
+            registry.register_store(&url, Arc::new(SameThreadLocalFileSystem::new()));
+            rt_builder =
+                rt_builder.with_object_store_registry(Arc::new(registry));
+        }
         const NUM_TRACKED_CONSUMERS: usize = 5;
         if let Some(memory_limit) = self.memory_limit {
             let pool: Arc<dyn MemoryPool> = match self.mem_pool_type.as_str() {

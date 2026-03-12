@@ -95,7 +95,11 @@ pub fn main() -> Result<()> {
             let core_id = core_ids.lock().unwrap().next().unwrap();
             core_affinity::set_for_current(core_id);
         });
-        eprintln!("Thread pinning enabled");
+
+        // Use same-thread IO so file reads stay on the pinned core
+        datafusion_benchmarks::same_thread_local::enable_same_thread_io();
+
+        eprintln!("Thread pinning enabled (with same-thread IO)");
     }
 
     let runtime = builder.build().expect("failed to build tokio runtime");

@@ -22,6 +22,7 @@ pub mod h2o;
 pub mod hj;
 pub mod imdb;
 pub mod nlj;
+pub mod same_thread_local;
 pub mod smj;
 pub mod sort_tpch;
 pub mod tpcds;
