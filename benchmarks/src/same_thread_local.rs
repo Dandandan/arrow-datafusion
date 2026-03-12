@@ -275,20 +275,20 @@ fn read_range(file: &mut File, path: &PathBuf, range: Range<u64>) -> Result<Byte
 
     let to_read = range.end.min(file_len) - range.start;
 
-    file.seek(SeekFrom::Start(range.start))
-        .map_err(|e| object_store::Error::Generic {
+    file.seek(SeekFrom::Start(range.start)).map_err(|e| {
+        object_store::Error::Generic {
             store: "SameThreadLocalFileSystem",
             source: Box::new(e),
-        })?;
+        }
+    })?;
 
     let mut buf = Vec::with_capacity(to_read as usize);
-    let read = file
-        .take(to_read)
-        .read_to_end(&mut buf)
-        .map_err(|e| object_store::Error::Generic {
+    let read = file.take(to_read).read_to_end(&mut buf).map_err(|e| {
+        object_store::Error::Generic {
             store: "SameThreadLocalFileSystem",
             source: Box::new(e),
-        })? as u64;
+        }
+    })? as u64;
 
     if read != to_read {
         return Err(object_store::Error::Generic {
@@ -305,6 +305,11 @@ fn read_range(file: &mut File, path: &PathBuf, range: Range<u64>) -> Result<Byte
 
     Ok(buf.into())
 }
+
+/// Reads smaller than this are run inline via `block_in_place` for best
+/// L1/L2 cache locality. Larger reads are dispatched to the per-core IO
+/// thread so the tokio worker stays free.
+const INLINE_IO_THRESHOLD: u64 = 1024 * 1024; // 1 MB
 
 // ---------------------------------------------------------------------------
 // ObjectStore trait
@@ -329,26 +334,24 @@ impl ObjectStore for SameThreadLocalFileSystem {
         self.inner.put_multipart_opts(location, opts).await
     }
 
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> Result<GetResult> {
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        // get_opts just opens a file and stats it — always small/fast,
+        // so run inline for best L1 cache locality.
         let location = location.clone();
         let path = self.inner.path_to_filesystem(&location)?;
-
-        let rx = io_pool().submit(move || {
+        tokio::task::block_in_place(move || {
             let (file, metadata) = open_file(&path)?;
             let meta = convert_metadata(&metadata, location);
             options.check_preconditions(&meta)?;
 
             let range = match options.range {
-                Some(r) => r.as_range(meta.size).map_err(|e| {
-                    object_store::Error::Generic {
-                        store: "SameThreadLocalFileSystem",
-                        source: Box::new(e),
-                    }
-                })?,
+                Some(r) => {
+                    r.as_range(meta.size)
+                        .map_err(|e| object_store::Error::Generic {
+                            store: "SameThreadLocalFileSystem",
+                            source: Box::new(e),
+                        })?
+                }
                 None => 0..meta.size,
             };
 
@@ -358,12 +361,7 @@ impl ObjectStore for SameThreadLocalFileSystem {
                 range,
                 meta,
             })
-        });
-
-        rx.await.map_err(|_| object_store::Error::Generic {
-            store: "SameThreadLocalFileSystem",
-            source: "IO thread shut down".into(),
-        })?
+        })
     }
 
     async fn get_ranges(
@@ -374,18 +372,34 @@ impl ObjectStore for SameThreadLocalFileSystem {
         let path = self.inner.path_to_filesystem(location)?;
         let ranges = ranges.to_vec();
 
-        let rx = io_pool().submit(move || {
-            let (mut file, _) = open_file(&path)?;
-            ranges
-                .into_iter()
-                .map(|r| read_range(&mut file, &path, r))
-                .collect()
-        });
+        let total_bytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
 
-        rx.await.map_err(|_| object_store::Error::Generic {
-            store: "SameThreadLocalFileSystem",
-            source: "IO thread shut down".into(),
-        })?
+        if total_bytes < INLINE_IO_THRESHOLD {
+            // Small reads: run inline on the current worker thread for
+            // best L1/L2 cache locality with zero coordination overhead.
+            tokio::task::block_in_place(move || {
+                let (mut file, _) = open_file(&path)?;
+                ranges
+                    .into_iter()
+                    .map(|r| read_range(&mut file, &path, r))
+                    .collect()
+            })
+        } else {
+            // Large reads: dispatch to the per-core IO thread so the
+            // tokio worker stays free for other partitions.
+            let rx = io_pool().submit(move || {
+                let (mut file, _) = open_file(&path)?;
+                ranges
+                    .into_iter()
+                    .map(|r| read_range(&mut file, &path, r))
+                    .collect()
+            });
+
+            rx.await.map_err(|_| object_store::Error::Generic {
+                store: "SameThreadLocalFileSystem",
+                source: "IO thread shut down".into(),
+            })?
+        }
     }
 
     fn delete_stream(
@@ -395,10 +409,7 @@ impl ObjectStore for SameThreadLocalFileSystem {
         self.inner.delete_stream(locations)
     }
 
-    fn list(
-        &self,
-        prefix: Option<&Path>,
-    ) -> BoxStream<'static, Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
 
@@ -410,10 +421,7 @@ impl ObjectStore for SameThreadLocalFileSystem {
         self.inner.list_with_offset(prefix, offset)
     }
 
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> Result<ListResult> {
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
 
