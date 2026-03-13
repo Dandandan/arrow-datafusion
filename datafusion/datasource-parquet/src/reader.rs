@@ -27,7 +27,10 @@ use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use futures::future::try_join_all;
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
+use object_store::path::Path;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
 use parquet::file::metadata::ParquetMetaData;
@@ -98,6 +101,7 @@ pub struct ParquetFileReader {
     pub file_metrics: ParquetFileMetrics,
     pub inner: ParquetObjectReader,
     pub partitioned_file: PartitionedFile,
+    store: Arc<dyn ObjectStore>,
 }
 
 impl AsyncFileReader for ParquetFileReader {
@@ -119,7 +123,7 @@ impl AsyncFileReader for ParquetFileReader {
     {
         let total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
         self.file_metrics.bytes_scanned.add(total as usize);
-        fetch_coalesced_ranges(&mut self.inner, ranges)
+        fetch_ranges_parallel(&self.store, &self.partitioned_file.object_meta.location, ranges)
     }
 
     fn get_metadata<'a>(
@@ -157,7 +161,7 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
         );
         let store = Arc::clone(&self.store);
         let mut inner = ParquetObjectReader::new(
-            store,
+            Arc::clone(&store),
             partitioned_file.object_meta.location.clone(),
         )
         .with_file_size(partitioned_file.object_meta.size);
@@ -170,6 +174,7 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
             inner,
             file_metrics,
             partitioned_file,
+            store,
         }))
     }
 }
@@ -284,7 +289,7 @@ impl AsyncFileReader for CachedParquetFileReader {
     {
         let total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
         self.file_metrics.bytes_scanned.add(total as usize);
-        fetch_coalesced_ranges(&mut self.inner, ranges)
+        fetch_ranges_parallel(&self.store, &self.partitioned_file.object_meta.location, ranges)
     }
 
     fn get_metadata<'a>(
@@ -362,137 +367,23 @@ impl FileMetadata for CachedParquetMetaData {
     }
 }
 
-/// Fetch byte ranges from a [`ParquetObjectReader`], coalescing adjacent
-/// (touching or overlapping) ranges into single IO requests.
-///
-/// The results are returned in the same order as the input `ranges`.
-fn fetch_coalesced_ranges<'a>(
-    inner: &'a mut ParquetObjectReader,
+/// Fetch byte ranges from an [`ObjectStore`] in parallel, issuing one
+/// `get_range` call per range concurrently via `try_join_all`.
+fn fetch_ranges_parallel<'a>(
+    store: &'a Arc<dyn ObjectStore>,
+    location: &'a Path,
     ranges: Vec<Range<u64>>,
 ) -> BoxFuture<'a, parquet::errors::Result<Vec<Bytes>>> {
     async move {
-        if ranges.len() <= 1 {
-            return inner.get_byte_ranges(ranges).await;
-        }
+        let futures = ranges.into_iter().map(|range| {
+            let store = Arc::clone(store);
+            let location = location.clone();
+            async move { store.get_range(&location, range).await }
+        });
 
-        let (coalesced, mappings) = coalesce_ranges(&ranges);
-
-        // No coalescing happened — fall through to the inner reader directly.
-        if coalesced.len() == ranges.len() {
-            return inner.get_byte_ranges(ranges).await;
-        }
-
-        let fetched = inner.get_byte_ranges(coalesced.clone()).await?;
-
-        // Reconstruct the originally requested slices from the coalesced data.
-        let mut result = vec![Bytes::new(); ranges.len()];
-        for ((coalesced_range, members), coalesced_bytes) in
-            coalesced.iter().zip(&mappings).zip(fetched)
-        {
-            for &(original_idx, ref original_range) in members {
-                let offset = (original_range.start - coalesced_range.start) as usize;
-                let len = (original_range.end - original_range.start) as usize;
-                result[original_idx] = coalesced_bytes.slice(offset..offset + len);
-            }
-        }
-
-        Ok(result)
+        try_join_all(futures).await.map_err(|e| {
+            parquet::errors::ParquetError::External(Box::new(e))
+        })
     }
     .boxed()
-}
-
-/// Given a list of byte ranges, merge ranges that are adjacent (touching or
-/// overlapping). Returns the merged ranges and, for each merged range, the list
-/// of `(original_index, original_range)` pairs it was built from.
-fn coalesce_ranges(
-    ranges: &[Range<u64>],
-) -> (Vec<Range<u64>>, Vec<Vec<(usize, Range<u64>)>>) {
-    // Sort by start position, keeping track of original indices.
-    let mut indexed: Vec<(usize, &Range<u64>)> = ranges.iter().enumerate().collect();
-    indexed.sort_by_key(|(_, r)| r.start);
-
-    let mut coalesced: Vec<Range<u64>> = Vec::new();
-    let mut mappings: Vec<Vec<(usize, Range<u64>)>> = Vec::new();
-
-    let Some(&(first_idx, first_range)) = indexed.first() else {
-        return (coalesced, mappings);
-    };
-
-    let mut current_start = first_range.start;
-    let mut current_end = first_range.end;
-    let mut current_members = vec![(first_idx, first_range.clone())];
-
-    for &(idx, range) in &indexed[1..] {
-        if range.start <= current_end {
-            current_end = current_end.max(range.end);
-            current_members.push((idx, range.clone()));
-        } else {
-            coalesced.push(current_start..current_end);
-            mappings.push(std::mem::take(&mut current_members));
-            current_start = range.start;
-            current_end = range.end;
-            current_members.push((idx, range.clone()));
-        }
-    }
-
-    coalesced.push(current_start..current_end);
-    mappings.push(current_members);
-
-    (coalesced, mappings)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_coalesce_empty() {
-        let (coalesced, mappings) = coalesce_ranges(&[]);
-        assert!(coalesced.is_empty());
-        assert!(mappings.is_empty());
-    }
-
-    #[test]
-    fn test_coalesce_single() {
-        let ranges = vec![100..200];
-        let (coalesced, mappings) = coalesce_ranges(&ranges);
-        assert_eq!(coalesced, vec![100..200]);
-        assert_eq!(mappings.len(), 1);
-        assert_eq!(mappings[0], vec![(0, 100..200)]);
-    }
-
-    #[test]
-    fn test_coalesce_adjacent() {
-        let ranges = vec![100..200, 200..300];
-        let (coalesced, mappings) = coalesce_ranges(&ranges);
-        assert_eq!(coalesced, vec![100..300]);
-        assert_eq!(mappings[0].len(), 2);
-    }
-
-    #[test]
-    fn test_no_coalesce_with_gap() {
-        let ranges = vec![100..200, 250..350];
-        let (coalesced, _) = coalesce_ranges(&ranges);
-        // Gap of 50 bytes — not adjacent, so not coalesced
-        assert_eq!(coalesced, vec![100..200, 250..350]);
-    }
-
-    #[test]
-    fn test_coalesce_unsorted_input() {
-        let ranges = vec![300..400, 100..200, 200..300];
-        let (coalesced, mappings) = coalesce_ranges(&ranges);
-        assert_eq!(coalesced, vec![100..400]);
-        // Original indices are preserved
-        let indices: Vec<usize> = mappings[0].iter().map(|(i, _)| *i).collect();
-        assert!(indices.contains(&0));
-        assert!(indices.contains(&1));
-        assert!(indices.contains(&2));
-    }
-
-    #[test]
-    fn test_coalesce_overlapping() {
-        let ranges = vec![100..300, 200..400];
-        let (coalesced, _) = coalesce_ranges(&ranges);
-        assert_eq!(coalesced, vec![100..400]);
-    }
 }
