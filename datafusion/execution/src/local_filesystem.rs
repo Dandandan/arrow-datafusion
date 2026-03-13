@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A [`LocalFileSystem`] wrapper that uses [`maybe_spawn_blocking`] for blocking
-//! I/O operations on the read path, matching the upstream object_store behavior.
+//! A [`LocalFileSystem`] wrapper that caches open file descriptors and uses
+//! [`maybe_spawn_blocking`] for blocking I/O on the read path.
 
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::{File, Metadata};
 use std::io::ErrorKind;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 #[cfg(target_family = "unix")]
@@ -33,6 +34,7 @@ use std::os::windows::fs::FileExt;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use futures::stream::BoxStream;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
@@ -42,15 +44,28 @@ use object_store::{
     PutPayload, PutResult, RenameOptions, Result,
 };
 
-/// A [`LocalFileSystem`] wrapper that uses [`maybe_spawn_blocking`] for blocking
-/// I/O operations on the read path (`get_opts` and `get_ranges`), matching the
-/// upstream object_store behavior.
+/// A [`LocalFileSystem`] wrapper that caches open file descriptors so each file
+/// is opened at most once for the lifetime of this store.
+///
+/// On the read path (`get_opts`, `get_ranges`) the cached handle is reused via
+/// positional reads (`pread` / `read_at`) which are thread-safe and do not
+/// require seeking.
 ///
 /// Non-read operations (put, delete, list, copy, rename) are delegated to the
 /// inner [`LocalFileSystem`].
-#[derive(Debug)]
 pub struct BlockInPlaceLocalFileSystem {
     inner: LocalFileSystem,
+    /// Cache of open file descriptors, keyed by absolute filesystem path.
+    file_cache: DashMap<PathBuf, Arc<File>>,
+}
+
+impl Debug for BlockInPlaceLocalFileSystem {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockInPlaceLocalFileSystem")
+            .field("inner", &self.inner)
+            .field("cached_files", &self.file_cache.len())
+            .finish()
+    }
 }
 
 impl BlockInPlaceLocalFileSystem {
@@ -58,6 +73,7 @@ impl BlockInPlaceLocalFileSystem {
     pub fn new() -> Self {
         Self {
             inner: LocalFileSystem::new(),
+            file_cache: DashMap::new(),
         }
     }
 
@@ -65,7 +81,20 @@ impl BlockInPlaceLocalFileSystem {
     pub fn new_with_prefix(prefix: impl AsRef<std::path::Path>) -> Result<Self> {
         Ok(Self {
             inner: LocalFileSystem::new_with_prefix(prefix)?,
+            file_cache: DashMap::new(),
         })
+    }
+
+    /// Get a cached file handle or open and cache a new one.
+    fn get_or_open_file(&self, path: &std::path::Path) -> Result<Arc<File>> {
+        if let Some(entry) = self.file_cache.get(path) {
+            return Ok(Arc::clone(entry.value()));
+        }
+        let file = open_file(path)?;
+        let file = Arc::new(file);
+        self.file_cache
+            .insert(path.to_path_buf(), Arc::clone(&file));
+        Ok(file)
     }
 }
 
@@ -100,11 +129,15 @@ impl ObjectStore for BlockInPlaceLocalFileSystem {
         self.inner.put_multipart_opts(location, opts).await
     }
 
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult> {
         let path = self.inner.path_to_filesystem(location)?;
+        let file = self.get_or_open_file(&path)?;
         let location = location.clone();
         maybe_spawn_blocking(move || {
-            let file = open_file(&path)?;
             let metadata = file_metadata(&file, &path)?;
             let meta = convert_metadata(metadata, location);
             options.check_preconditions(&meta)?;
@@ -120,8 +153,20 @@ impl ObjectStore for BlockInPlaceLocalFileSystem {
                 None => 0..meta.size,
             };
 
+            // Dup the fd so the caller can take ownership without
+            // invalidating the cached handle.
+            let owned_file = file.try_clone().map_err(|e| {
+                object_store::Error::Generic {
+                    store: "LocalFileSystem",
+                    source: Box::new(IoError {
+                        source: e,
+                        path: path.clone(),
+                    }),
+                }
+            })?;
+
             Ok(GetResult {
-                payload: GetResultPayload::File(file, path),
+                payload: GetResultPayload::File(owned_file, path),
                 attributes: Attributes::default(),
                 range,
                 meta,
@@ -136,12 +181,12 @@ impl ObjectStore for BlockInPlaceLocalFileSystem {
         ranges: &[Range<u64>],
     ) -> Result<Vec<Bytes>> {
         let path = self.inner.path_to_filesystem(location)?;
+        let file = self.get_or_open_file(&path)?;
         let ranges = ranges.to_vec();
         maybe_spawn_blocking(move || {
-            let mut file = File::open(&path).map_err(|e| map_open_error(e, &path))?;
             ranges
                 .into_iter()
-                .map(|r| read_range(&mut file, &path, r))
+                .map(|r| read_range(&file, &path, r))
                 .collect()
         })
         .await
@@ -154,7 +199,10 @@ impl ObjectStore for BlockInPlaceLocalFileSystem {
         self.inner.delete_stream(locations)
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
 
@@ -166,7 +214,10 @@ impl ObjectStore for BlockInPlaceLocalFileSystem {
         self.inner.list_with_offset(prefix, offset)
     }
 
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -221,7 +272,10 @@ fn file_metadata(file: &File, path: &std::path::Path) -> Result<Metadata> {
     }
 }
 
-fn map_open_error(source: std::io::Error, path: &std::path::Path) -> object_store::Error {
+fn map_open_error(
+    source: std::io::Error,
+    path: &std::path::Path,
+) -> object_store::Error {
     match source.kind() {
         ErrorKind::NotFound => map_not_found(path, source),
         _ => object_store::Error::Generic {
@@ -234,7 +288,10 @@ fn map_open_error(source: std::io::Error, path: &std::path::Path) -> object_stor
     }
 }
 
-fn map_not_found(path: &std::path::Path, source: std::io::Error) -> object_store::Error {
+fn map_not_found(
+    path: &std::path::Path,
+    source: std::io::Error,
+) -> object_store::Error {
     object_store::Error::NotFound {
         path: path.to_string_lossy().to_string(),
         source: source.into(),
@@ -279,113 +336,133 @@ fn get_inode(_metadata: &Metadata) -> u64 {
     0
 }
 
-/// Read a byte range from a file, using platform-specific APIs for efficiency.
+/// Read a byte range from a file, using positional reads (`pread` / `read_at`)
+/// which do not require seeking and are safe to call concurrently on a shared
+/// file descriptor.
+#[cfg(any(target_family = "unix", target_family = "windows"))]
 pub(crate) fn read_range(
-    file: &mut File,
+    file: &File,
     path: &std::path::Path,
     range: Range<u64>,
 ) -> Result<Bytes> {
     let requested = range.end - range.start;
-    let mut buf = Vec::with_capacity(requested as usize);
+    let mut buf = vec![0u8; requested as usize];
 
-    #[cfg(any(target_family = "unix", target_family = "windows"))]
-    {
-        buf.resize(requested as usize, 0_u8);
+    let mut buf_slice = &mut buf[..];
+    let mut offset = range.start;
 
-        let mut buf_slice = &mut buf[..];
-        let mut offset = range.start;
+    while !buf_slice.is_empty() {
+        #[cfg(target_family = "unix")]
+        let read_result = file.read_at(buf_slice, offset);
 
-        while !buf_slice.is_empty() {
-            #[cfg(target_family = "unix")]
-            let read_result = file.read_at(buf_slice, offset);
+        #[cfg(target_family = "windows")]
+        let read_result = file.seek_read(buf_slice, offset);
 
-            #[cfg(target_family = "windows")]
-            let read_result = file.seek_read(buf_slice, offset);
-
-            match read_result {
-                Ok(0) => break,
-                Ok(n) => {
-                    let tmp = buf_slice;
-                    buf_slice = &mut tmp[n..];
-                    offset += n as u64;
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                Err(source) => {
-                    return Err(object_store::Error::Generic {
-                        store: "LocalFileSystem",
-                        source: Box::new(IoError {
-                            source,
-                            path: path.to_path_buf(),
-                        }),
-                    });
-                }
+        match read_result {
+            Ok(0) => break,
+            Ok(n) => {
+                let tmp = buf_slice;
+                buf_slice = &mut tmp[n..];
+                offset += n as u64;
             }
-        }
-
-        if !buf_slice.is_empty() {
-            let metadata = file_metadata(file, path)?;
-            let file_len = metadata.len();
-
-            if range.start >= file_len {
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(source) => {
                 return Err(object_store::Error::Generic {
                     store: "LocalFileSystem",
-                    source: format!(
-                        "Range start {} exceeds file length {}",
-                        range.start, file_len
-                    )
-                    .into(),
+                    source: Box::new(IoError {
+                        source,
+                        path: path.to_path_buf(),
+                    }),
                 });
             }
-
-            return Err(object_store::Error::Generic {
-                store: "LocalFileSystem",
-                source: format!(
-                    "Out of range for {}: expected {} bytes, got {}",
-                    path.display(),
-                    range.end.min(file_len) - range.start,
-                    offset - range.start,
-                )
-                .into(),
-            });
         }
     }
 
-    #[cfg(all(not(unix), not(windows)))]
-    {
-        use std::io::{Seek, SeekFrom};
-        file.seek(SeekFrom::Start(range.start)).map_err(|source| {
-            object_store::Error::Generic {
-                store: "LocalFileSystem",
-                source: Box::new(IoError {
-                    source,
-                    path: path.to_path_buf(),
-                }),
-            }
-        })?;
+    if !buf_slice.is_empty() {
+        let metadata = file_metadata(file, path)?;
+        let file_len = metadata.len();
 
-        let read = file
-            .take(requested)
-            .read_to_end(&mut buf)
-            .map_err(|source| object_store::Error::Generic {
-                store: "LocalFileSystem",
-                source: Box::new(IoError {
-                    source,
-                    path: path.to_path_buf(),
-                }),
-            })? as u64;
-
-        if read != requested {
+        if range.start >= file_len {
             return Err(object_store::Error::Generic {
                 store: "LocalFileSystem",
                 source: format!(
-                    "Out of range for {}: expected {} bytes, got {}",
-                    path.display(),
-                    requested,
-                    read,
+                    "Range start {} exceeds file length {}",
+                    range.start, file_len
                 )
                 .into(),
             });
         }
+
+        return Err(object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: format!(
+                "Out of range for {}: expected {} bytes, got {}",
+                path.display(),
+                range.end.min(file_len) - range.start,
+                offset - range.start,
+            )
+            .into(),
+        });
+    }
+
+    Ok(buf.into())
+}
+
+/// Fallback for platforms without positional read support.
+#[cfg(all(not(target_family = "unix"), not(target_family = "windows")))]
+pub(crate) fn read_range(
+    file: &File,
+    path: &std::path::Path,
+    range: Range<u64>,
+) -> Result<Bytes> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Need a mutable handle for seek; clone the fd.
+    let mut file = file.try_clone().map_err(|source| {
+        object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: Box::new(IoError {
+                source,
+                path: path.to_path_buf(),
+            }),
+        }
+    })?;
+
+    let requested = range.end - range.start;
+    let mut buf = Vec::with_capacity(requested as usize);
+
+    file.seek(SeekFrom::Start(range.start)).map_err(|source| {
+        object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: Box::new(IoError {
+                source,
+                path: path.to_path_buf(),
+            }),
+        }
+    })?;
+
+    let read = (&mut file)
+        .take(requested)
+        .read_to_end(&mut buf)
+        .map_err(|source| object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: Box::new(IoError {
+                source,
+                path: path.to_path_buf(),
+            }),
+        })? as u64;
+
+    if read != requested {
+        return Err(object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: format!(
+                "Out of range for {}: expected {} bytes, got {}",
+                path.display(),
+                requested,
+                read,
+            )
+            .into(),
+        });
     }
 
     Ok(buf.into())
