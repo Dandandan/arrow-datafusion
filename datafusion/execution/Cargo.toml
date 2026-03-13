@@ -64,7 +64,7 @@ chrono = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 object_store = { workspace = true, features = ["fs"] }
-tokio = { version = "1.48", features = ["rt-multi-thread"] }
+tokio = { workspace = true }
 parking_lot = { workspace = true }
 parquet = { workspace = true, optional = true }
 rand = { workspace = true }

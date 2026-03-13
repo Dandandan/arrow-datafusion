@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A [`LocalFileSystem`] wrapper that uses [`tokio::task::block_in_place`] instead of
-//! [`tokio::task::spawn_blocking`] for blocking I/O operations on the read path.
+//! A [`LocalFileSystem`] wrapper that uses [`maybe_spawn_blocking`] for blocking
+//! I/O operations on the read path, matching the upstream object_store behavior.
 
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::{File, Metadata};
@@ -42,12 +42,9 @@ use object_store::{
     PutPayload, PutResult, RenameOptions, Result,
 };
 
-/// A [`LocalFileSystem`] wrapper that uses [`tokio::task::block_in_place`] instead of
-/// [`tokio::task::spawn_blocking`] for blocking I/O operations on the read path
-/// (`get_opts` and `get_ranges`).
-///
-/// This avoids the overhead of dispatching work to the blocking thread pool for
-/// local file I/O, which is typically very fast on modern storage (NVMe SSDs).
+/// A [`LocalFileSystem`] wrapper that uses [`maybe_spawn_blocking`] for blocking
+/// I/O operations on the read path (`get_opts` and `get_ranges`), matching the
+/// upstream object_store behavior.
 ///
 /// Non-read operations (put, delete, list, copy, rename) are delegated to the
 /// inner [`LocalFileSystem`].
@@ -106,7 +103,7 @@ impl ObjectStore for BlockInPlaceLocalFileSystem {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let path = self.inner.path_to_filesystem(location)?;
         let location = location.clone();
-        tokio::task::block_in_place(move || {
+        maybe_spawn_blocking(move || {
             let file = open_file(&path)?;
             let metadata = file_metadata(&file, &path)?;
             let meta = convert_metadata(metadata, location);
@@ -116,7 +113,7 @@ impl ObjectStore for BlockInPlaceLocalFileSystem {
                 Some(r) => {
                     r.as_range(meta.size)
                         .map_err(|e| object_store::Error::Generic {
-                            store: "BlockInPlaceLocalFileSystem",
+                            store: "LocalFileSystem",
                             source: Box::new(e),
                         })?
                 }
@@ -130,6 +127,7 @@ impl ObjectStore for BlockInPlaceLocalFileSystem {
                 meta,
             })
         })
+        .await
     }
 
     async fn get_ranges(
@@ -139,13 +137,14 @@ impl ObjectStore for BlockInPlaceLocalFileSystem {
     ) -> Result<Vec<Bytes>> {
         let path = self.inner.path_to_filesystem(location)?;
         let ranges = ranges.to_vec();
-        tokio::task::block_in_place(move || {
+        maybe_spawn_blocking(move || {
             let mut file = File::open(&path).map_err(|e| map_open_error(e, &path))?;
             ranges
                 .into_iter()
                 .map(|r| read_range(&mut file, &path, r))
                 .collect()
         })
+        .await
     }
 
     fn delete_stream(
@@ -192,6 +191,19 @@ impl ObjectStore for BlockInPlaceLocalFileSystem {
 
 // --- Helper functions (mirroring object_store::local internals) ---
 
+/// If running in a tokio context, dispatches `f` via `spawn_blocking`.
+/// Otherwise runs `f` directly on the current thread.
+async fn maybe_spawn_blocking<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => runtime.spawn_blocking(f).await?,
+        Err(_) => f(),
+    }
+}
+
 fn open_file(path: &std::path::Path) -> Result<File> {
     File::open(path).map_err(|e| map_open_error(e, path).into())
 }
@@ -213,7 +225,7 @@ fn map_open_error(source: std::io::Error, path: &std::path::Path) -> object_stor
     match source.kind() {
         ErrorKind::NotFound => map_not_found(path, source),
         _ => object_store::Error::Generic {
-            store: "BlockInPlaceLocalFileSystem",
+            store: "LocalFileSystem",
             source: Box::new(IoError {
                 source,
                 path: path.to_path_buf(),
@@ -300,7 +312,7 @@ pub(crate) fn read_range(
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(source) => {
                     return Err(object_store::Error::Generic {
-                        store: "BlockInPlaceLocalFileSystem",
+                        store: "LocalFileSystem",
                         source: Box::new(IoError {
                             source,
                             path: path.to_path_buf(),
@@ -316,7 +328,7 @@ pub(crate) fn read_range(
 
             if range.start >= file_len {
                 return Err(object_store::Error::Generic {
-                    store: "BlockInPlaceLocalFileSystem",
+                    store: "LocalFileSystem",
                     source: format!(
                         "Range start {} exceeds file length {}",
                         range.start, file_len
@@ -326,7 +338,7 @@ pub(crate) fn read_range(
             }
 
             return Err(object_store::Error::Generic {
-                store: "BlockInPlaceLocalFileSystem",
+                store: "LocalFileSystem",
                 source: format!(
                     "Out of range for {}: expected {} bytes, got {}",
                     path.display(),
@@ -343,7 +355,7 @@ pub(crate) fn read_range(
         use std::io::{Seek, SeekFrom};
         file.seek(SeekFrom::Start(range.start)).map_err(|source| {
             object_store::Error::Generic {
-                store: "BlockInPlaceLocalFileSystem",
+                store: "LocalFileSystem",
                 source: Box::new(IoError {
                     source,
                     path: path.to_path_buf(),
@@ -355,7 +367,7 @@ pub(crate) fn read_range(
             .take(requested)
             .read_to_end(&mut buf)
             .map_err(|source| object_store::Error::Generic {
-                store: "BlockInPlaceLocalFileSystem",
+                store: "LocalFileSystem",
                 source: Box::new(IoError {
                     source,
                     path: path.to_path_buf(),
@@ -364,7 +376,7 @@ pub(crate) fn read_range(
 
         if read != requested {
             return Err(object_store::Error::Generic {
-                store: "BlockInPlaceLocalFileSystem",
+                store: "LocalFileSystem",
                 source: format!(
                     "Out of range for {}: expected {} bytes, got {}",
                     path.display(),
