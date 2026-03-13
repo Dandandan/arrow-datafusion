@@ -1599,7 +1599,7 @@ impl ExecutionPlan for AggregateExec {
     }
 }
 
-fn create_schema(
+pub(crate) fn create_schema(
     input_schema: &Schema,
     group_by: &PhysicalGroupBy,
     aggr_expr: &[Arc<AggregateFunctionExpr>],

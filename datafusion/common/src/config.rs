@@ -929,6 +929,11 @@ config_namespace! {
         /// repartitioning to increase parallelism to leverage more CPU cores
         pub enable_round_robin_repartition: bool, default = true
 
+        /// When set to true, the optimizer will fuse a Partial AggregateExec
+        /// with its downstream Hash RepartitionExec into a single
+        /// AggregateRepartitionExec, eliminating intermediate materialization.
+        pub enable_fuse_aggregate_repartition: bool, default = false
+
         /// When set to true, the optimizer will attempt to perform limit operations
         /// during aggregations, if possible
         pub enable_topk_aggregation: bool, default = true

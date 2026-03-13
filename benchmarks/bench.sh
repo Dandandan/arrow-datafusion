@@ -42,6 +42,11 @@ DATAFUSION_DIR=${DATAFUSION_DIR:-$SCRIPT_DIR/..}
 DATA_DIR=${DATA_DIR:-$SCRIPT_DIR/data}
 CARGO_COMMAND=${CARGO_COMMAND:-"cargo run --release"}
 PREFER_HASH_JOIN=${PREFER_HASH_JOIN:-true}
+FUSE_AGGREGATE_REPARTITION=${FUSE_AGGREGATE_REPARTITION:-false}
+FUSE_AGG_REPART_ARG=""
+if [ "$FUSE_AGGREGATE_REPARTITION" = "true" ]; then
+    FUSE_AGG_REPART_ARG="--fuse-aggregate-repartition"
+fi
 
 usage() {
     echo "
@@ -141,6 +146,7 @@ CARGO_COMMAND       command that runs the benchmark binary
 DATAFUSION_DIR      directory to use (default $DATAFUSION_DIR)
 RESULTS_NAME        folder where the benchmark files are stored
 PREFER_HASH_JOIN    Prefer hash join algorithm (default true)
+FUSE_AGGREGATE_REPARTITION  Fuse partial aggregate + hash repartition (default false)
 DATAFUSION_*        Set the given datafusion configuration
 "
     exit 1
@@ -189,6 +195,7 @@ main() {
             echo "DATA_DIR: ${DATA_DIR}"
             echo "CARGO_COMMAND: ${CARGO_COMMAND}"
             echo "PREFER_HASH_JOIN: ${PREFER_HASH_JOIN}"
+            echo "FUSE_AGGREGATE_REPARTITION: ${FUSE_AGGREGATE_REPARTITION}"
             echo "***************************"
             case "$BENCHMARK" in
                 all)

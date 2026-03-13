@@ -61,6 +61,10 @@ pub struct CommonOpt {
     /// Activate debug mode to see more details
     #[arg(short, long)]
     pub debug: bool,
+
+    /// Enable fused aggregate + hash repartition optimization
+    #[arg(long)]
+    pub fuse_aggregate_repartition: bool,
 }
 
 impl CommonOpt {
@@ -82,6 +86,13 @@ impl CommonOpt {
         if let Some(sort_spill_reservation_bytes) = self.sort_spill_reservation_bytes {
             config =
                 config.with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
+        }
+
+        if self.fuse_aggregate_repartition {
+            config
+                .options_mut()
+                .optimizer
+                .enable_fuse_aggregate_repartition = true;
         }
 
         config
