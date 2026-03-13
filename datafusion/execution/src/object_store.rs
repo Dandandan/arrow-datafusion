@@ -19,13 +19,13 @@
 //! This allows the user to extend DataFusion with different storage systems such as S3 or HDFS
 //! and query data inside these systems.
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::local_filesystem::BlockInPlaceLocalFileSystem;
 use dashmap::DashMap;
 use datafusion_common::{
     DataFusionError, Result, exec_err, internal_datafusion_err, not_impl_err,
 };
 use object_store::ObjectStore;
-#[cfg(not(target_arch = "wasm32"))]
-use object_store::local::LocalFileSystem;
 use std::sync::Arc;
 use url::Url;
 
@@ -209,7 +209,10 @@ impl DefaultObjectStoreRegistry {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Self {
         let object_stores: DashMap<String, Arc<dyn ObjectStore>> = DashMap::new();
-        object_stores.insert("file://".to_string(), Arc::new(LocalFileSystem::new()));
+        object_stores.insert(
+            "file://".to_string(),
+            Arc::new(BlockInPlaceLocalFileSystem::new()),
+        );
         Self { object_stores }
     }
 

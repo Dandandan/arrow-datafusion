@@ -30,6 +30,8 @@
 pub mod cache;
 pub mod config;
 pub mod disk_manager;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod local_filesystem;
 pub mod memory_pool;
 pub mod object_store;
 #[cfg(feature = "parquet_encryption")]
