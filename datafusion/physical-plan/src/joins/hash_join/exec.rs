@@ -65,7 +65,7 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{Array, ArrayRef, BooleanBufferBuilder, new_null_array};
+use arrow::array::{Array, ArrayRef, BooleanBufferBuilder, UInt64Array, new_null_array};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
@@ -177,43 +177,50 @@ fn try_create_array_map(
     let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, num_row);
     reservation.try_grow(mem_size)?;
 
-    // Evaluate key expressions per-batch and concatenate only key columns
-    let left_values = concat_key_value_arrays(on_left, batches.iter())?;
+    // Evaluate key expressions per-batch and concatenate for ArrayMap construction
+    let per_batch_keys: Vec<Vec<ArrayRef>> = batches
+        .iter()
+        .map(|batch| evaluate_expressions_to_arrays(on_left, batch))
+        .collect::<Result<Vec<_>>>()?;
+    let left_values: Vec<ArrayRef> = if per_batch_keys.is_empty() || on_left.is_empty() {
+        on_left
+            .iter()
+            .map(|_| new_null_array(&DataType::Null, 0))
+            .collect()
+    } else {
+        let num_keys = on_left.len();
+        (0..num_keys)
+            .map(|key_idx| {
+                let arrays: Vec<&dyn Array> = per_batch_keys
+                    .iter()
+                    .map(|keys| keys[key_idx].as_ref())
+                    .collect();
+                Ok(arrow::compute::concat(&arrays)?)
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
 
     let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
 
     Ok(Some((array_map, left_values)))
 }
 
-/// Evaluate key expressions per-batch and concatenate only the resulting key
-/// column arrays. This avoids `concat_batches` on the full data (which would
-/// duplicate all columns in memory) while still providing contiguous key arrays
-/// for `equal_rows_arr`.
-fn concat_key_value_arrays<'a>(
-    on: &[PhysicalExprRef],
-    batches: impl Iterator<Item = &'a RecordBatch>,
-) -> Result<Vec<ArrayRef>> {
-    let batches: Vec<&RecordBatch> = batches.collect();
-    if batches.is_empty() || on.is_empty() {
-        return Ok(on
-            .iter()
-            .map(|_| new_null_array(&DataType::Null, 0))
-            .collect());
-    }
-    // Evaluate key expressions for each batch
-    let per_batch_keys: Vec<Vec<ArrayRef>> = batches
+/// Convert flat indices (used in the visited bitmap) to packed composite indices
+/// `(batch_idx << 32) | row_idx` used by `build_batch_from_indices`.
+pub(super) fn flat_to_packed_indices(
+    flat_indices: &UInt64Array,
+    batch_offsets: &[usize],
+) -> UInt64Array {
+    flat_indices
+        .values()
         .iter()
-        .map(|batch| evaluate_expressions_to_arrays(on, batch))
-        .collect::<Result<Vec<_>>>()?;
-    // Transpose and concatenate: for each key column, concat across all batches
-    let num_keys = on.len();
-    (0..num_keys)
-        .map(|key_idx| {
-            let arrays: Vec<&dyn Array> = per_batch_keys
-                .iter()
-                .map(|keys| keys[key_idx].as_ref())
-                .collect();
-            Ok(arrow::compute::concat(&arrays)?)
+        .map(|&flat_val| {
+            let flat = flat_val as usize;
+            let batch_idx = batch_offsets
+                .partition_point(|&o| o <= flat)
+                .saturating_sub(1);
+            let row_idx = flat - batch_offsets[batch_idx];
+            ((batch_idx as u64) << 32) | (row_idx as u64)
         })
         .collect()
 }
@@ -231,8 +238,9 @@ pub(super) struct JoinLeftData {
     /// batch_offsets[i] is the starting flat index for batches[i].
     /// Has length batches.len() + 1 (last element is total row count).
     batch_offsets: Vec<usize>,
-    /// The build side on expressions values (concatenated key columns only)
-    values: Vec<ArrayRef>,
+    /// The build side key expression values, per batch.
+    /// values_per_batch[batch_idx][key_idx] is the key column array for that batch.
+    values_per_batch: Vec<Vec<ArrayRef>>,
     /// Shared bitmap builder for visited left indices
     visited_indices_bitmap: SharedBitmapBuilder,
     /// Counter of running probe-threads, potentially
@@ -283,9 +291,9 @@ impl JoinLeftData {
         &self.batch_offsets
     }
 
-    /// returns a reference to the build side expressions values
-    pub(super) fn values(&self) -> &[ArrayRef] {
-        &self.values
+    /// returns a reference to the build side key expressions values, per batch
+    pub(super) fn values_per_batch(&self) -> &[Vec<ArrayRef>] {
+        &self.values_per_batch
     }
 
     /// returns a reference to the visited indices bitmap
@@ -2018,8 +2026,8 @@ async fn collect_left_input(
         _ => None,
     };
 
-    let (join_hash_map, left_values, should_reverse_batches) =
-        if let Some((array_map, left_value)) = try_create_array_map(
+    let (join_hash_map, should_reverse_batches) = if let Some((array_map, _left_value)) =
+        try_create_array_map(
             &bounds,
             &schema,
             &batches,
@@ -2029,61 +2037,57 @@ async fn collect_left_input(
             config.execution.perfect_hash_join_min_key_density,
             null_equality,
         )? {
-            array_map_created_count.add(1);
-            metrics.build_mem_used.add(array_map.size());
+        array_map_created_count.add(1);
+        metrics.build_mem_used.add(array_map.size());
 
-            (Map::ArrayMap(array_map), left_value, false)
+        (Map::ArrayMap(array_map), false)
+    } else {
+        // Estimation of memory size, required for hashtable, prior to allocation.
+        // Final result can be verified using `RawTable.allocation_info()`
+        let fixed_size_u32 = size_of::<JoinHashMapU32>();
+        let fixed_size_u64 = size_of::<JoinHashMapU64>();
+
+        // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
+        // `u64` indice variant
+        // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
+        let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
+            let estimated_hashtable_size =
+                estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+            reservation.try_grow(estimated_hashtable_size)?;
+            metrics.build_mem_used.add(estimated_hashtable_size);
+            Box::new(JoinHashMapU64::with_capacity(num_rows))
         } else {
-            // Estimation of memory size, required for hashtable, prior to allocation.
-            // Final result can be verified using `RawTable.allocation_info()`
-            let fixed_size_u32 = size_of::<JoinHashMapU32>();
-            let fixed_size_u64 = size_of::<JoinHashMapU64>();
-
-            // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
-            // `u64` indice variant
-            // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
-            let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
-                let estimated_hashtable_size =
-                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-                reservation.try_grow(estimated_hashtable_size)?;
-                metrics.build_mem_used.add(estimated_hashtable_size);
-                Box::new(JoinHashMapU64::with_capacity(num_rows))
-            } else {
-                let estimated_hashtable_size =
-                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-                reservation.try_grow(estimated_hashtable_size)?;
-                metrics.build_mem_used.add(estimated_hashtable_size);
-                Box::new(JoinHashMapU32::with_capacity(num_rows))
-            };
-
-            let mut hashes_buffer = Vec::new();
-            let mut offset = 0;
-
-            let batches_iter = batches.iter().rev();
-
-            // Updating hashmap starting from the last batch
-            for batch in batches_iter.clone() {
-                hashes_buffer.clear();
-                hashes_buffer.resize(batch.num_rows(), 0);
-                update_hash(
-                    &on_left,
-                    batch,
-                    &mut *hashmap,
-                    offset,
-                    &random_state,
-                    &mut hashes_buffer,
-                    0,
-                    true,
-                )?;
-                offset += batch.num_rows();
-            }
-
-            // Evaluate key expressions per-batch and concatenate only the key columns
-            // (avoids concat_batches on the full data, saving memory)
-            let left_values = concat_key_value_arrays(&on_left, batches_iter.clone())?;
-
-            (Map::HashMap(hashmap), left_values, true)
+            let estimated_hashtable_size =
+                estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+            reservation.try_grow(estimated_hashtable_size)?;
+            metrics.build_mem_used.add(estimated_hashtable_size);
+            Box::new(JoinHashMapU32::with_capacity(num_rows))
         };
+
+        let mut hashes_buffer = Vec::new();
+        let mut offset = 0;
+
+        let batches_iter = batches.iter().rev();
+
+        // Updating hashmap starting from the last batch
+        for batch in batches_iter.clone() {
+            hashes_buffer.clear();
+            hashes_buffer.resize(batch.num_rows(), 0);
+            update_hash(
+                &on_left,
+                batch,
+                &mut *hashmap,
+                offset,
+                &random_state,
+                &mut hashes_buffer,
+                0,
+                true,
+            )?;
+            offset += batch.num_rows();
+        }
+
+        (Map::HashMap(hashmap), true)
+    };
 
     // For HashMap: reverse the batches to match the hash map's flat index ordering.
     // The hash map is built iterating in reverse (last batch first), so flat index 0
@@ -2096,7 +2100,27 @@ async fn collect_left_input(
         batches.reverse();
     }
 
-    // Compute batch_offsets (prefix sum of batch sizes) for flat-to-(batch,row) conversion
+    // Evaluate key expressions per-batch (no concatenation needed for equal_rows_arr)
+    let values_per_batch: Vec<Vec<ArrayRef>> = if batches.is_empty() {
+        let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let empty_keys = on_left
+            .iter()
+            .map(|c| c.evaluate(&empty_batch)?.into_array(0))
+            .collect::<Result<Vec<_>>>()?;
+        vec![empty_keys]
+    } else {
+        batches
+            .iter()
+            .map(|batch| {
+                on_left
+                    .iter()
+                    .map(|c| c.evaluate(batch)?.into_array(batch.num_rows()))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    // Compute batch_offsets (prefix sum of batch sizes) for flat-to-packed index conversion
     let batch_offsets = {
         let mut offsets = Vec::with_capacity(batches.len() + 1);
         offsets.push(0usize);
@@ -2124,15 +2148,30 @@ async fn collect_left_input(
     let membership = if num_rows == 0 {
         PushdownStrategy::Empty
     } else {
-        // If the build side is small enough we can use IN list pushdown.
-        // If it's too big we fall back to pushing down a reference to the hash table.
-        // See `PushdownStrategy` for more details.
-        let estimated_size = left_values
+        // For membership testing, we need concatenated key columns.
+        // Concat from the per-batch values.
+        let concat_values: Vec<ArrayRef> =
+            if values_per_batch.is_empty() || values_per_batch[0].is_empty() {
+                vec![]
+            } else {
+                let num_keys = values_per_batch[0].len();
+                (0..num_keys)
+                    .map(|key_idx| {
+                        let arrays: Vec<&dyn Array> = values_per_batch
+                            .iter()
+                            .map(|keys| keys[key_idx].as_ref())
+                            .collect();
+                        Ok(arrow::compute::concat(&arrays)?)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+
+        let estimated_size = concat_values
             .iter()
             .map(|arr| arr.get_array_memory_size())
             .sum::<usize>();
-        if left_values.is_empty()
-            || left_values[0].is_empty()
+        if concat_values.is_empty()
+            || concat_values[0].is_empty()
             || estimated_size > config.optimizer.hash_join_inlist_pushdown_max_size
             || map.num_of_distinct_key()
                 > config
@@ -2140,7 +2179,7 @@ async fn collect_left_input(
                     .hash_join_inlist_pushdown_max_distinct_values
         {
             PushdownStrategy::Map(Arc::clone(&map))
-        } else if let Some(in_list_values) = build_struct_inlist_values(&left_values)? {
+        } else if let Some(in_list_values) = build_struct_inlist_values(&concat_values)? {
             PushdownStrategy::InList(in_list_values)
         } else {
             PushdownStrategy::Map(Arc::clone(&map))
@@ -2156,7 +2195,7 @@ async fn collect_left_input(
         schema: Arc::clone(&schema),
         batches,
         batch_offsets,
-        values: left_values,
+        values_per_batch,
         visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
         probe_threads_counter: AtomicUsize::new(probe_threads_count),
         _reservation: reservation,
@@ -4416,7 +4455,8 @@ mod tests {
         let mut build_indices_buffer = Vec::new();
         let (l, r, _) = lookup_join_hashmap(
             &join_hash_map,
-            &[left_keys_values],
+            &[vec![left_keys_values]],
+            &[0, left.num_rows()],
             &[right_keys_values],
             NullEquality::NullEqualsNothing,
             &hashes_buffer,
@@ -4477,7 +4517,8 @@ mod tests {
         let mut build_indices_buffer = Vec::new();
         let (l, r, _) = lookup_join_hashmap(
             &join_hash_map,
-            &[left_keys_values],
+            &[vec![left_keys_values]],
+            &[0, left.num_rows()],
             &[right_keys_values],
             NullEquality::NullEqualsNothing,
             &hashes_buffer,

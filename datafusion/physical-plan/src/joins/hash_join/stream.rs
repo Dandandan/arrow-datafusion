@@ -285,7 +285,8 @@ impl RecordBatchStream for HashJoinStream {
 #[expect(clippy::too_many_arguments)]
 pub(super) fn lookup_join_hashmap(
     build_hashmap: &dyn JoinHashMapType,
-    build_side_values: &[ArrayRef],
+    build_side_values_per_batch: &[Vec<ArrayRef>],
+    batch_offsets: &[usize],
     probe_side_values: &[ArrayRef],
     null_equality: NullEquality,
     hashes_buffer: &[u64],
@@ -302,8 +303,11 @@ pub(super) fn lookup_join_hashmap(
         build_indices_buffer,
     );
 
+    // Convert flat indices from hash map to packed composite indices
     let build_indices_unfiltered: UInt64Array =
         std::mem::take(build_indices_buffer).into();
+    let build_indices_unfiltered =
+        super::exec::flat_to_packed_indices(&build_indices_unfiltered, batch_offsets);
     let probe_indices_unfiltered: UInt32Array =
         std::mem::take(probe_indices_buffer).into();
 
@@ -312,7 +316,7 @@ pub(super) fn lookup_join_hashmap(
     let (build_indices, probe_indices) = equal_rows_arr(
         &build_indices_unfiltered,
         &probe_indices_unfiltered,
-        build_side_values,
+        build_side_values_per_batch,
         probe_side_values,
         null_equality,
     )?;
@@ -666,7 +670,8 @@ impl HashJoinStream {
         {
             Map::HashMap(map) => lookup_join_hashmap(
                 map.as_ref(),
-                build_side.left_data.values(),
+                build_side.left_data.values_per_batch(),
+                build_side.left_data.batch_offsets(),
                 &state.values,
                 self.null_equality,
                 &self.hashes_buffer,
@@ -683,8 +688,15 @@ impl HashJoinStream {
                     &mut self.probe_indices_buffer,
                     &mut self.build_indices_buffer,
                 )?;
+                // ArrayMap returns flat indices; convert to packed composite indices
+                let flat_build_indices: UInt64Array =
+                    self.build_indices_buffer.clone().into();
+                let packed_build_indices = super::exec::flat_to_packed_indices(
+                    &flat_build_indices,
+                    build_side.left_data.batch_offsets(),
+                );
                 (
-                    UInt64Array::from(self.build_indices_buffer.clone()),
+                    packed_build_indices,
                     UInt32Array::from(self.probe_indices_buffer.clone()),
                     next_offset,
                 )
@@ -707,7 +719,6 @@ impl HashJoinStream {
         let (left_indices, right_indices) = if let Some(filter) = &self.filter {
             apply_join_filter_to_indices(
                 build_side.left_data.batches(),
-                build_side.left_data.batch_offsets(),
                 &state.batch,
                 left_indices,
                 right_indices,
@@ -721,10 +732,16 @@ impl HashJoinStream {
         };
 
         // mark joined left-side indices as visited, if required by join type
+        // Convert packed indices to flat indices for the bitmap
         if need_produce_result_in_final(self.join_type) {
+            let batch_offsets = build_side.left_data.batch_offsets();
             let mut bitmap = build_side.left_data.visited_indices_bitmap().lock();
             left_indices.iter().flatten().for_each(|x| {
-                bitmap.set_bit(x as usize, true);
+                let packed = x as u64;
+                let batch_idx = (packed >> 32) as usize;
+                let row_idx = (packed & 0xFFFFFFFF) as usize;
+                let flat = batch_offsets[batch_idx] + row_idx;
+                bitmap.set_bit(flat, true);
             });
         }
 
@@ -769,11 +786,9 @@ impl HashJoinStream {
 
         // Build output batch and push to coalescer
         let batch = if self.join_type == JoinType::RightMark {
-            let num_rows = state.batch.num_rows();
             build_batch_from_indices(
                 &self.schema,
                 std::slice::from_ref(&state.batch),
-                &[0, num_rows],
                 &build_side.left_data.batch(),
                 &left_indices,
                 &right_indices,
@@ -785,7 +800,6 @@ impl HashJoinStream {
             build_batch_from_indices(
                 &self.schema,
                 build_side.left_data.batches(),
-                build_side.left_data.batch_offsets(),
                 &state.batch,
                 &left_indices,
                 &right_indices,
@@ -852,11 +866,16 @@ impl HashJoinStream {
         }
 
         // use the global left bitmap to produce the left indices and right indices
-        let (mut left_side, mut right_side) = get_final_indices_from_shared_bitmap(
+        // The bitmap uses flat indices; convert them to packed composite indices
+        // for build_batch_from_indices.
+        let (flat_left_side, mut right_side) = get_final_indices_from_shared_bitmap(
             build_side.left_data.visited_indices_bitmap(),
             self.join_type,
             true,
         );
+        let batch_offsets = build_side.left_data.batch_offsets();
+        let mut left_side =
+            super::exec::flat_to_packed_indices(&flat_left_side, batch_offsets);
 
         // For null-aware anti join, filter out LEFT rows with NULL in join keys
         // BUT only if the probe side (RIGHT) was non-empty. If probe side is empty,
@@ -870,17 +889,20 @@ impl HashJoinStream {
                 .load(Ordering::Relaxed)
         {
             // Since null_aware validation ensures single column join, we only check the first column
-            let build_key_column = &build_side.left_data.values()[0];
+            let values_per_batch = build_side.left_data.values_per_batch();
 
             // Filter out indices where the key is NULL
+            // left_side contains packed indices: (batch_idx << 32) | row_idx
             let filtered_indices: Vec<u64> = left_side
                 .iter()
-                .filter_map(|idx| {
-                    let idx_usize = idx.unwrap() as usize;
-                    if build_key_column.is_null(idx_usize) {
+                .filter_map(|idx: Option<u64>| {
+                    let packed = idx.unwrap();
+                    let batch_idx = (packed >> 32) as usize;
+                    let row_idx = (packed & 0xFFFFFFFF) as usize;
+                    if values_per_batch[batch_idx][0].is_null(row_idx) {
                         None // Skip rows with NULL keys
                     } else {
-                        Some(idx.unwrap())
+                        Some(packed)
                     }
                 })
                 .collect();
@@ -906,7 +928,6 @@ impl HashJoinStream {
             let batch = build_batch_from_indices(
                 &self.schema,
                 build_side.left_data.batches(),
-                build_side.left_data.batch_offsets(),
                 &empty_right_batch,
                 &left_side,
                 &right_side,

@@ -910,10 +910,8 @@ pub(crate) fn get_final_indices_from_bit_map(
     (left_indices, right_indices)
 }
 
-#[expect(clippy::too_many_arguments)]
 pub(crate) fn apply_join_filter_to_indices(
     build_batches: &[RecordBatch],
-    build_batch_offsets: &[usize],
     probe_batch: &RecordBatch,
     build_indices: UInt64Array,
     probe_indices: UInt32Array,
@@ -936,7 +934,6 @@ pub(crate) fn apply_join_filter_to_indices(
             let intermediate_batch = build_batch_from_indices(
                 filter.schema(),
                 build_batches,
-                build_batch_offsets,
                 probe_batch,
                 &build_indices.slice(i, len),
                 &probe_indices.slice(i, len),
@@ -959,7 +956,6 @@ pub(crate) fn apply_join_filter_to_indices(
         let intermediate_batch = build_batch_from_indices(
             filter.schema(),
             build_batches,
-            build_batch_offsets,
             probe_batch,
             &build_indices,
             &probe_indices,
@@ -995,20 +991,17 @@ fn new_empty_schema_batch(schema: &Schema, row_count: usize) -> Result<RecordBat
     )?)
 }
 
-/// Convert flat row indices into (batch_index, row_index) pairs using
-/// the batch_offsets prefix-sum array.
-fn flat_indices_to_interleave(
-    build_indices: &UInt64Array,
-    batch_offsets: &[usize],
-) -> Vec<(usize, usize)> {
+/// Decode packed composite indices into (batch_index, row_index) pairs.
+///
+/// Each u64 value encodes `(batch_idx << 32) | row_idx`.
+/// For single-batch cases (batch_idx == 0), the packed value equals the row index.
+fn packed_indices_to_interleave(build_indices: &UInt64Array) -> Vec<(usize, usize)> {
     build_indices
         .values()
         .iter()
-        .map(|&flat_idx| {
-            let flat = flat_idx as usize;
-            // Binary search to find which batch this flat index belongs to
-            let batch_idx = batch_offsets.partition_point(|&o| o <= flat) - 1;
-            let row_idx = flat - batch_offsets[batch_idx];
+        .map(|&packed| {
+            let batch_idx = (packed >> 32) as usize;
+            let row_idx = (packed & 0xFFFFFFFF) as usize;
             (batch_idx, row_idx)
         })
         .collect()
@@ -1017,13 +1010,13 @@ fn flat_indices_to_interleave(
 /// Returns a new [RecordBatch] by combining the `left` and `right` according to `indices`.
 /// The resulting batch has [Schema] `schema`.
 ///
+/// Build-side indices are packed composite keys: `(batch_idx << 32) | row_idx`.
 /// Build-side columns are gathered from multiple batches using `interleave`,
 /// avoiding the need to `concat_batches` the entire build side upfront.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn build_batch_from_indices(
     schema: &Schema,
     build_batches: &[RecordBatch],
-    build_batch_offsets: &[usize],
     probe_batch: &RecordBatch,
     build_indices: &UInt64Array,
     probe_indices: &UInt32Array,
@@ -1039,19 +1032,13 @@ pub(crate) fn build_batch_from_indices(
         return new_empty_schema_batch(schema, row_count);
     }
 
-    // For a single batch, use take() directly (no index conversion overhead).
-    // For multiple batches, pre-compute interleave indices.
-    let use_single_batch = build_batches.len() == 1;
-    let interleave_indices = if !use_single_batch
-        && !build_batches.is_empty()
-        && build_indices.null_count() != build_indices.len()
+    // Pre-compute interleave indices for build-side columns (shared across all build columns)
+    let interleave_indices = if build_batches.is_empty()
+        || build_indices.null_count() == build_indices.len()
     {
-        Some(flat_indices_to_interleave(
-            build_indices,
-            build_batch_offsets,
-        ))
-    } else {
         None
+    } else {
+        Some(packed_indices_to_interleave(build_indices))
     };
 
     let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
@@ -1060,25 +1047,8 @@ pub(crate) fn build_batch_from_indices(
         let array = if column_index.side == JoinSide::None {
             Arc::new(compute::is_not_null(probe_indices)?)
         } else if column_index.side == build_side {
-            if build_batches.is_empty()
-                || build_indices.null_count() == build_indices.len()
-            {
-                // All build indices are null (outer join with no matches)
-                let data_type = if build_batches.is_empty() {
-                    schema.field(column_index.index).data_type().clone()
-                } else {
-                    build_batches[0]
-                        .column(column_index.index)
-                        .data_type()
-                        .clone()
-                };
-                new_null_array(&data_type, build_indices.len())
-            } else if use_single_batch {
-                // Fast path: single batch, use take() directly (no conversion)
-                let array = build_batches[0].column(column_index.index);
-                take(array.as_ref(), build_indices, None)?
-            } else if let Some(ref il_indices) = interleave_indices {
-                // Multi-batch path: gather from all build batches via interleave
+            if let Some(ref il_indices) = interleave_indices {
+                // Gather column arrays from all build batches
                 let arrays: Vec<&dyn Array> = build_batches
                     .iter()
                     .map(|b| b.column(column_index.index).as_ref())
@@ -1108,9 +1078,16 @@ pub(crate) fn build_batch_from_indices(
                     result
                 }
             } else {
-                unreachable!(
-                    "interleave_indices should be Some for multi-batch non-null case"
-                )
+                // All build indices are null (outer join with no matches)
+                let data_type = if build_batches.is_empty() {
+                    schema.field(column_index.index).data_type().clone()
+                } else {
+                    build_batches[0]
+                        .column(column_index.index)
+                        .data_type()
+                        .clone()
+                };
+                new_null_array(&data_type, build_indices.len())
             }
         } else {
             let array = probe_batch.column(column_index.index);
@@ -1840,34 +1817,73 @@ pub fn update_hash(
     Ok(())
 }
 
+/// Compares build-side and probe-side key columns for equality, filtering
+/// out non-matching rows after hash collision resolution.
+///
+/// Build-side indices are packed composite keys: `(batch_idx << 32) | row_idx`.
+/// `left_arrays_per_batch[batch_idx][key_idx]` holds key columns per batch.
+///
+/// For single-batch builds (the common case), uses `take` directly since
+/// batch_idx == 0 means packed values equal row indices. For multi-batch
+/// builds, uses `interleave` to gather from the correct batches.
 pub(super) fn equal_rows_arr(
     indices_left: &UInt64Array,
     indices_right: &UInt32Array,
-    left_arrays: &[ArrayRef],
+    left_arrays_per_batch: &[Vec<ArrayRef>],
     right_arrays: &[ArrayRef],
     null_equality: NullEquality,
 ) -> Result<(UInt64Array, UInt32Array)> {
-    let mut iter = left_arrays.iter().zip(right_arrays.iter());
+    if left_arrays_per_batch.is_empty() || right_arrays.is_empty() {
+        return Err(DataFusionError::Internal(
+            "At least one array should be provided for both left and right".to_string(),
+        ));
+    }
 
-    let Some((first_left, first_right)) = iter.next() else {
-        return Ok((Vec::<u64>::new().into(), Vec::<u32>::new().into()));
+    let num_keys = right_arrays.len();
+
+    // Gather left-side key values using packed indices
+    let gather_left_key = |key_idx: usize| -> Result<ArrayRef> {
+        if left_arrays_per_batch.len() == 1 {
+            // Single batch: packed value == row index (batch_idx is 0),
+            // so we can use take directly with UInt32 indices.
+            let row_indices: UInt32Array =
+                indices_left.values().iter().map(|&v| v as u32).collect();
+            Ok(take(
+                left_arrays_per_batch[0][key_idx].as_ref(),
+                &row_indices,
+                None,
+            )?)
+        } else {
+            // Multiple batches: decode packed indices and use interleave
+            let arrays: Vec<&dyn Array> = left_arrays_per_batch
+                .iter()
+                .map(|batch_keys| batch_keys[key_idx].as_ref())
+                .collect();
+            let il_indices: Vec<(usize, usize)> = indices_left
+                .values()
+                .iter()
+                .map(|&packed| {
+                    let batch_idx = (packed >> 32) as usize;
+                    let row_idx = (packed & 0xFFFFFFFF) as usize;
+                    (batch_idx, row_idx)
+                })
+                .collect();
+            Ok(compute::interleave(&arrays, &il_indices)?)
+        }
     };
 
-    let arr_left = take(first_left.as_ref(), indices_left, None)?;
-    let arr_right = take(first_right.as_ref(), indices_right, None)?;
+    let arr_left = gather_left_key(0)?;
+    let arr_right = take(right_arrays[0].as_ref(), indices_right, None)?;
 
     let mut equal: BooleanArray = eq_dyn_null(&arr_left, &arr_right, null_equality)?;
 
-    // Use map and try_fold to iterate over the remaining pairs of arrays.
-    // In each iteration, take is used on the pair of arrays and their equality is determined.
-    // The results are then folded (combined) using the and function to get a final equality result.
-    equal = iter
-        .map(|(left, right)| {
-            let arr_left = take(left.as_ref(), indices_left, None)?;
-            let arr_right = take(right.as_ref(), indices_right, None)?;
-            eq_dyn_null(arr_left.as_ref(), arr_right.as_ref(), null_equality)
-        })
-        .try_fold(equal, |acc, equal2| and(&acc, &equal2?))?;
+    for key_idx in 1..num_keys {
+        let arr_left = gather_left_key(key_idx)?;
+        let arr_right = take(right_arrays[key_idx].as_ref(), indices_right, None)?;
+        let eq_result =
+            eq_dyn_null(arr_left.as_ref(), arr_right.as_ref(), null_equality)?;
+        equal = and(&equal, &eq_result)?;
+    }
 
     let filter_builder = FilterBuilder::new(&equal).optimize().build();
 
