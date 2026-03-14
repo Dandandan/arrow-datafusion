@@ -1319,6 +1319,93 @@ impl ExecutionPlan for HashJoinExec {
         let array_map_created_count = MetricBuilder::new(&self.metrics)
             .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, partition);
 
+        let batch_size = context.session_config().batch_size();
+
+        // Check if adaptive join switching is enabled
+        let adaptive_threshold = context
+            .session_config()
+            .options()
+            .optimizer
+            .hash_join_adaptive_threshold;
+
+        // Adaptive mode is enabled when:
+        // - threshold > 0
+        // - not null_aware (too complex for initial impl)
+        // - no dynamic filter pushdown (incompatible with side switching)
+        // - For CollectLeft: only when right has 1 partition (otherwise the left
+        //   side must be shared across partitions via OnceFut)
+        let use_adaptive = adaptive_threshold > 0
+            && !self.null_aware
+            && !enable_dynamic_filter_pushdown
+            && (self.mode == PartitionMode::Partitioned || right_partitions == 1);
+
+        if use_adaptive {
+            // Adaptive mode: pass both streams to HashJoinStream
+            let left_partition = match self.mode {
+                PartitionMode::CollectLeft => 0,
+                PartitionMode::Partitioned => partition,
+                PartitionMode::Auto => {
+                    return plan_err!(
+                        "Invalid HashJoinExec, unsupported PartitionMode {:?} in execute()",
+                        PartitionMode::Auto
+                    );
+                }
+            };
+            let left_stream = self.left.execute(left_partition, Arc::clone(&context))?;
+            let right_stream = self.right.execute(partition, Arc::clone(&context))?;
+
+            // update column indices to reflect the projection
+            let column_indices_after_projection = match self.projection.as_ref() {
+                Some(projection) => projection
+                    .iter()
+                    .map(|i| self.column_indices[*i].clone())
+                    .collect(),
+                None => self.column_indices.clone(),
+            };
+
+            let on_right = self
+                .on
+                .iter()
+                .map(|(_, right_expr)| Arc::clone(right_expr))
+                .collect::<Vec<_>>();
+
+            // Use a dummy OnceFut that will never be polled (adaptive mode skips WaitBuildSide)
+            let dummy_fut = OnceFut::new(async {
+                internal_err!("adaptive mode should not poll left_fut")
+            });
+
+            return Ok(Box::pin(HashJoinStream::new(
+                partition,
+                self.schema(),
+                on_right,
+                self.filter.clone(),
+                self.join_type,
+                right_stream,
+                self.random_state.random_state().clone(),
+                join_metrics,
+                column_indices_after_projection,
+                self.null_equality,
+                HashJoinStreamState::AdaptiveCollectLeft,
+                BuildSide::Initial(BuildSideInitialState {
+                    left_fut: dummy_fut,
+                }),
+                batch_size,
+                vec![],
+                self.right.output_ordering().is_some(),
+                None, // no build_accumulator in adaptive mode
+                self.mode,
+                self.null_aware,
+                self.fetch,
+                Some(left_stream),
+                on_left,
+                adaptive_threshold,
+                Some(Arc::clone(context.session_config().options())),
+                Some(array_map_created_count),
+                Some(Arc::clone(context.memory_pool())),
+            )));
+        }
+
+        // Non-adaptive (normal) path
         let left_fut = match self.mode {
             PartitionMode::CollectLeft => self.left_fut.try_once(|| {
                 let left_stream = self.left.execute(0, Arc::clone(&context))?;
@@ -1369,8 +1456,6 @@ impl ExecutionPlan for HashJoinExec {
             }
         };
 
-        let batch_size = context.session_config().batch_size();
-
         // Initialize build_accumulator lazily with runtime partition counts (only if enabled)
         // Use RepartitionExec's random state (seeds: 0,0,0,0) for partition routing
         let repartition_random_state = REPARTITION_RANDOM_STATE;
@@ -1400,7 +1485,7 @@ impl ExecutionPlan for HashJoinExec {
 
         // we have the batches and the hash map with their keys. We can how create a stream
         // over the right that uses this information to issue new batches.
-        let right_stream = self.right.execute(partition, context)?;
+        let right_stream = self.right.execute(partition, Arc::clone(&context))?;
 
         // update column indices to reflect the projection
         let column_indices_after_projection = match self.projection.as_ref() {
@@ -1437,6 +1522,12 @@ impl ExecutionPlan for HashJoinExec {
             self.mode,
             self.null_aware,
             self.fetch,
+            None, // no left_stream in normal mode
+            on_left,
+            0,    // adaptive_threshold = 0 (disabled)
+            None, // no config needed in normal mode
+            None, // no array_map_created_count in normal mode
+            None, // no memory_pool in normal mode
         )))
     }
 
@@ -2092,6 +2183,157 @@ async fn collect_left_input(
     };
 
     Ok(data)
+}
+
+/// Build a [`JoinLeftData`] from pre-collected batches.
+///
+/// This is a simplified version of `collect_left_input` used by the adaptive
+/// join switching logic. It builds a hash map from the given batches using
+/// the standard HashMap path (no ArrayMap/perfect hash, no dynamic filter pushdown).
+pub(super) fn build_join_left_data(
+    batches: Vec<RecordBatch>,
+    on_exprs: &[PhysicalExprRef],
+    random_state: &RandomState,
+    metrics: &BuildProbeJoinMetrics,
+    join_type: JoinType,
+    null_equality: NullEquality,
+    config: &ConfigOptions,
+    array_map_created_count: &Count,
+    memory_pool: &Arc<dyn datafusion_execution::memory_pool::MemoryPool>,
+) -> Result<Arc<JoinLeftData>> {
+    let mut reservation = MemoryConsumer::new("HashJoinInput").register(memory_pool);
+
+    let num_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    if batches.is_empty() || num_rows == 0 {
+        let schema = if let Some(b) = batches.first() {
+            b.schema()
+        } else {
+            Arc::new(Schema::empty())
+        };
+        let empty_batch = RecordBatch::new_empty(schema);
+        let hashmap: Box<dyn JoinHashMapType> =
+            Box::new(JoinHashMapU32::with_capacity(0));
+        let map = Arc::new(Map::HashMap(hashmap));
+        let visited_indices_bitmap = BooleanBufferBuilder::new(0);
+        return Ok(Arc::new(JoinLeftData {
+            map,
+            batch: empty_batch,
+            values: vec![],
+            visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
+            probe_threads_counter: AtomicUsize::new(1),
+            _reservation: reservation,
+            bounds: None,
+            membership: PushdownStrategy::Empty,
+            probe_side_non_empty: AtomicBool::new(false),
+            probe_side_has_null: AtomicBool::new(false),
+        }));
+    }
+
+    let schema = batches[0].schema();
+
+    // Try to compute bounds for ArrayMap
+    let should_collect_min_max =
+        should_collect_min_max_for_perfect_hash(on_exprs, &schema)?;
+    let bounds = if should_collect_min_max && num_rows > 0 {
+        let mut accumulators = on_exprs
+            .iter()
+            .map(|expr| CollectLeftAccumulator::try_new(Arc::clone(expr), &schema))
+            .collect::<Result<Vec<_>>>()?;
+        for batch in &batches {
+            for acc in &mut accumulators {
+                acc.update_batch(batch)?;
+            }
+        }
+        let bounds = accumulators
+            .into_iter()
+            .map(CollectLeftAccumulator::evaluate)
+            .collect::<Result<Vec<_>>>()?;
+        Some(PartitionBounds::new(bounds))
+    } else {
+        None
+    };
+
+    // Try ArrayMap first
+    let (join_hash_map, batch, values) = if let Some((array_map, batch, left_value)) =
+        try_create_array_map(
+            &bounds,
+            &schema,
+            &batches,
+            on_exprs,
+            &mut reservation,
+            config.execution.perfect_hash_join_small_build_threshold,
+            config.execution.perfect_hash_join_min_key_density,
+            null_equality,
+        )? {
+        array_map_created_count.add(1);
+        metrics.build_mem_used.add(array_map.size());
+        (Map::ArrayMap(array_map), batch, left_value)
+    } else {
+        let fixed_size_u32 = size_of::<JoinHashMapU32>();
+        let fixed_size_u64 = size_of::<JoinHashMapU64>();
+
+        let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
+            let estimated_hashtable_size =
+                estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+            metrics.build_mem_used.add(estimated_hashtable_size);
+            Box::new(JoinHashMapU64::with_capacity(num_rows))
+        } else {
+            let estimated_hashtable_size =
+                estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+            metrics.build_mem_used.add(estimated_hashtable_size);
+            Box::new(JoinHashMapU32::with_capacity(num_rows))
+        };
+
+        let mut hashes_buffer = Vec::new();
+        let mut offset = 0;
+
+        let batches_iter = batches.iter().rev();
+        for batch in batches_iter.clone() {
+            hashes_buffer.clear();
+            hashes_buffer.resize(batch.num_rows(), 0);
+            update_hash(
+                on_exprs,
+                batch,
+                &mut *hashmap,
+                offset,
+                random_state,
+                &mut hashes_buffer,
+                0,
+                true,
+            )?;
+            offset += batch.num_rows();
+        }
+
+        let batch = concat_batches(&schema, batches_iter.clone())?;
+        let values = evaluate_expressions_to_arrays(on_exprs, &batch)?;
+
+        (Map::HashMap(hashmap), batch, values)
+    };
+
+    let map = Arc::new(join_hash_map);
+
+    let with_visited = need_produce_result_in_final(join_type);
+    let visited_indices_bitmap = if with_visited {
+        let mut bbb = BooleanBufferBuilder::new(batch.num_rows());
+        bbb.append_n(num_rows, false);
+        bbb
+    } else {
+        BooleanBufferBuilder::new(0)
+    };
+
+    Ok(Arc::new(JoinLeftData {
+        map,
+        batch,
+        values,
+        visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
+        probe_threads_counter: AtomicUsize::new(1),
+        _reservation: reservation,
+        bounds: None,
+        membership: PushdownStrategy::Empty,
+        probe_side_non_empty: AtomicBool::new(false),
+        probe_side_has_null: AtomicBool::new(false),
+    }))
 }
 
 #[cfg(test)]
@@ -5963,5 +6205,358 @@ mod tests {
         assert_eq!(lr_is_preserved(JoinType::RightSemi), (true, true));
         assert_eq!(lr_is_preserved(JoinType::RightAnti), (true, true));
         assert_eq!(lr_is_preserved(JoinType::RightMark), (false, true));
+    }
+
+    /// Helper to create a task context with adaptive join switching enabled.
+    fn prepare_adaptive_task_ctx(threshold: usize) -> Arc<TaskContext> {
+        let mut session_config = SessionConfig::default().with_batch_size(8192);
+        session_config
+            .options_mut()
+            .optimizer
+            .hash_join_adaptive_threshold = threshold;
+        Arc::new(TaskContext::default().with_session_config(session_config))
+    }
+
+    /// Test: left side is small (below threshold), no swap occurs.
+    #[tokio::test]
+    async fn adaptive_no_swap_left_small() -> Result<()> {
+        // Left: small table (3 rows), Right: larger table (4 rows)
+        let left = build_table(
+            ("a1", &vec![1, 2, 3]),
+            ("b1", &vec![4, 5, 7]),
+            ("c1", &vec![7, 8, 100]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30, 40]),
+            ("b1", &vec![4, 5, 6, 7]),
+            ("c2", &vec![70, 80, 90, 100]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        // Use a very large threshold so both sides fit -> left builds (no swap)
+        let ctx = prepare_adaptive_task_ctx(64 * 1024 * 1024);
+
+        let join = join(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        )?;
+        let stream = join.execute(0, ctx)?;
+        let batches = common::collect(stream).await?;
+
+        let expected = [
+            "+----+----+-----+----+----+-----+",
+            "| a1 | b1 | c1  | a2 | b1 | c2  |",
+            "+----+----+-----+----+----+-----+",
+            "| 1  | 4  | 7   | 10 | 4  | 70  |",
+            "| 2  | 5  | 8   | 20 | 5  | 80  |",
+            "| 3  | 7  | 100 | 40 | 7  | 100 |",
+            "+----+----+-----+----+----+-----+",
+        ];
+        assert_batches_sorted_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    /// Test: left side is larger than right, adaptive switches to build from right.
+    #[tokio::test]
+    async fn adaptive_swap_right_smaller() -> Result<()> {
+        // Left: larger table, Right: smaller table
+        // Use threshold = 1 byte so left immediately exceeds it
+        let left = build_table(
+            ("a1", &vec![1, 2, 3, 4, 5]),
+            ("b1", &vec![4, 5, 6, 7, 8]),
+            ("c1", &vec![10, 20, 30, 40, 50]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20]),
+            ("b1", &vec![4, 5]),
+            ("c2", &vec![70, 80]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        // Threshold = 1 byte forces left to exceed immediately, right is small -> swap
+        let ctx = prepare_adaptive_task_ctx(1);
+
+        let join = join(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        )?;
+        let stream = join.execute(0, ctx)?;
+        let batches = common::collect(stream).await?;
+
+        let expected = [
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b1 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 1  | 4  | 10 | 10 | 4  | 70 |",
+            "| 2  | 5  | 20 | 20 | 5  | 80 |",
+            "+----+----+----+----+----+----+",
+        ];
+        assert_batches_sorted_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    /// Test: both sides exceed threshold, falls back to building from left.
+    #[tokio::test]
+    async fn adaptive_both_big_fallback_left() -> Result<()> {
+        // Both sides are "big" (threshold = 1 byte)
+        let left = build_table(
+            ("a1", &vec![1, 2, 3]),
+            ("b1", &vec![4, 5, 7]),
+            ("c1", &vec![7, 8, 100]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30, 40]),
+            ("b1", &vec![4, 5, 6, 7]),
+            ("c2", &vec![70, 80, 90, 100]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        // Both sides > 1 byte, so no swap, fallback to left build
+        // But wait: left goes first. After left exceeds threshold, we scan right.
+        // Right also exceeds, so we finish left and build from left.
+        // However, with threshold=1, the first batch from left exceeds it.
+        // Then we scan right - first batch exceeds too.
+        // So we finish left and build from left.
+        // Actually right only has 1 batch, so if it exceeds threshold too -> fallback.
+        // Let me use a threshold of 1 byte to ensure both exceed.
+        let ctx = prepare_adaptive_task_ctx(1);
+
+        let join = join(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        )?;
+        let stream = join.execute(0, ctx)?;
+        let batches = common::collect(stream).await?;
+
+        let expected = [
+            "+----+----+-----+----+----+-----+",
+            "| a1 | b1 | c1  | a2 | b1 | c2  |",
+            "+----+----+-----+----+----+-----+",
+            "| 1  | 4  | 7   | 10 | 4  | 70  |",
+            "| 2  | 5  | 8   | 20 | 5  | 80  |",
+            "| 3  | 7  | 100 | 40 | 7  | 100 |",
+            "+----+----+-----+----+----+-----+",
+        ];
+        assert_batches_sorted_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    /// Test: adaptive with LeftJoin and swap - verifies join type semantics
+    #[tokio::test]
+    async fn adaptive_swap_left_join() -> Result<()> {
+        // Left has more data, right is small, threshold=1 forces swap
+        let left = build_table(
+            ("a1", &vec![1, 2, 3, 4]),
+            ("b1", &vec![4, 5, 6, 7]),
+            ("c1", &vec![10, 20, 30, 40]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20]),
+            ("b1", &vec![4, 5]),
+            ("c2", &vec![70, 80]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        let ctx = prepare_adaptive_task_ctx(1);
+
+        let join_exec = HashJoinExec::try_new(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on,
+            None,
+            &JoinType::Left,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        let stream = join_exec.execute(0, ctx)?;
+        let batches = common::collect(stream).await?;
+
+        // Left join: all left rows should appear, with NULLs for non-matching right
+        let expected = [
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b1 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 1  | 4  | 10 | 10 | 4  | 70 |",
+            "| 2  | 5  | 20 | 20 | 5  | 80 |",
+            "| 3  | 6  | 30 |    |    |    |",
+            "| 4  | 7  | 40 |    |    |    |",
+            "+----+----+----+----+----+----+",
+        ];
+        assert_batches_sorted_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    /// Test: adaptive with RightJoin and swap
+    #[tokio::test]
+    async fn adaptive_swap_right_join() -> Result<()> {
+        let left = build_table(
+            ("a1", &vec![1, 2, 3, 4]),
+            ("b1", &vec![4, 5, 6, 7]),
+            ("c1", &vec![10, 20, 30, 40]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20]),
+            ("b1", &vec![4, 5]),
+            ("c2", &vec![70, 80]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        let ctx = prepare_adaptive_task_ctx(1);
+
+        let join_exec = HashJoinExec::try_new(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on,
+            None,
+            &JoinType::Right,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        let stream = join_exec.execute(0, ctx)?;
+        let batches = common::collect(stream).await?;
+
+        // Right join: all right rows should appear
+        let expected = [
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b1 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 1  | 4  | 10 | 10 | 4  | 70 |",
+            "| 2  | 5  | 20 | 20 | 5  | 80 |",
+            "+----+----+----+----+----+----+",
+        ];
+        assert_batches_sorted_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    /// Test: adaptive with FullJoin and swap
+    #[tokio::test]
+    async fn adaptive_swap_full_join() -> Result<()> {
+        let left = build_table(
+            ("a1", &vec![1, 2, 3, 4]),
+            ("b1", &vec![4, 5, 6, 7]),
+            ("c1", &vec![10, 20, 30, 40]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30]),
+            ("b1", &vec![4, 5, 8]),
+            ("c2", &vec![70, 80, 90]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        let ctx = prepare_adaptive_task_ctx(1);
+
+        let join_exec = HashJoinExec::try_new(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on,
+            None,
+            &JoinType::Full,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        let stream = join_exec.execute(0, ctx)?;
+        let batches = common::collect(stream).await?;
+
+        // Full join: all rows from both sides
+        let expected = [
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b1 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 1  | 4  | 10 | 10 | 4  | 70 |",
+            "| 2  | 5  | 20 | 20 | 5  | 80 |",
+            "| 3  | 6  | 30 |    |    |    |",
+            "| 4  | 7  | 40 |    |    |    |",
+            "|    |    |    | 30 | 8  | 90 |",
+            "+----+----+----+----+----+----+",
+        ];
+        assert_batches_sorted_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    /// Test: adaptive with Partitioned mode
+    #[tokio::test]
+    async fn adaptive_partitioned_inner_join() -> Result<()> {
+        let left = build_table(
+            ("a1", &vec![1, 2, 3]),
+            ("b1", &vec![4, 5, 7]),
+            ("c1", &vec![7, 8, 100]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30, 40]),
+            ("b1", &vec![4, 5, 6, 7]),
+            ("c2", &vec![70, 80, 90, 100]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        let ctx = prepare_adaptive_task_ctx(64 * 1024 * 1024);
+
+        let join_exec = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::Partitioned,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        let stream = join_exec.execute(0, ctx)?;
+        let batches = common::collect(stream).await?;
+
+        let expected = [
+            "+----+----+-----+----+----+-----+",
+            "| a1 | b1 | c1  | a2 | b1 | c2  |",
+            "+----+----+-----+----+----+-----+",
+            "| 1  | 4  | 7   | 10 | 4  | 70  |",
+            "| 2  | 5  | 8   | 20 | 5  | 80  |",
+            "| 3  | 7  | 100 | 40 | 7  | 100 |",
+            "+----+----+-----+----+----+-----+",
+        ];
+        assert_batches_sorted_eq!(expected, &batches);
+
+        Ok(())
     }
 }

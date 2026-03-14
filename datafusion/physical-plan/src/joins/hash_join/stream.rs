@@ -20,10 +20,12 @@
 //! This module implements [`HashJoinStream`], the streaming engine for
 //! [`super::HashJoinExec`]. See comments in [`HashJoinStream`] for more details.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::Poll;
 
+use crate::EmptyRecordBatchStream;
 use crate::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
 use crate::joins::Map;
 use crate::joins::MapOffset;
@@ -35,6 +37,7 @@ use crate::joins::hash_join::shared_bounds::{
 use crate::joins::utils::{
     OnceFut, equal_rows_arr, get_final_indices_from_shared_bitmap,
 };
+use crate::spill::get_record_batch_memory_size;
 use crate::{
     RecordBatchStream, SendableRecordBatchStream, handle_state,
     hash_utils::create_hashes,
@@ -127,6 +130,12 @@ pub(super) enum HashJoinStreamState {
     WaitBuildSide,
     /// Waiting for bounds to be reported by all partitions
     WaitPartitionBoundsReport,
+    /// Adaptive mode: scanning left side up to threshold
+    AdaptiveCollectLeft,
+    /// Adaptive mode: left exceeded threshold, scanning right side
+    AdaptiveCollectRight,
+    /// Adaptive mode: both sides big, finish collecting left
+    AdaptiveBuildFromLeft,
     /// Indicates that build-side has been collected, and stream is ready for fetching probe-side
     FetchProbeBatch,
     /// Indicates that non-empty batch has been fetched from probe-side, and is ready to be processed
@@ -226,6 +235,31 @@ pub(super) struct HashJoinStream {
     output_buffer: LimitedBatchCoalescer,
     /// Whether this is a null-aware anti join
     null_aware: bool,
+    // --- Adaptive join switching fields ---
+    /// Left (build) stream, only populated in adaptive mode
+    left_stream: Option<SendableRecordBatchStream>,
+    /// Left-side join key expressions for adaptive mode
+    on_left: Vec<PhysicalExprRef>,
+    /// Size threshold for adaptive switching (0 = disabled)
+    adaptive_threshold: usize,
+    /// Collected left batches during adaptive scanning
+    adaptive_left_batches: Vec<RecordBatch>,
+    /// Total bytes collected from left side
+    adaptive_left_bytes: usize,
+    /// Collected right batches during adaptive scanning
+    adaptive_right_batches: Vec<RecordBatch>,
+    /// Total bytes collected from right side
+    adaptive_right_bytes: usize,
+    /// Whether the build/probe sides have been swapped
+    swapped: bool,
+    /// Session config options for adaptive mode (ArrayMap thresholds, etc.)
+    config: Option<Arc<datafusion_common::config::ConfigOptions>>,
+    /// Counter for ArrayMap creations (adaptive mode)
+    array_map_created_count: Option<crate::metrics::Count>,
+    /// Memory pool for adaptive mode reservation
+    memory_pool: Option<Arc<dyn datafusion_execution::memory_pool::MemoryPool>>,
+    /// Memory reservation for adaptive batch collection
+    adaptive_reservation: Option<datafusion_execution::memory_pool::MemoryReservation>,
 }
 
 impl RecordBatchStream for HashJoinStream {
@@ -375,6 +409,12 @@ impl HashJoinStream {
         mode: PartitionMode,
         null_aware: bool,
         fetch: Option<usize>,
+        left_stream: Option<SendableRecordBatchStream>,
+        on_left: Vec<PhysicalExprRef>,
+        adaptive_threshold: usize,
+        config: Option<Arc<datafusion_common::config::ConfigOptions>>,
+        array_map_created_count: Option<crate::metrics::Count>,
+        memory_pool: Option<Arc<dyn datafusion_execution::memory_pool::MemoryPool>>,
     ) -> Self {
         // Create output buffer with coalescing and optional fetch limit.
         let output_buffer =
@@ -403,6 +443,25 @@ impl HashJoinStream {
             mode,
             output_buffer,
             null_aware,
+            left_stream,
+            on_left,
+            adaptive_threshold,
+            adaptive_left_batches: Vec::new(),
+            adaptive_left_bytes: 0,
+            adaptive_right_batches: Vec::new(),
+            adaptive_right_bytes: 0,
+            swapped: false,
+            adaptive_reservation: memory_pool.as_ref().map(|pool| {
+                let name = match mode {
+                    PartitionMode::CollectLeft => "HashJoinInput".to_string(),
+                    _ => format!("HashJoinInput[{partition}]"),
+                };
+                datafusion_execution::memory_pool::MemoryConsumer::new(name)
+                    .register(pool)
+            }),
+            config,
+            array_map_created_count,
+            memory_pool,
         }
     }
 
@@ -432,6 +491,15 @@ impl HashJoinStream {
                 }
                 HashJoinStreamState::WaitPartitionBoundsReport => {
                     handle_state!(ready!(self.wait_for_partition_bounds_report(cx)))
+                }
+                HashJoinStreamState::AdaptiveCollectLeft => {
+                    handle_state!(ready!(self.adaptive_collect_left(cx)))
+                }
+                HashJoinStreamState::AdaptiveCollectRight => {
+                    handle_state!(ready!(self.adaptive_collect_right(cx)))
+                }
+                HashJoinStreamState::AdaptiveBuildFromLeft => {
+                    handle_state!(ready!(self.adaptive_build_from_left(cx)))
                 }
                 HashJoinStreamState::FetchProbeBatch => {
                     handle_state!(ready!(self.fetch_probe_batch(cx)))
@@ -643,6 +711,12 @@ impl HashJoinStream {
             }
         }
 
+        let effective_join_type_for_empty = if self.swapped {
+            self.join_type.swap()
+        } else {
+            self.join_type
+        };
+
         // if the left side is empty, we can skip the (potentially expensive) join operation
         let is_empty = build_side.left_data.map().is_empty();
 
@@ -652,7 +726,7 @@ impl HashJoinStream {
                 build_side.left_data.batch(),
                 &state.batch,
                 &self.column_indices,
-                self.join_type,
+                effective_join_type_for_empty,
             )?;
             timer.done();
             self.output_buffer.push_batch(result)?;
@@ -703,6 +777,17 @@ impl HashJoinStream {
             .avg_fanout
             .add_total(distinct_right_indices_count);
 
+        let effective_build_side = if self.swapped {
+            JoinSide::Right
+        } else {
+            JoinSide::Left
+        };
+        let effective_join_type = if self.swapped {
+            self.join_type.swap()
+        } else {
+            self.join_type
+        };
+
         // apply join filter if exists
         let (left_indices, right_indices) = if let Some(filter) = &self.filter {
             apply_join_filter_to_indices(
@@ -711,16 +796,16 @@ impl HashJoinStream {
                 left_indices,
                 right_indices,
                 filter,
-                JoinSide::Left,
+                effective_build_side,
                 None,
-                self.join_type,
+                effective_join_type,
             )?
         } else {
             (left_indices, right_indices)
         };
 
         // mark joined left-side indices as visited, if required by join type
-        if need_produce_result_in_final(self.join_type) {
+        if need_produce_result_in_final(effective_join_type) {
             let mut bitmap = build_side.left_data.visited_indices_bitmap().lock();
             left_indices.iter().flatten().for_each(|x| {
                 bitmap.set_bit(x as usize, true);
@@ -762,16 +847,20 @@ impl HashJoinStream {
             left_indices,
             right_indices,
             index_alignment_range_start..index_alignment_range_end,
-            self.join_type,
+            effective_join_type,
             self.right_side_ordered,
         )?;
 
         // Build output batch and push to coalescer
         let (build_batch, probe_batch, join_side) =
-            if self.join_type == JoinType::RightMark {
+            if effective_join_type == JoinType::RightMark {
                 (&state.batch, build_side.left_data.batch(), JoinSide::Right)
             } else {
-                (build_side.left_data.batch(), &state.batch, JoinSide::Left)
+                (
+                    build_side.left_data.batch(),
+                    &state.batch,
+                    effective_build_side,
+                )
             };
 
         let batch = build_batch_from_indices(
@@ -782,7 +871,7 @@ impl HashJoinStream {
             &right_indices,
             &self.column_indices,
             join_side,
-            self.join_type,
+            effective_join_type,
         )?;
 
         let push_status = self.output_buffer.push_batch(batch)?;
@@ -817,7 +906,13 @@ impl HashJoinStream {
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
         let timer = self.join_metrics.join_time.timer();
 
-        if !need_produce_result_in_final(self.join_type) {
+        let effective_join_type = if self.swapped {
+            self.join_type.swap()
+        } else {
+            self.join_type
+        };
+
+        if !need_produce_result_in_final(effective_join_type) {
             self.state = HashJoinStreamState::Completed;
             return Ok(StatefulStreamResult::Continue);
         }
@@ -844,7 +939,7 @@ impl HashJoinStream {
         // use the global left bitmap to produce the left indices and right indices
         let (mut left_side, mut right_side) = get_final_indices_from_shared_bitmap(
             build_side.left_data.visited_indices_bitmap(),
-            self.join_type,
+            effective_join_type,
             true,
         );
 
@@ -853,7 +948,7 @@ impl HashJoinStream {
         // NULL NOT IN (empty) = TRUE, so NULL rows should be returned.
         // Use shared atomic state to get global knowledge across all partitions
         if self.null_aware
-            && self.join_type == JoinType::LeftAnti
+            && effective_join_type == JoinType::LeftAnti
             && build_side
                 .left_data
                 .probe_side_non_empty
@@ -890,6 +985,12 @@ impl HashJoinStream {
 
         self.state = HashJoinStreamState::Completed;
 
+        let effective_build_side = if self.swapped {
+            JoinSide::Right
+        } else {
+            JoinSide::Left
+        };
+
         // Push final unmatched indices to output buffer
         if !left_side.is_empty() {
             let empty_right_batch = RecordBatch::new_empty(self.right.schema());
@@ -900,8 +1001,8 @@ impl HashJoinStream {
                 &left_side,
                 &right_side,
                 &self.column_indices,
-                JoinSide::Left,
-                self.join_type,
+                effective_build_side,
+                effective_join_type,
             )?;
             let push_status = self.output_buffer.push_batch(batch)?;
 
@@ -912,6 +1013,225 @@ impl HashJoinStream {
         }
 
         Ok(StatefulStreamResult::Continue)
+    }
+
+    // --- Adaptive join switching methods ---
+
+    /// Scan the left (default build) side collecting batches and tracking bytes.
+    /// If left finishes within threshold, build hash map from left and proceed normally.
+    /// If left exceeds threshold, transition to scanning the right side.
+    fn adaptive_collect_left(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+        let left_stream = self
+            .left_stream
+            .as_mut()
+            .expect("left_stream must be set in adaptive mode");
+
+        match ready!(left_stream.poll_next_unpin(cx)) {
+            None => {
+                // Left side exhausted and fits within threshold - use left as build side (normal path)
+                let batches = std::mem::take(&mut self.adaptive_left_batches);
+                let config = self
+                    .config
+                    .as_ref()
+                    .expect("config must be set in adaptive mode");
+                let counter = self
+                    .array_map_created_count
+                    .as_ref()
+                    .expect("counter must be set in adaptive mode");
+                let pool = self
+                    .memory_pool
+                    .as_ref()
+                    .expect("memory_pool must be set in adaptive mode");
+                let left_data = build_join_left_data_from_batches(
+                    batches,
+                    &self.on_left,
+                    &self.random_state,
+                    &self.join_metrics,
+                    self.join_type,
+                    self.null_equality,
+                    config,
+                    counter,
+                    pool,
+                )?;
+                self.build_side = BuildSide::Ready(BuildSideReadyState { left_data });
+                self.state = HashJoinStreamState::FetchProbeBatch;
+            }
+            Some(Ok(batch)) => {
+                let batch_size = get_record_batch_memory_size(&batch);
+                if let Some(ref mut reservation) = self.adaptive_reservation {
+                    reservation.try_grow(batch_size)?;
+                }
+                self.adaptive_left_bytes += batch_size;
+                self.join_metrics.build_input_batches.add(1);
+                self.join_metrics.build_input_rows.add(batch.num_rows());
+                self.adaptive_left_batches.push(batch);
+
+                if self.adaptive_left_bytes >= self.adaptive_threshold {
+                    // Left exceeds threshold, start scanning right
+                    self.state = HashJoinStreamState::AdaptiveCollectRight;
+                }
+            }
+            Some(Err(e)) => return Poll::Ready(Err(e)),
+        }
+
+        Poll::Ready(Ok(StatefulStreamResult::Continue))
+    }
+
+    /// Left exceeded threshold; scan the right (probe) side entirely.
+    /// If right < threshold, SWAP: build from right, probe from left.
+    /// If right also >= threshold, finish collecting left and build from left.
+    fn adaptive_collect_right(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+        match ready!(self.right.poll_next_unpin(cx)) {
+            None => {
+                // Right side exhausted
+                if self.adaptive_right_bytes < self.adaptive_threshold {
+                    // Right is smaller - SWAP: build from right, probe from left
+                    let right_batches = std::mem::take(&mut self.adaptive_right_batches);
+                    let left_batches = std::mem::take(&mut self.adaptive_left_batches);
+
+                    // Build hash map from right side batches
+                    let config = self
+                        .config
+                        .as_ref()
+                        .expect("config must be set in adaptive mode");
+                    let counter = self
+                        .array_map_created_count
+                        .as_ref()
+                        .expect("counter must be set in adaptive mode");
+                    let pool = self
+                        .memory_pool
+                        .as_ref()
+                        .expect("memory_pool must be set in adaptive mode");
+                    let left_data = build_join_left_data_from_batches(
+                        right_batches,
+                        &self.on_right,
+                        &self.random_state,
+                        &self.join_metrics,
+                        self.join_type.swap(),
+                        self.null_equality,
+                        config,
+                        counter,
+                        pool,
+                    )?;
+                    self.build_side = BuildSide::Ready(BuildSideReadyState { left_data });
+
+                    // Replace self.right with a stream that yields left_batches first, then left_stream
+                    let left_stream = self
+                        .left_stream
+                        .take()
+                        .expect("left_stream must be set in adaptive mode");
+                    self.right = Box::pin(PrependBatchesStream::new(
+                        left_stream.schema(),
+                        left_batches,
+                        left_stream,
+                    ));
+
+                    // Swap on_right to use left expressions (now probe-side)
+                    std::mem::swap(&mut self.on_right, &mut self.on_left);
+
+                    self.swapped = true;
+                    self.state = HashJoinStreamState::FetchProbeBatch;
+                } else {
+                    // Both sides big - finish collecting left, build from left
+                    self.state = HashJoinStreamState::AdaptiveBuildFromLeft;
+                }
+            }
+            Some(Ok(batch)) => {
+                let batch_size = get_record_batch_memory_size(&batch);
+                if let Some(ref mut reservation) = self.adaptive_reservation {
+                    reservation.try_grow(batch_size)?;
+                }
+                self.adaptive_right_bytes += batch_size;
+                self.adaptive_right_batches.push(batch);
+
+                if self.adaptive_right_bytes >= self.adaptive_threshold {
+                    // Right also exceeds threshold - give up on swapping
+                    // Transition to finish collecting left side
+                    self.state = HashJoinStreamState::AdaptiveBuildFromLeft;
+                }
+            }
+            Some(Err(e)) => return Poll::Ready(Err(e)),
+        }
+
+        Poll::Ready(Ok(StatefulStreamResult::Continue))
+    }
+
+    /// Both sides exceeded the threshold. Finish collecting the left side,
+    /// build the hash map from left, and use saved right batches as probe.
+    fn adaptive_build_from_left(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+        let left_stream = self
+            .left_stream
+            .as_mut()
+            .expect("left_stream must be set in adaptive mode");
+
+        match ready!(left_stream.poll_next_unpin(cx)) {
+            None => {
+                // Left side fully collected - build hash map from left
+                let left_batches = std::mem::take(&mut self.adaptive_left_batches);
+                let right_batches = std::mem::take(&mut self.adaptive_right_batches);
+
+                let config = self
+                    .config
+                    .as_ref()
+                    .expect("config must be set in adaptive mode");
+                let counter = self
+                    .array_map_created_count
+                    .as_ref()
+                    .expect("counter must be set in adaptive mode");
+                let pool = self
+                    .memory_pool
+                    .as_ref()
+                    .expect("memory_pool must be set in adaptive mode");
+                let left_data = build_join_left_data_from_batches(
+                    left_batches,
+                    &self.on_left,
+                    &self.random_state,
+                    &self.join_metrics,
+                    self.join_type,
+                    self.null_equality,
+                    config,
+                    counter,
+                    pool,
+                )?;
+                self.build_side = BuildSide::Ready(BuildSideReadyState { left_data });
+
+                // Replace probe stream: saved right batches first, then remaining right stream
+                let right_schema = self.right.schema();
+                let remaining_right = std::mem::replace(
+                    &mut self.right,
+                    // temporary placeholder
+                    Box::pin(EmptyRecordBatchStream::new(Arc::clone(&right_schema))),
+                );
+                self.right = Box::pin(PrependBatchesStream::new(
+                    right_schema,
+                    right_batches,
+                    remaining_right,
+                ));
+
+                self.state = HashJoinStreamState::FetchProbeBatch;
+            }
+            Some(Ok(batch)) => {
+                let batch_size = get_record_batch_memory_size(&batch);
+                if let Some(ref mut reservation) = self.adaptive_reservation {
+                    reservation.try_grow(batch_size)?;
+                }
+                self.join_metrics.build_input_batches.add(1);
+                self.join_metrics.build_input_rows.add(batch.num_rows());
+                self.adaptive_left_batches.push(batch);
+            }
+            Some(Err(e)) => return Poll::Ready(Err(e)),
+        }
+
+        Poll::Ready(Ok(StatefulStreamResult::Continue))
     }
 }
 
@@ -924,4 +1244,72 @@ impl Stream for HashJoinStream {
     ) -> Poll<Option<Self::Item>> {
         self.poll_next_impl(cx)
     }
+}
+
+/// A stream that yields pre-collected batches first, then delegates to an inner stream.
+struct PrependBatchesStream {
+    schema: SchemaRef,
+    batches: VecDeque<RecordBatch>,
+    inner: SendableRecordBatchStream,
+}
+
+impl PrependBatchesStream {
+    fn new(
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        inner: SendableRecordBatchStream,
+    ) -> Self {
+        Self {
+            schema,
+            batches: VecDeque::from(batches),
+            inner,
+        }
+    }
+}
+
+impl RecordBatchStream for PrependBatchesStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+impl Stream for PrependBatchesStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        if let Some(batch) = self.batches.pop_front() {
+            return Poll::Ready(Some(Ok(batch)));
+        }
+        self.inner.poll_next_unpin(cx)
+    }
+}
+
+/// Build a `JoinLeftData` from pre-collected batches.
+/// This is a simplified version of `collect_left_input` for use in adaptive mode.
+fn build_join_left_data_from_batches(
+    batches: Vec<RecordBatch>,
+    on_exprs: &[PhysicalExprRef],
+    random_state: &RandomState,
+    metrics: &BuildProbeJoinMetrics,
+    join_type: JoinType,
+    null_equality: NullEquality,
+    config: &datafusion_common::config::ConfigOptions,
+    array_map_created_count: &crate::metrics::Count,
+    memory_pool: &Arc<dyn datafusion_execution::memory_pool::MemoryPool>,
+) -> Result<Arc<JoinLeftData>> {
+    use crate::joins::hash_join::exec::build_join_left_data;
+    build_join_left_data(
+        batches,
+        on_exprs,
+        random_state,
+        metrics,
+        join_type,
+        null_equality,
+        config,
+        array_map_created_count,
+        memory_pool,
+    )
 }

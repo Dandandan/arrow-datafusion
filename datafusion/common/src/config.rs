@@ -1135,6 +1135,13 @@ config_namespace! {
         /// See: <https://trino.io/docs/current/admin/dynamic-filtering.html#dynamic-filter-collection-thresholds>
         pub hash_join_inlist_pushdown_max_distinct_values: usize, default = 150
 
+        /// Size threshold in bytes for hash join adaptive build-side switching.
+        /// When set to a non-zero value, the hash join will scan both sides
+        /// to determine which is smaller and use the smaller side as the build
+        /// side. If both sides exceed this threshold, the left side is used.
+        /// Set to 0 to disable adaptive switching (default).
+        pub hash_join_adaptive_threshold: usize, default = 8 * 1024 * 1024
+
         /// The default filter selectivity used by Filter Statistics
         /// when an exact selectivity cannot be determined. Valid values are
         /// between 0 (no selectivity) and 100 (all rows are selected).
