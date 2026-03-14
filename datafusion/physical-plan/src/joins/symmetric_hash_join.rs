@@ -951,9 +951,11 @@ pub(crate) fn build_side_determined_results(
         // Create an empty probe record batch:
         let empty_probe_batch = RecordBatch::new_empty(probe_schema);
         // Build the final result from the indices of build and probe sides:
+        let num_rows = build_hash_joiner.input_buffer.num_rows();
         build_batch_from_indices(
             output_schema.as_ref(),
-            &build_hash_joiner.input_buffer,
+            std::slice::from_ref(&build_hash_joiner.input_buffer),
+            &[0, num_rows],
             &empty_probe_batch,
             &build_indices,
             &probe_indices,
@@ -1015,8 +1017,10 @@ pub(crate) fn join_with_probe_batch(
     )?;
 
     let (build_indices, probe_indices) = if let Some(filter) = filter {
+        let num_rows = build_hash_joiner.input_buffer.num_rows();
         apply_join_filter_to_indices(
-            &build_hash_joiner.input_buffer,
+            std::slice::from_ref(&build_hash_joiner.input_buffer),
+            &[0, num_rows],
             probe_batch,
             build_indices,
             probe_indices,
@@ -1054,9 +1058,11 @@ pub(crate) fn join_with_probe_batch(
     ) {
         Ok(None)
     } else {
+        let num_rows = build_hash_joiner.input_buffer.num_rows();
         build_batch_from_indices(
             schema,
-            &build_hash_joiner.input_buffer,
+            std::slice::from_ref(&build_hash_joiner.input_buffer),
+            &[0, num_rows],
             probe_batch,
             &build_indices,
             &probe_indices,

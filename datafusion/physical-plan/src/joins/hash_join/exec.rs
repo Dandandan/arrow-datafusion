@@ -65,8 +65,7 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{ArrayRef, BooleanBufferBuilder};
-use arrow::compute::concat_batches;
+use arrow::array::{Array, ArrayRef, BooleanBufferBuilder, new_null_array};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
@@ -106,14 +105,14 @@ const ARRAY_MAP_CREATED_COUNT_METRIC_NAME: &str = "array_map_created_count";
 #[expect(clippy::too_many_arguments)]
 fn try_create_array_map(
     bounds: &Option<PartitionBounds>,
-    schema: &SchemaRef,
+    _schema: &SchemaRef,
     batches: &[RecordBatch],
     on_left: &[PhysicalExprRef],
     reservation: &mut MemoryReservation,
     perfect_hash_join_small_build_threshold: usize,
     perfect_hash_join_min_key_density: f64,
     null_equality: NullEquality,
-) -> Result<Option<(ArrayMap, RecordBatch, Vec<ArrayRef>)>> {
+) -> Result<Option<(ArrayMap, Vec<ArrayRef>)>> {
     if on_left.len() != 1 {
         return Ok(None);
     }
@@ -178,12 +177,42 @@ fn try_create_array_map(
     let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, num_row);
     reservation.try_grow(mem_size)?;
 
-    let batch = concat_batches(schema, batches)?;
-    let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+    // Evaluate key expressions per-batch and concatenate only key columns
+    let left_values = concat_key_value_arrays(on_left, batches.iter())?;
 
     let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
 
-    Ok(Some((array_map, batch, left_values)))
+    Ok(Some((array_map, left_values)))
+}
+
+/// Evaluate key expressions per-batch and concatenate only the resulting key
+/// column arrays. This avoids `concat_batches` on the full data (which would
+/// duplicate all columns in memory) while still providing contiguous key arrays
+/// for `equal_rows_arr`.
+fn concat_key_value_arrays<'a>(
+    on: &[PhysicalExprRef],
+    batches: impl Iterator<Item = &'a RecordBatch>,
+) -> Result<Vec<ArrayRef>> {
+    let batches: Vec<&RecordBatch> = batches.collect();
+    if batches.is_empty() || on.is_empty() {
+        return Ok(on.iter().map(|_| new_null_array(&DataType::Null, 0)).collect());
+    }
+    // Evaluate key expressions for each batch
+    let per_batch_keys: Vec<Vec<ArrayRef>> = batches
+        .iter()
+        .map(|batch| evaluate_expressions_to_arrays(on, batch))
+        .collect::<Result<Vec<_>>>()?;
+    // Transpose and concatenate: for each key column, concat across all batches
+    let num_keys = on.len();
+    (0..num_keys)
+        .map(|key_idx| {
+            let arrays: Vec<&dyn Array> = per_batch_keys
+                .iter()
+                .map(|keys| keys[key_idx].as_ref())
+                .collect();
+            Ok(arrow::compute::concat(&arrays)?)
+        })
+        .collect()
 }
 
 /// HashTable and input data for the left (build side) of a join
@@ -191,9 +220,15 @@ pub(super) struct JoinLeftData {
     /// The hash table with indices into `batch`
     /// Arc is used to allow sharing with SharedBuildAccumulator for hash map pushdown
     pub(super) map: Arc<Map>,
-    /// The input rows for the build side
-    batch: RecordBatch,
-    /// The build side on expressions values
+    /// The schema of the build side input
+    schema: SchemaRef,
+    /// The input batches for the build side (kept separate to avoid concat_batches)
+    batches: Vec<RecordBatch>,
+    /// Prefix-sum of batch sizes for converting flat indices to (batch_idx, row_idx).
+    /// batch_offsets[i] is the starting flat index for batches[i].
+    /// Has length batches.len() + 1 (last element is total row count).
+    batch_offsets: Vec<usize>,
+    /// The build side on expressions values (concatenated key columns only)
     values: Vec<ArrayRef>,
     /// Shared bitmap builder for visited left indices
     visited_indices_bitmap: SharedBitmapBuilder,
@@ -225,9 +260,29 @@ impl JoinLeftData {
         &self.map
     }
 
-    /// returns a reference to the build side batch
-    pub(super) fn batch(&self) -> &RecordBatch {
-        &self.batch
+    /// Returns a reference to a build-side batch for schema/data-type lookups.
+    /// If batches exist, returns the first one; otherwise creates an empty batch
+    /// with the correct build-side schema.
+    pub(super) fn batch(&self) -> RecordBatch {
+        self.batches
+            .first()
+            .cloned()
+            .unwrap_or_else(|| RecordBatch::new_empty(Arc::clone(&self.schema)))
+    }
+
+    /// returns a reference to the build side batches
+    pub(super) fn batches(&self) -> &[RecordBatch] {
+        &self.batches
+    }
+
+    /// returns the batch offsets for flat-to-(batch,row) index conversion
+    pub(super) fn batch_offsets(&self) -> &[usize] {
+        &self.batch_offsets
+    }
+
+    /// returns total number of rows across all build batches
+    pub(super) fn num_rows(&self) -> usize {
+        *self.batch_offsets.last().unwrap_or(&0)
     }
 
     /// returns a reference to the build side expressions values
@@ -1965,8 +2020,8 @@ async fn collect_left_input(
         _ => None,
     };
 
-    let (join_hash_map, batch, left_values) =
-        if let Some((array_map, batch, left_value)) = try_create_array_map(
+    let (join_hash_map, left_values, should_reverse_batches) =
+        if let Some((array_map, left_value)) = try_create_array_map(
             &bounds,
             &schema,
             &batches,
@@ -1979,7 +2034,7 @@ async fn collect_left_input(
             array_map_created_count.add(1);
             metrics.build_mem_used.add(array_map.size());
 
-            (Map::ArrayMap(array_map), batch, left_value)
+            (Map::ArrayMap(array_map), left_value, false)
         } else {
             // Estimation of memory size, required for hashtable, prior to allocation.
             // Final result can be verified using `RawTable.allocation_info()`
@@ -2025,21 +2080,41 @@ async fn collect_left_input(
                 offset += batch.num_rows();
             }
 
-            // Merge all batches into a single batch, so we can directly index into the arrays
-            let batch = concat_batches(&schema, batches_iter.clone())?;
+            // Evaluate key expressions per-batch and concatenate only the key columns
+            // (avoids concat_batches on the full data, saving memory)
+            let left_values = concat_key_value_arrays(&on_left, batches_iter.clone())?;
 
-            let left_values = evaluate_expressions_to_arrays(&on_left, &batch)?;
-
-            (Map::HashMap(hashmap), batch, left_values)
+            (Map::HashMap(hashmap), left_values, true)
         };
+
+    // For HashMap: reverse the batches to match the hash map's flat index ordering.
+    // The hash map is built iterating in reverse (last batch first), so flat index 0
+    // corresponds to the first row of the last original batch. By reversing, batches[0]
+    // is the last original batch, matching the hash map's indexing scheme.
+    // For ArrayMap: batches are already in the correct (forward) order since the
+    // ArrayMap is built from forward-ordered concatenated key columns.
+    let mut batches = batches;
+    if should_reverse_batches {
+        batches.reverse();
+    }
+
+    // Compute batch_offsets (prefix sum of batch sizes) for flat-to-(batch,row) conversion
+    let batch_offsets = {
+        let mut offsets = Vec::with_capacity(batches.len() + 1);
+        offsets.push(0usize);
+        for b in &batches {
+            offsets.push(offsets.last().unwrap() + b.num_rows());
+        }
+        offsets
+    };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
     let visited_indices_bitmap = if with_visited_indices_bitmap {
-        let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
+        let bitmap_size = bit_util::ceil(num_rows, 8);
         reservation.try_grow(bitmap_size)?;
         metrics.build_mem_used.add(bitmap_size);
 
-        let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
+        let mut bitmap_buffer = BooleanBufferBuilder::new(num_rows);
         bitmap_buffer.append_n(num_rows, false);
         bitmap_buffer
     } else {
@@ -2080,7 +2155,9 @@ async fn collect_left_input(
 
     let data = JoinLeftData {
         map,
-        batch,
+        schema: Arc::clone(&schema),
+        batches,
+        batch_offsets,
         values: left_values,
         visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
         probe_threads_counter: AtomicUsize::new(probe_threads_count),

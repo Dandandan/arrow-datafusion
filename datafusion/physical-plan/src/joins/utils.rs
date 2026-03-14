@@ -912,7 +912,8 @@ pub(crate) fn get_final_indices_from_bit_map(
 
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn apply_join_filter_to_indices(
-    build_input_buffer: &RecordBatch,
+    build_batches: &[RecordBatch],
+    build_batch_offsets: &[usize],
     probe_batch: &RecordBatch,
     build_indices: UInt64Array,
     probe_indices: UInt32Array,
@@ -934,7 +935,8 @@ pub(crate) fn apply_join_filter_to_indices(
             let len = end - i;
             let intermediate_batch = build_batch_from_indices(
                 filter.schema(),
-                build_input_buffer,
+                build_batches,
+                build_batch_offsets,
                 probe_batch,
                 &build_indices.slice(i, len),
                 &probe_indices.slice(i, len),
@@ -956,7 +958,8 @@ pub(crate) fn apply_join_filter_to_indices(
     } else {
         let intermediate_batch = build_batch_from_indices(
             filter.schema(),
-            build_input_buffer,
+            build_batches,
+            build_batch_offsets,
             probe_batch,
             &build_indices,
             &probe_indices,
@@ -992,12 +995,35 @@ fn new_empty_schema_batch(schema: &Schema, row_count: usize) -> Result<RecordBat
     )?)
 }
 
+/// Convert flat row indices into (batch_index, row_index) pairs using
+/// the batch_offsets prefix-sum array.
+fn flat_indices_to_interleave(
+    build_indices: &UInt64Array,
+    batch_offsets: &[usize],
+) -> Vec<(usize, usize)> {
+    build_indices
+        .values()
+        .iter()
+        .map(|&flat_idx| {
+            let flat = flat_idx as usize;
+            // Binary search to find which batch this flat index belongs to
+            let batch_idx = batch_offsets.partition_point(|&o| o <= flat) - 1;
+            let row_idx = flat - batch_offsets[batch_idx];
+            (batch_idx, row_idx)
+        })
+        .collect()
+}
+
 /// Returns a new [RecordBatch] by combining the `left` and `right` according to `indices`.
 /// The resulting batch has [Schema] `schema`.
+///
+/// Build-side columns are gathered from multiple batches using `interleave`,
+/// avoiding the need to `concat_batches` the entire build side upfront.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn build_batch_from_indices(
     schema: &Schema,
-    build_input_buffer: &RecordBatch,
+    build_batches: &[RecordBatch],
+    build_batch_offsets: &[usize],
     probe_batch: &RecordBatch,
     build_indices: &UInt64Array,
     probe_indices: &UInt32Array,
@@ -1006,9 +1032,6 @@ pub(crate) fn build_batch_from_indices(
     join_type: JoinType,
 ) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
-        // For RightAnti and RightSemi joins, after `adjust_indices_by_join_type`
-        // the build_indices were untouched so only probe_indices hold the actual
-        // row count.
         let row_count = match join_type {
             JoinType::RightAnti | JoinType::RightSemi => probe_indices.len(),
             _ => build_indices.len(),
@@ -1016,25 +1039,68 @@ pub(crate) fn build_batch_from_indices(
         return new_empty_schema_batch(schema, row_count);
     }
 
-    // build the columns of the new [RecordBatch]:
-    // 1. pick whether the column is from the left or right
-    // 2. based on the pick, `take` items from the different RecordBatches
+    // Pre-compute interleave indices for build-side columns (shared across all build columns)
+    let interleave_indices = if build_batches.is_empty()
+        || build_indices.null_count() == build_indices.len()
+    {
+        None
+    } else {
+        Some(flat_indices_to_interleave(build_indices, build_batch_offsets))
+    };
+
     let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
 
     for column_index in column_indices {
         let array = if column_index.side == JoinSide::None {
-            // For mark joins, the mark column is a true if the indices is not null, otherwise it will be false
             Arc::new(compute::is_not_null(probe_indices)?)
         } else if column_index.side == build_side {
-            let array = build_input_buffer.column(column_index.index);
-            if array.is_empty() || build_indices.null_count() == build_indices.len() {
-                // Outer join would generate a null index when finding no match at our side.
-                // Therefore, it's possible we are empty but need to populate an n-length null array,
-                // where n is the length of the index array.
-                assert_eq!(build_indices.null_count(), build_indices.len());
-                new_null_array(array.data_type(), build_indices.len())
+            if let Some(ref il_indices) = interleave_indices {
+                // Gather column arrays from all build batches
+                let arrays: Vec<&dyn Array> = build_batches
+                    .iter()
+                    .map(|b| b.column(column_index.index).as_ref())
+                    .collect();
+                let result = compute::interleave(&arrays, il_indices)?;
+                // Apply null mask from build_indices (for outer joins where
+                // unmatched rows are represented as null indices)
+                if build_indices.null_count() > 0 {
+                    if let Some(idx_nulls) = build_indices.nulls() {
+                        // Combine the existing data nulls with the build_indices nulls
+                        let data = result.to_data();
+                        let combined_nulls = if let Some(existing) = data.nulls() {
+                            NullBuffer::new(
+                                existing.inner() & idx_nulls.inner(),
+                            )
+                        } else {
+                            idx_nulls.clone()
+                        };
+                        arrow::array::make_array(
+                            data.into_builder()
+                                .null_bit_buffer(Some(
+                                    combined_nulls.into_inner().into_inner(),
+                                ))
+                                .build()?,
+                        )
+                    } else {
+                        result
+                    }
+                } else {
+                    result
+                }
             } else {
-                take(array.as_ref(), build_indices, None)?
+                // All build indices are null (outer join with no matches)
+                let data_type = if build_batches.is_empty() {
+                    schema
+                        .field(column_index.index)
+                        .data_type()
+                        .clone()
+                } else {
+                    build_batches[0]
+                        .column(column_index.index)
+                        .data_type()
+                        .clone()
+                };
+                new_null_array(&data_type, build_indices.len())
             }
         } else {
             let array = probe_batch.column(column_index.index);

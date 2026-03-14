@@ -649,7 +649,7 @@ impl HashJoinStream {
         if is_empty && self.filter.is_none() {
             let result = build_batch_empty_build_side(
                 &self.schema,
-                build_side.left_data.batch(),
+                &build_side.left_data.batch(),
                 &state.batch,
                 &self.column_indices,
                 self.join_type,
@@ -706,7 +706,8 @@ impl HashJoinStream {
         // apply join filter if exists
         let (left_indices, right_indices) = if let Some(filter) = &self.filter {
             apply_join_filter_to_indices(
-                build_side.left_data.batch(),
+                build_side.left_data.batches(),
+                build_side.left_data.batch_offsets(),
                 &state.batch,
                 left_indices,
                 right_indices,
@@ -767,23 +768,32 @@ impl HashJoinStream {
         )?;
 
         // Build output batch and push to coalescer
-        let (build_batch, probe_batch, join_side) =
-            if self.join_type == JoinType::RightMark {
-                (&state.batch, build_side.left_data.batch(), JoinSide::Right)
-            } else {
-                (build_side.left_data.batch(), &state.batch, JoinSide::Left)
-            };
-
-        let batch = build_batch_from_indices(
-            &self.schema,
-            build_batch,
-            probe_batch,
-            &left_indices,
-            &right_indices,
-            &self.column_indices,
-            join_side,
-            self.join_type,
-        )?;
+        let batch = if self.join_type == JoinType::RightMark {
+            let num_rows = state.batch.num_rows();
+            build_batch_from_indices(
+                &self.schema,
+                std::slice::from_ref(&state.batch),
+                &[0, num_rows],
+                &build_side.left_data.batch(),
+                &left_indices,
+                &right_indices,
+                &self.column_indices,
+                JoinSide::Right,
+                self.join_type,
+            )?
+        } else {
+            build_batch_from_indices(
+                &self.schema,
+                build_side.left_data.batches(),
+                build_side.left_data.batch_offsets(),
+                &state.batch,
+                &left_indices,
+                &right_indices,
+                &self.column_indices,
+                JoinSide::Left,
+                self.join_type,
+            )?
+        };
 
         let push_status = self.output_buffer.push_batch(batch)?;
 
@@ -895,7 +905,8 @@ impl HashJoinStream {
             let empty_right_batch = RecordBatch::new_empty(self.right.schema());
             let batch = build_batch_from_indices(
                 &self.schema,
-                build_side.left_data.batch(),
+                build_side.left_data.batches(),
+                build_side.left_data.batch_offsets(),
                 &empty_right_batch,
                 &left_side,
                 &right_side,
