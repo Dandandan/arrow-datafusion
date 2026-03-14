@@ -402,7 +402,7 @@ impl JoinedRecordBatches {
 
     /// Clears batches without touching metadata (for early return when no filtering needed)
     fn clear_batches(&mut self, schema: &SchemaRef, batch_size: usize) {
-        self.joined_batches = BatchCoalescer::new(Arc::clone(schema), batch_size)
+        self.joined_batches = BatchCoalescer::new(Arc::clone(schema), batch_size.max(8))
             .with_biggest_coalesce_batch_size(Option::from(batch_size / 2));
     }
 
@@ -513,7 +513,7 @@ impl JoinedRecordBatches {
     }
 
     fn clear(&mut self, schema: &SchemaRef, batch_size: usize) {
-        self.joined_batches = BatchCoalescer::new(Arc::clone(schema), batch_size)
+        self.joined_batches = BatchCoalescer::new(Arc::clone(schema), batch_size.max(8))
             .with_biggest_coalesce_batch_size(Option::from(batch_size / 2));
         self.filter_metadata = FilterMetadata::new();
         self.debug_assert_empty_consistency();
@@ -785,7 +785,7 @@ impl SortMergeJoinStream {
                     .with_biggest_coalesce_batch_size(Option::from(batch_size / 2)),
                 filter_metadata: FilterMetadata::new(),
             },
-            output: BatchCoalescer::new(schema, batch_size)
+            output: BatchCoalescer::new(schema, batch_size.max(8))
                 .with_biggest_coalesce_batch_size(Option::from(batch_size / 2)),
             batch_size,
             join_type,

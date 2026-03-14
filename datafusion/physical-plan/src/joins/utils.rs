@@ -1081,10 +1081,13 @@ pub(crate) fn build_batch_from_indices(
                 // All build indices are null (outer join with no matches)
                 // Use the build batch schema to get the correct data type
                 // (column_index.index refers to the build batch columns, not the output schema)
-                let data_type = build_batches
-                    .first()
-                    .map(|b| b.column(column_index.index).data_type().clone())
-                    .unwrap_or_else(|| schema.field(columns.len()).data_type().clone());
+                let data_type = if let Some(b) = build_batches.first() {
+                    b.column(column_index.index).data_type().clone()
+                } else {
+                    // No build batches available (empty build side in CollectLeft mode).
+                    // Use the output schema field at the current column position.
+                    schema.field(columns.len()).data_type().clone()
+                };
                 new_null_array(&data_type, build_indices.len())
             }
         } else {

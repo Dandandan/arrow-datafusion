@@ -1147,7 +1147,9 @@ impl NestedLoopJoinStream {
             left_data,
             metrics,
             buffered_left_data: None,
-            output_buffer: Box::new(BatchCoalescer::new(schema, batch_size)),
+            // Use at least 8 to avoid debug_assert in arrow-select's BatchCoalescer
+            // where Vec::reserve(n) for small n can allocate more capacity than n
+            output_buffer: Box::new(BatchCoalescer::new(schema, batch_size.max(8))),
             batch_size,
             current_right_batch: None,
             current_right_batch_matched: None,

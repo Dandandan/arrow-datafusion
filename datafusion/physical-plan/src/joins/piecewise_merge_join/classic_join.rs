@@ -416,7 +416,7 @@ struct BatchProcessState {
 impl BatchProcessState {
     pub(crate) fn new(schema: Arc<Schema>, batch_size: usize) -> Self {
         Self {
-            output_batches: Box::new(BatchCoalescer::new(schema, batch_size)),
+            output_batches: Box::new(BatchCoalescer::new(schema, batch_size.max(8))),
             unmatched_indices: PrimitiveBuilder::new(),
             start_buffer_idx: 0,
             start_stream_idx: 0,

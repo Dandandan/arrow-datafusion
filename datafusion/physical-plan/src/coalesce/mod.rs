@@ -59,6 +59,9 @@ impl LimitedBatchCoalescer {
         target_batch_size: usize,
         fetch: Option<usize>,
     ) -> Self {
+        // Use at least 8 to avoid debug_assert in arrow-select's BatchCoalescer
+        // where Vec::reserve(n) for small n can allocate more capacity than n
+        let target_batch_size = target_batch_size.max(8);
         Self {
             inner: BatchCoalescer::new(schema, target_batch_size)
                 .with_biggest_coalesce_batch_size(Some(target_batch_size / 2)),

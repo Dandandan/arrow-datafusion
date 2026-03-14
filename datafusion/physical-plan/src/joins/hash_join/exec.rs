@@ -2099,19 +2099,17 @@ async fn collect_left_input(
     if should_reverse_batches {
         batches.reverse();
     }
-
-    // Ensure there is always at least one batch for schema/data-type lookups
-    // (e.g. build_batch_from_indices needs the build-side data types even when
-    // there are no build-side rows, for producing null arrays in outer joins).
-    if batches.is_empty() {
-        batches.push(RecordBatch::new_empty(Arc::clone(&schema)));
-    }
+    // Remove empty batches to avoid ambiguity in flat_to_packed_indices:
+    // duplicate offsets from empty batches cause partition_point to return
+    // incorrect batch indices.
+    batches.retain(|b| b.num_rows() > 0);
 
     // Evaluate key expressions per-batch (no concatenation needed for equal_rows_arr)
-    let values_per_batch: Vec<Vec<ArrayRef>> = if num_rows == 0 {
+    let values_per_batch: Vec<Vec<ArrayRef>> = if batches.is_empty() {
+        let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
         let empty_keys = on_left
             .iter()
-            .map(|c| c.evaluate(&batches[0])?.into_array(0))
+            .map(|c| c.evaluate(&empty_batch)?.into_array(0))
             .collect::<Result<Vec<_>>>()?;
         vec![empty_keys]
     } else {
