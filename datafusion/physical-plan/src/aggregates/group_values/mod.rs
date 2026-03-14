@@ -34,6 +34,7 @@ mod row;
 mod single_group_by;
 use datafusion_physical_expr::binary_map::OutputType;
 use multi_group_by::GroupValuesColumn;
+use multi_group_by::packed::{GroupValuesPacked, can_pack_schema};
 use row::GroupValuesRows;
 
 pub(crate) use single_group_by::primitive::HashValue;
@@ -198,6 +199,12 @@ pub fn new_group_values(
             }
             _ => {}
         }
+    }
+
+    // Try packed representation for multi-column integer/boolean group keys
+    // that fit within 128 bits — avoids per-column hashing and comparison.
+    if matches!(group_ordering, GroupOrdering::None) && can_pack_schema(&schema) {
+        return Ok(Box::new(GroupValuesPacked::try_new(schema)?));
     }
 
     if multi_group_by::supported_schema(schema.as_ref()) {
