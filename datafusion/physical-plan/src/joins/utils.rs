@@ -1039,16 +1039,19 @@ pub(crate) fn build_batch_from_indices(
         return new_empty_schema_batch(schema, row_count);
     }
 
-    // Pre-compute interleave indices for build-side columns (shared across all build columns)
-    let interleave_indices = if build_batches.is_empty()
-        || build_indices.null_count() == build_indices.len()
+    // For a single batch, use take() directly (no index conversion overhead).
+    // For multiple batches, pre-compute interleave indices.
+    let use_single_batch = build_batches.len() == 1;
+    let interleave_indices = if !use_single_batch
+        && !build_batches.is_empty()
+        && build_indices.null_count() != build_indices.len()
     {
-        None
-    } else {
         Some(flat_indices_to_interleave(
             build_indices,
             build_batch_offsets,
         ))
+    } else {
+        None
     };
 
     let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
@@ -1057,8 +1060,25 @@ pub(crate) fn build_batch_from_indices(
         let array = if column_index.side == JoinSide::None {
             Arc::new(compute::is_not_null(probe_indices)?)
         } else if column_index.side == build_side {
-            if let Some(ref il_indices) = interleave_indices {
-                // Gather column arrays from all build batches
+            if build_batches.is_empty()
+                || build_indices.null_count() == build_indices.len()
+            {
+                // All build indices are null (outer join with no matches)
+                let data_type = if build_batches.is_empty() {
+                    schema.field(column_index.index).data_type().clone()
+                } else {
+                    build_batches[0]
+                        .column(column_index.index)
+                        .data_type()
+                        .clone()
+                };
+                new_null_array(&data_type, build_indices.len())
+            } else if use_single_batch {
+                // Fast path: single batch, use take() directly (no conversion)
+                let array = build_batches[0].column(column_index.index);
+                take(array.as_ref(), build_indices, None)?
+            } else if let Some(ref il_indices) = interleave_indices {
+                // Multi-batch path: gather from all build batches via interleave
                 let arrays: Vec<&dyn Array> = build_batches
                     .iter()
                     .map(|b| b.column(column_index.index).as_ref())
@@ -1068,7 +1088,6 @@ pub(crate) fn build_batch_from_indices(
                 // unmatched rows are represented as null indices)
                 if build_indices.null_count() > 0 {
                     if let Some(idx_nulls) = build_indices.nulls() {
-                        // Combine the existing data nulls with the build_indices nulls
                         let data = result.to_data();
                         let combined_nulls = if let Some(existing) = data.nulls() {
                             NullBuffer::new(existing.inner() & idx_nulls.inner())
@@ -1089,16 +1108,7 @@ pub(crate) fn build_batch_from_indices(
                     result
                 }
             } else {
-                // All build indices are null (outer join with no matches)
-                let data_type = if build_batches.is_empty() {
-                    schema.field(column_index.index).data_type().clone()
-                } else {
-                    build_batches[0]
-                        .column(column_index.index)
-                        .data_type()
-                        .clone()
-                };
-                new_null_array(&data_type, build_indices.len())
+                unreachable!("interleave_indices should be Some for multi-batch non-null case")
             }
         } else {
             let array = probe_batch.column(column_index.index);
