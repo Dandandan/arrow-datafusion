@@ -2,8 +2,8 @@
 
 ## Developer Documentation
 
-- [Contributor Guide](https://datafusion.apache.org/contributor-guide/index.html)
-- [Architecture Guide](https://datafusion.apache.org/contributor-guide/architecture.html)
+- [Contributor Guide](docs/source/contributor-guide/index.md)
+- [Architecture Guide](docs/source/contributor-guide/architecture.md)
 
 ## Before Committing
 
