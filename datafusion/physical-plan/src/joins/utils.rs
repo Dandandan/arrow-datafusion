@@ -1043,7 +1043,7 @@ pub(crate) fn build_batch_from_indices(
 
     let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
 
-    for (output_idx, column_index) in column_indices.iter().enumerate() {
+    for column_index in column_indices {
         let array = if column_index.side == JoinSide::None {
             Arc::new(compute::is_not_null(probe_indices)?)
         } else if column_index.side == build_side {
@@ -1084,9 +1084,7 @@ pub(crate) fn build_batch_from_indices(
                 let data_type = build_batches
                     .first()
                     .map(|b| b.column(column_index.index).data_type().clone())
-                    .unwrap_or_else(|| {
-                        schema.field(columns.len()).data_type().clone()
-                    });
+                    .unwrap_or_else(|| schema.field(columns.len()).data_type().clone());
                 new_null_array(&data_type, build_indices.len())
             }
         } else {
