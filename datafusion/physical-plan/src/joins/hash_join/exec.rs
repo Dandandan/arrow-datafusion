@@ -195,7 +195,10 @@ fn concat_key_value_arrays<'a>(
 ) -> Result<Vec<ArrayRef>> {
     let batches: Vec<&RecordBatch> = batches.collect();
     if batches.is_empty() || on.is_empty() {
-        return Ok(on.iter().map(|_| new_null_array(&DataType::Null, 0)).collect());
+        return Ok(on
+            .iter()
+            .map(|_| new_null_array(&DataType::Null, 0))
+            .collect());
     }
     // Evaluate key expressions for each batch
     let per_batch_keys: Vec<Vec<ArrayRef>> = batches

@@ -1045,7 +1045,10 @@ pub(crate) fn build_batch_from_indices(
     {
         None
     } else {
-        Some(flat_indices_to_interleave(build_indices, build_batch_offsets))
+        Some(flat_indices_to_interleave(
+            build_indices,
+            build_batch_offsets,
+        ))
     };
 
     let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
@@ -1068,9 +1071,7 @@ pub(crate) fn build_batch_from_indices(
                         // Combine the existing data nulls with the build_indices nulls
                         let data = result.to_data();
                         let combined_nulls = if let Some(existing) = data.nulls() {
-                            NullBuffer::new(
-                                existing.inner() & idx_nulls.inner(),
-                            )
+                            NullBuffer::new(existing.inner() & idx_nulls.inner())
                         } else {
                             idx_nulls.clone()
                         };
@@ -1090,10 +1091,7 @@ pub(crate) fn build_batch_from_indices(
             } else {
                 // All build indices are null (outer join with no matches)
                 let data_type = if build_batches.is_empty() {
-                    schema
-                        .field(column_index.index)
-                        .data_type()
-                        .clone()
+                    schema.field(column_index.index).data_type().clone()
                 } else {
                     build_batches[0]
                         .column(column_index.index)
