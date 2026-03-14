@@ -150,6 +150,9 @@ where
 /// The size, in number of entries, of the initial hash table
 const INITIAL_MAP_CAPACITY: usize = 512;
 
+/// Batch size for batched lookups in insert_if_new_inner
+const INTERN_BATCH_SIZE: usize = 8;
+
 impl<V> ArrowBytesViewMap<V>
 where
     V: Debug + PartialEq + Eq + Clone + Copy + Default,
@@ -270,32 +273,193 @@ where
         // Ensure lengths are equivalent
         assert_eq!(values.len(), self.hashes_buffer.len());
 
-        for i in 0..values.len() {
+        let total = values.len();
+        let num_full_batches = total / INTERN_BATCH_SIZE;
+
+        // Process in batches of 8 to hide memory latency via batched probes
+        for batch_idx in 0..num_full_batches {
+            let base = batch_idx * INTERN_BATCH_SIZE;
+
+            // Collect views, hashes, null flags into fixed-size arrays
+            let mut views = [0u128; INTERN_BATCH_SIZE];
+            let mut hashes = [0u64; INTERN_BATCH_SIZE];
+            let mut is_null = [false; INTERN_BATCH_SIZE];
+
+            for k in 0..INTERN_BATCH_SIZE {
+                views[k] = input_views[base + k];
+                hashes[k] = self.hashes_buffer[base + k];
+                is_null[k] = values.is_null(base + k);
+            }
+
+            // Deduplicate within batch (skip nulls).
+            // dedup[i] == i means the value is unique among batch[0..=i].
+            // dedup[i] == j (j < i) means batch[i] has the same value as batch[j].
+            let mut dedup = [0usize; INTERN_BATCH_SIZE];
+            for i in 0..INTERN_BATCH_SIZE {
+                dedup[i] = i;
+                if is_null[i] {
+                    continue;
+                }
+                let len_i = views[i] as u32;
+                for j in 0..i {
+                    if is_null[j] {
+                        continue;
+                    }
+                    let len_j = views[j] as u32;
+                    if len_i != len_j {
+                        continue;
+                    }
+                    if len_i <= 12 {
+                        if views[i] == views[j] {
+                            dedup[i] = j;
+                            break;
+                        }
+                    } else {
+                        // Compare 4-byte prefix first
+                        let prefix_i = (views[i] >> 32) as u32;
+                        let prefix_j = (views[j] >> 32) as u32;
+                        if prefix_i != prefix_j {
+                            continue;
+                        }
+                        // Full comparison
+                        let val_i: &[u8] = values.value(base + i).as_ref();
+                        let val_j: &[u8] = values.value(base + j).as_ref();
+                        if val_i == val_j {
+                            dedup[i] = j;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Create iter_hash iterators for all unique non-null values.
+            // Creating the iterator loads the control byte group from the hash
+            // table, triggering cache line loads at up to 8 different positions.
+            // By the time we advance the iterators, the data is likely warm.
+            let iters =
+                std::array::from_fn::<_, INTERN_BATCH_SIZE, _>(|i| {
+                    if !is_null[i] && dedup[i] == i {
+                        Some(self.map.iter_hash(hashes[i]))
+                    } else {
+                        None
+                    }
+                });
+
+            // Advance iterators to find matching entries.
+            let mut found_payload = [None::<V>; INTERN_BATCH_SIZE];
+            for (i, iter) in iters.into_iter().enumerate() {
+                if let Some(mut iter) = iter {
+                    let hash = hashes[i];
+                    let view_u128 = views[i];
+                    let len = view_u128 as u32;
+                    let idx = base + i;
+
+                    let completed = &self.completed;
+                    let in_progress = &self.in_progress;
+
+                    found_payload[i] = iter
+                        .find(|header| {
+                            if header.hash != hash {
+                                return false;
+                            }
+
+                            if len <= 12 {
+                                return header.view == view_u128;
+                            }
+
+                            let stored_prefix = (header.view >> 32) as u32;
+                            let input_prefix = (view_u128 >> 32) as u32;
+                            if stored_prefix != input_prefix {
+                                return false;
+                            }
+
+                            let byte_view = ByteView::from(header.view);
+                            let stored_len = byte_view.length as usize;
+                            let buffer_index = byte_view.buffer_index as usize;
+                            let offset = byte_view.offset as usize;
+
+                            let stored_value =
+                                if buffer_index < completed.len() {
+                                    &completed[buffer_index].as_slice()
+                                        [offset..offset + stored_len]
+                                } else {
+                                    &in_progress[offset..offset + stored_len]
+                                };
+                            let input_value: &[u8] = values.value(idx).as_ref();
+                            stored_value == input_value
+                        })
+                        .map(|entry| entry.payload);
+                }
+            }
+
+            // Insert missing values and emit payloads in order
+            let mut payloads = [V::default(); INTERN_BATCH_SIZE];
+            for i in 0..INTERN_BATCH_SIZE {
+                let idx = base + i;
+
+                if is_null[i] {
+                    let payload =
+                        if let Some(&(payload, _offset)) = self.null.as_ref() {
+                            payload
+                        } else {
+                            let payload = make_payload_fn(None);
+                            let null_index = self.views.len();
+                            self.views.push(0);
+                            self.nulls.append_null();
+                            self.null = Some((payload, null_index));
+                            payload
+                        };
+                    payloads[i] = payload;
+                } else if dedup[i] != i {
+                    payloads[i] = payloads[dedup[i]];
+                } else if let Some(p) = found_payload[i] {
+                    payloads[i] = p;
+                } else {
+                    let value: &[u8] = values.value(idx).as_ref();
+                    let payload = make_payload_fn(Some(value));
+                    let new_view = self.append_value(value);
+                    let new_header = Entry {
+                        view: new_view,
+                        hash: hashes[i],
+                        payload,
+                    };
+                    self.map.insert_accounted(
+                        new_header,
+                        |h| h.hash,
+                        &mut self.map_size,
+                    );
+                    payloads[i] = payload;
+                }
+
+                observe_payload_fn(payloads[i]);
+            }
+        }
+
+        // Handle remainder elements one at a time
+        let remainder_start = num_full_batches * INTERN_BATCH_SIZE;
+        for i in remainder_start..total {
             let view_u128 = input_views[i];
             let hash = self.hashes_buffer[i];
 
-            // handle null value via validity bitmap check
             if values.is_null(i) {
-                let payload = if let Some(&(payload, _offset)) = self.null.as_ref() {
-                    payload
-                } else {
-                    let payload = make_payload_fn(None);
-                    let null_index = self.views.len();
-                    self.views.push(0);
-                    self.nulls.append_null();
-                    self.null = Some((payload, null_index));
-                    payload
-                };
+                let payload =
+                    if let Some(&(payload, _offset)) = self.null.as_ref() {
+                        payload
+                    } else {
+                        let payload = make_payload_fn(None);
+                        let null_index = self.views.len();
+                        self.views.push(0);
+                        self.nulls.append_null();
+                        self.null = Some((payload, null_index));
+                        payload
+                    };
                 observe_payload_fn(payload);
                 continue;
             }
 
-            // Extract length from the view (first 4 bytes of u128 in little-endian)
             let len = view_u128 as u32;
 
-            // Check if value already exists
             let maybe_payload = {
-                // Borrow completed and in_progress for comparison
                 let completed = &self.completed;
                 let in_progress = &self.in_progress;
 
@@ -305,19 +469,16 @@ where
                             return false;
                         }
 
-                        // Fast path: inline strings can be compared directly
                         if len <= 12 {
                             return header.view == view_u128;
                         }
 
-                        // For larger strings: first compare the 4-byte prefix
                         let stored_prefix = (header.view >> 32) as u32;
                         let input_prefix = (view_u128 >> 32) as u32;
                         if stored_prefix != input_prefix {
                             return false;
                         }
 
-                        // Prefix matched - compare full bytes
                         let byte_view = ByteView::from(header.view);
                         let stored_len = byte_view.length as usize;
                         let buffer_index = byte_view.buffer_index as usize;
@@ -338,18 +499,14 @@ where
             let payload = if let Some(payload) = maybe_payload {
                 payload
             } else {
-                // no existing value, make a new one
                 let value: &[u8] = values.value(i).as_ref();
                 let payload = make_payload_fn(Some(value));
-
-                // Create view pointing to our buffers
                 let new_view = self.append_value(value);
                 let new_header = Entry {
                     view: new_view,
                     hash,
                     payload,
                 };
-
                 self.map
                     .insert_accounted(new_header, |h| h.hash, &mut self.map_size);
                 payload

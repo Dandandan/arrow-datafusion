@@ -19,8 +19,8 @@ use crate::aggregates::group_values::GroupValues;
 use ahash::RandomState;
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::{
-    ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, NullBufferBuilder, PrimitiveArray,
-    cast::AsArray,
+    Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, NullBufferBuilder,
+    PrimitiveArray, cast::AsArray,
 };
 use arrow::datatypes::{DataType, i256};
 use datafusion_common::Result;
@@ -108,6 +108,105 @@ impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
     }
 }
 
+/// Batch size for batched lookups in intern
+const INTERN_BATCH_SIZE: usize = 8;
+
+impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T>
+where
+    T::Native: HashValue,
+{
+    /// Look up a single value in the hash table, inserting if not found.
+    #[inline(always)]
+    fn find_or_insert(&mut self, key: T::Native, hash: u64) -> usize {
+        let found = self.map.find(hash, |&(g, h)| unsafe {
+            hash == h && self.values.get_unchecked(g).is_eq(key)
+        });
+        match found {
+            Some(&(g, _)) => g,
+            None => {
+                let g = self.values.len();
+                self.map.insert_unique(hash, (g, hash), |&(_, h)| h);
+                self.values.push(key);
+                g
+            }
+        }
+    }
+
+    /// Process a batch of INTERN_BATCH_SIZE non-null values, deduplicating
+    /// within the batch and batching hash table probes to hide memory latency.
+    #[inline(always)]
+    fn intern_batch(
+        &mut self,
+        chunk: &[T::Native; INTERN_BATCH_SIZE],
+        groups: &mut Vec<usize>,
+    ) {
+        // Step 1: Deduplicate within the batch by comparing values.
+        // dedup[i] == i means the value is unique among chunk[0..=i].
+        // dedup[i] == j (j < i) means chunk[i] == chunk[j].
+        let mut dedup = [0usize; INTERN_BATCH_SIZE];
+        for i in 0..INTERN_BATCH_SIZE {
+            dedup[i] = i;
+            for j in 0..i {
+                if chunk[j].is_eq(chunk[i]) {
+                    dedup[i] = j;
+                    break;
+                }
+            }
+        }
+
+        // Step 2: Hash only unique values
+        let mut hashes = [0u64; INTERN_BATCH_SIZE];
+        for i in 0..INTERN_BATCH_SIZE {
+            if dedup[i] == i {
+                hashes[i] = chunk[i].hash(&self.random_state);
+            }
+        }
+
+        // Step 3: Create iter_hash iterators for all unique values.
+        // Creating the iterator loads the control byte group from the hash
+        // table, triggering cache line loads at up to 8 different positions.
+        // By the time we advance the iterators, the data is likely warm.
+        let iters = std::array::from_fn::<_, INTERN_BATCH_SIZE, _>(|i| {
+            if dedup[i] == i {
+                Some(self.map.iter_hash(hashes[i]))
+            } else {
+                None
+            }
+        });
+
+        // Step 4: Advance iterators to find matching entries.
+        let mut found = [None::<usize>; INTERN_BATCH_SIZE];
+        for (i, iter) in iters.into_iter().enumerate() {
+            if let Some(mut iter) = iter {
+                found[i] = iter
+                    .find(|&(g, h)| unsafe {
+                        hashes[i] == *h
+                            && self.values.get_unchecked(*g).is_eq(chunk[i])
+                    })
+                    .map(|&(g, _)| g);
+            }
+        }
+
+        // Step 4: Insert missing values and collect group IDs
+        let mut group_ids = [0usize; INTERN_BATCH_SIZE];
+        for i in 0..INTERN_BATCH_SIZE {
+            if dedup[i] != i {
+                group_ids[i] = group_ids[dedup[i]];
+            } else if let Some(g) = found[i] {
+                group_ids[i] = g;
+            } else {
+                let g = self.values.len();
+                self.map
+                    .insert_unique(hashes[i], (g, hashes[i]), |&(_, h)| h);
+                self.values.push(chunk[i]);
+                group_ids[i] = g;
+            }
+        }
+
+        groups.extend_from_slice(&group_ids);
+    }
+}
+
 impl<T: ArrowPrimitiveType> GroupValues for GroupValuesPrimitive<T>
 where
     T::Native: HashValue,
@@ -116,36 +215,39 @@ where
         assert_eq!(cols.len(), 1);
         groups.clear();
 
-        for v in cols[0].as_primitive::<T>() {
-            let group_id = match v {
-                None => *self.null_group.get_or_insert_with(|| {
-                    let group_id = self.values.len();
-                    self.values.push(Default::default());
-                    group_id
-                }),
-                Some(key) => {
-                    let state = &self.random_state;
-                    let hash = key.hash(state);
-                    let insert = self.map.entry(
-                        hash,
-                        |&(g, h)| unsafe {
-                            hash == h && self.values.get_unchecked(g).is_eq(key)
-                        },
-                        |&(_, h)| h,
-                    );
+        let arr = cols[0].as_primitive::<T>();
+        let len = arr.len();
+        groups.reserve(len);
 
-                    match insert {
-                        hashbrown::hash_table::Entry::Occupied(o) => o.get().0,
-                        hashbrown::hash_table::Entry::Vacant(v) => {
-                            let g = self.values.len();
-                            v.insert((g, hash));
-                            self.values.push(key);
-                            g
-                        }
+        if arr.null_count() == 0 {
+            // Fast path: no nulls, use batched lookups
+            let values = arr.values();
+            for chunk in values.chunks_exact(INTERN_BATCH_SIZE) {
+                let chunk: &[T::Native; INTERN_BATCH_SIZE] =
+                    chunk.try_into().unwrap();
+                self.intern_batch(chunk, groups);
+            }
+            for &key in values.chunks_exact(INTERN_BATCH_SIZE).remainder() {
+                let hash = key.hash(&self.random_state);
+                let group_id = self.find_or_insert(key, hash);
+                groups.push(group_id);
+            }
+        } else {
+            // Path with nulls: process one at a time
+            for v in arr.iter() {
+                let group_id = match v {
+                    None => *self.null_group.get_or_insert_with(|| {
+                        let group_id = self.values.len();
+                        self.values.push(Default::default());
+                        group_id
+                    }),
+                    Some(key) => {
+                        let hash = key.hash(&self.random_state);
+                        self.find_or_insert(key, hash)
                     }
-                }
-            };
-            groups.push(group_id)
+                };
+                groups.push(group_id);
+            }
         }
         Ok(())
     }
