@@ -283,11 +283,6 @@ impl JoinLeftData {
         &self.batch_offsets
     }
 
-    /// returns total number of rows across all build batches
-    pub(super) fn num_rows(&self) -> usize {
-        *self.batch_offsets.last().unwrap_or(&0)
-    }
-
     /// returns a reference to the build side expressions values
     pub(super) fn values(&self) -> &[ArrayRef] {
         &self.values
