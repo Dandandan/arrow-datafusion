@@ -2108,7 +2108,7 @@ async fn collect_left_input(
     }
 
     // Evaluate key expressions per-batch (no concatenation needed for equal_rows_arr)
-    let values_per_batch: Vec<Vec<ArrayRef>> = if batches[0].num_rows() == 0 {
+    let values_per_batch: Vec<Vec<ArrayRef>> = if num_rows == 0 {
         let empty_keys = on_left
             .iter()
             .map(|c| c.evaluate(&batches[0])?.into_array(0))
