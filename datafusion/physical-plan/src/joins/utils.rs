@@ -1084,7 +1084,9 @@ pub(crate) fn build_batch_from_indices(
                 let data_type = build_batches
                     .first()
                     .map(|b| b.column(column_index.index).data_type().clone())
-                    .unwrap_or_else(|| schema.field(output_idx).data_type().clone());
+                    .unwrap_or_else(|| {
+                        schema.field(columns.len()).data_type().clone()
+                    });
                 new_null_array(&data_type, build_indices.len())
             }
         } else {
