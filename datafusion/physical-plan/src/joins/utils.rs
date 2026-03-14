@@ -1108,7 +1108,9 @@ pub(crate) fn build_batch_from_indices(
                     result
                 }
             } else {
-                unreachable!("interleave_indices should be Some for multi-batch non-null case")
+                unreachable!(
+                    "interleave_indices should be Some for multi-batch non-null case"
+                )
             }
         } else {
             let array = probe_batch.column(column_index.index);
