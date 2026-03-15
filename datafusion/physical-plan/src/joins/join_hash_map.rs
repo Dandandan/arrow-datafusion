@@ -396,16 +396,54 @@ where
     let one = T::try_from(1).unwrap();
 
     // Check if hashmap consists of unique values
-    // If so, we can skip the chain traversal
+    // If so, we can skip the chain traversal and batch-probe 4 at a time
     if map.len() == next_chain.len() {
         let start = offset.0;
         let end = (start + limit).min(hash_values.len());
-        for (i, &hash) in hash_values[start..end].iter().enumerate() {
-            if let Some((_, idx)) = map.find(hash, |(h, _)| hash == *h) {
-                input_indices.push(start as u32 + i as u32);
+        let slice = &hash_values[start..end];
+
+        let chunks = slice.chunks_exact(4);
+        let remainder = chunks.remainder();
+        let remainder_len = remainder.len();
+
+        for (chunk_idx, chunk) in chunks.enumerate() {
+            let base = (start + chunk_idx * 4) as u32;
+            let hashes = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            // SAFETY: We only read the returned mutable references, never write.
+            // Overlapping entries (duplicate hashes) are safe since no mutation occurs.
+            #[allow(invalid_reference_casting)]
+            let results = unsafe {
+                let map_mut = &mut *(map as *const HashTable<(u64, T)>
+                    as *mut HashTable<(u64, T)>);
+                map_mut.get_disjoint_unchecked_mut(hashes, |i, (h, _)| hashes[i] == *h)
+            };
+            if let Some((_, idx)) = results[0] {
+                input_indices.push(base);
+                match_indices.push((*idx - one).into());
+            }
+            if let Some((_, idx)) = results[1] {
+                input_indices.push(base + 1);
+                match_indices.push((*idx - one).into());
+            }
+            if let Some((_, idx)) = results[2] {
+                input_indices.push(base + 2);
+                match_indices.push((*idx - one).into());
+            }
+            if let Some((_, idx)) = results[3] {
+                input_indices.push(base + 3);
                 match_indices.push((*idx - one).into());
             }
         }
+
+        // Handle remainder
+        let remainder_start = start + slice.len() - remainder_len;
+        for (i, &hash) in remainder.iter().enumerate() {
+            if let Some((_, idx)) = map.find(hash, |(h, _)| hash == *h) {
+                input_indices.push((remainder_start + i) as u32);
+                match_indices.push((*idx - one).into());
+            }
+        }
+
         return if end == hash_values.len() {
             None
         } else {
