@@ -910,6 +910,7 @@ pub(crate) fn get_final_indices_from_bit_map(
     (left_indices, right_indices)
 }
 
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn apply_join_filter_to_indices(
     build_batches: &[RecordBatch],
     probe_batch: &RecordBatch,
@@ -1878,7 +1879,7 @@ pub(super) fn equal_rows_arr(
 
     let mut equal: BooleanArray = eq_dyn_null(&arr_left, &arr_right, null_equality)?;
 
-    for key_idx in 1..num_keys {
+    for (key_idx, <item>) in right_arrays.iter().enumerate().take(num_keys).skip(1) {
         let arr_left = gather_left_key(key_idx)?;
         let arr_right = take(right_arrays[key_idx].as_ref(), indices_right, None)?;
         let eq_result =

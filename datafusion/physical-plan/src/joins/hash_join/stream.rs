@@ -736,8 +736,7 @@ impl HashJoinStream {
         if need_produce_result_in_final(self.join_type) {
             let batch_offsets = build_side.left_data.batch_offsets();
             let mut bitmap = build_side.left_data.visited_indices_bitmap().lock();
-            left_indices.iter().flatten().for_each(|x| {
-                let packed = x as u64;
+            left_indices.iter().flatten().for_each(|packed| {
                 let batch_idx = (packed >> 32) as usize;
                 let row_idx = (packed & 0xFFFFFFFF) as usize;
                 let flat = batch_offsets[batch_idx] + row_idx;
