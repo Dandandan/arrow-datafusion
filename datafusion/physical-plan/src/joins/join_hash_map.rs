@@ -41,8 +41,6 @@ use crate::joins::chain::traverse_chain;
 const INLINE_BIT_U32: u32 = 1 << 31;
 const INLINE_BIT_U64: u64 = 1 << 63;
 
-// --- Trait ---
-
 pub trait JoinHashMapType: Send + Sync {
     fn extend_zero(&mut self, len: usize);
 
@@ -75,7 +73,7 @@ pub trait JoinHashMapType: Send + Sync {
     fn flatten(&mut self);
 }
 
-// --- InlineBit ---
+// --- InlineBit: packed value encoding ---
 
 trait InlineBit: Copy + PartialEq {
     fn is_inline(self) -> bool;
@@ -131,34 +129,51 @@ impl InlineBit for u64 {
     }
 }
 
-// --- Build + probe implementation generic over T (packed) and F (flat index) ---
+// --- Generic JoinHashMap ---
 
-/// Trait for flat index types (u32 or u64).
-trait FlatIdx: Copy + Default + Into<u64> {
-    fn from_u64(v: u64) -> Self;
+/// Hash map for join build/probe using contiguous storage.
+/// `T` is the packed map value type (u32 or u64).
+/// `F` is the flat index type (u32 or u64), must impl `Into<u64>` for output.
+pub(crate) struct JoinHashMap<T: InlineBit, F: Copy + Default + Into<u64>> {
+    map: HashTable<(u64, T)>,
+    flat_indices: Vec<F>,
+    group_offsets: Vec<u32>,
+    overflow: Vec<(u32, F)>,
+    num_groups: u32,
 }
 
-impl FlatIdx for u32 {
-    #[inline(always)]
-    fn from_u64(v: u64) -> Self {
-        v as u32
+pub type JoinHashMapU32 = JoinHashMap<u32, u32>;
+pub type JoinHashMapU64 = JoinHashMap<u64, u64>;
+
+impl<T: InlineBit, F: Copy + Default + Into<u64>> JoinHashMap<T, F> {
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            map: HashTable::with_capacity(cap),
+            flat_indices: Vec::new(),
+            group_offsets: Vec::new(),
+            overflow: Vec::new(),
+            num_groups: 0,
+        }
     }
 }
 
-impl FlatIdx for u64 {
-    #[inline(always)]
-    fn from_u64(v: u64) -> Self {
-        v
+impl<T: InlineBit, F: Copy + Default + Into<u64>> Debug for JoinHashMap<T, F> {
+    fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
+        Ok(())
     }
 }
 
-fn build_insert<T: InlineBit, F: FlatIdx>(
+// --- Build ---
+
+fn build_insert<T: InlineBit, F: Copy + Default + Into<u64>>(
     map: &mut HashTable<(u64, T)>,
     num_groups: &mut u32,
     overflow: &mut Vec<(u32, F)>,
     row: usize,
     hash_value: u64,
-) {
+) where
+    F: From<u32>,
+{
     let entry = map.entry(hash_value, |&(h, _)| hash_value == h, |&(h, _)| h);
     match entry {
         Occupied(mut occ) => {
@@ -168,9 +183,9 @@ fn build_insert<T: InlineBit, F: FlatIdx>(
                 let gid = *num_groups;
                 *num_groups += 1;
                 *packed = T::make_group_id(gid);
-                overflow.push((gid, F::from_u64(old_row)));
+                overflow.push((gid, F::from(old_row as u32)));
             }
-            overflow.push((packed.group_id(), F::from_u64(row as u64)));
+            overflow.push((packed.group_id(), F::from(row as u32)));
         }
         Vacant(vac) => {
             vac.insert((hash_value, T::make_inline(row as u64)));
@@ -178,7 +193,9 @@ fn build_insert<T: InlineBit, F: FlatIdx>(
     }
 }
 
-fn flatten_overflow<F: FlatIdx>(
+// --- Flatten ---
+
+fn flatten_overflow<F: Copy + Default + Into<u64>>(
     num_groups: u32,
     overflow: &mut Vec<(u32, F)>,
     flat_indices: &mut Vec<F>,
@@ -189,39 +206,78 @@ fn flatten_overflow<F: FlatIdx>(
     }
 
     let ng = num_groups as usize;
-    let mut counts = vec![0u32; ng];
-    for &(gid, _) in overflow.iter() {
-        counts[gid as usize] += 1;
-    }
 
+    // Count entries per group directly into group_offsets
     group_offsets.clear();
-    group_offsets.reserve(ng + 1);
-    group_offsets.push(0);
-    for &c in &counts {
-        let last = *group_offsets.last().unwrap();
-        group_offsets.push(last + c);
+    group_offsets.resize(ng + 1, 0);
+    for &(gid, _) in overflow.iter() {
+        group_offsets[gid as usize + 1] += 1;
+    }
+    // Prefix sum
+    for i in 1..=ng {
+        group_offsets[i] += group_offsets[i - 1];
     }
 
     // Place entries in reverse order (LIFO) to match linked-list traversal order.
-    let total = *group_offsets.last().unwrap() as usize;
+    let total = group_offsets[ng] as usize;
     flat_indices.clear();
     flat_indices.resize(total, F::default());
+    // Cursors start at end of each group and decrement
     let mut cursors = group_offsets[1..=ng].to_vec();
-
     for &(gid, row) in overflow.iter() {
         cursors[gid as usize] -= 1;
-        let pos = cursors[gid as usize] as usize;
-        flat_indices[pos] = row;
+        flat_indices[cursors[gid as usize] as usize] = row;
     }
 
     overflow.clear();
 }
 
-/// Probe the flattened hash map, emitting (probe_idx, build_row) pairs.
+// --- Probe ---
+
+/// Emit matches for a single packed entry. Returns `Some(offset)` if limit reached.
+#[inline(always)]
+fn emit_packed<T: InlineBit, F: Copy + Into<u64>>(
+    packed: T,
+    row_idx: usize,
+    start_pos: usize,
+    flat_indices: &[F],
+    group_offsets: &[u32],
+    remaining: &mut usize,
+    input_indices: &mut Vec<u32>,
+    match_indices: &mut Vec<u64>,
+) -> Option<MapOffset> {
+    if packed.is_inline() {
+        if *remaining == 0 {
+            return Some((row_idx, None));
+        }
+        match_indices.push(packed.inline_value());
+        input_indices.push(row_idx as u32);
+        *remaining -= 1;
+    } else {
+        let gid = packed.group_id() as usize;
+        let start = if start_pos > 0 {
+            start_pos
+        } else {
+            group_offsets[gid] as usize
+        };
+        let end = group_offsets[gid + 1] as usize;
+        for pos in start..end {
+            if *remaining == 0 {
+                return Some((row_idx, Some(pos as u64 + 1)));
+            }
+            match_indices.push(flat_indices[pos].into());
+            input_indices.push(row_idx as u32);
+            *remaining -= 1;
+        }
+    }
+    None
+}
+
+/// Probe the flattened hash map with batched finds (4 at a time).
 ///
 /// Offset convention: `Some(0)` = done with this probe idx.
 /// For resume within a group: `Some(pos + 1)` where pos is the flat_indices position.
-fn probe_flat<T: InlineBit, F: FlatIdx>(
+fn probe_flat<T: InlineBit, F: Copy + Default + Into<u64>>(
     map: &HashTable<(u64, T)>,
     flat_indices: &[F],
     group_offsets: &[u32],
@@ -242,19 +298,18 @@ fn probe_flat<T: InlineBit, F: FlatIdx>(
             if let Some((_, packed)) =
                 map.find(hash_values[idx], |(h, _)| hash_values[idx] == *h)
             {
-                if !packed.is_inline() {
-                    let gid = packed.group_id() as usize;
-                    let end = group_offsets[gid + 1] as usize;
-                    let resume = (pos_plus_one - 1) as usize;
-
-                    for pos in resume..end {
-                        if remaining == 0 {
-                            return Some((idx, Some(pos as u64 + 1)));
-                        }
-                        match_indices.push(flat_indices[pos].into());
-                        input_indices.push(idx as u32);
-                        remaining -= 1;
-                    }
+                let resume = (pos_plus_one - 1) as usize;
+                if let Some(off) = emit_packed(
+                    *packed,
+                    idx,
+                    resume,
+                    flat_indices,
+                    group_offsets,
+                    &mut remaining,
+                    input_indices,
+                    match_indices,
+                ) {
+                    return Some(off);
                 }
             }
             idx + 1
@@ -274,27 +329,17 @@ fn probe_flat<T: InlineBit, F: FlatIdx>(
 
         for (j, r) in [r0, r1, r2, r3].into_iter().enumerate() {
             if let Some((_, packed)) = r {
-                let row_idx = base + j;
-                let packed = *packed;
-                if packed.is_inline() {
-                    if remaining == 0 {
-                        return Some((row_idx, None));
-                    }
-                    match_indices.push(packed.inline_value());
-                    input_indices.push(row_idx as u32);
-                    remaining -= 1;
-                } else {
-                    let gid = packed.group_id() as usize;
-                    let start = group_offsets[gid] as usize;
-                    let end = group_offsets[gid + 1] as usize;
-                    for pos in start..end {
-                        if remaining == 0 {
-                            return Some((row_idx, Some(pos as u64 + 1)));
-                        }
-                        match_indices.push(flat_indices[pos].into());
-                        input_indices.push(row_idx as u32);
-                        remaining -= 1;
-                    }
+                if let Some(off) = emit_packed(
+                    *packed,
+                    base + j,
+                    0,
+                    flat_indices,
+                    group_offsets,
+                    &mut remaining,
+                    input_indices,
+                    match_indices,
+                ) {
+                    return Some(off);
                 }
             }
         }
@@ -302,74 +347,31 @@ fn probe_flat<T: InlineBit, F: FlatIdx>(
 
     let remainder_start = to_skip + remaining_slice.len() - remainder.len();
     for (i, &hash) in remainder.iter().enumerate() {
-        let row_idx = remainder_start + i;
         if let Some((_, packed)) = map.find(hash, |(h, _)| hash == *h) {
-            let packed = *packed;
-            if packed.is_inline() {
-                if remaining == 0 {
-                    return Some((row_idx, None));
-                }
-                match_indices.push(packed.inline_value());
-                input_indices.push(row_idx as u32);
-                remaining -= 1;
-            } else {
-                let gid = packed.group_id() as usize;
-                let start = group_offsets[gid] as usize;
-                let end = group_offsets[gid + 1] as usize;
-                for pos in start..end {
-                    if remaining == 0 {
-                        return Some((row_idx, Some(pos as u64 + 1)));
-                    }
-                    match_indices.push(flat_indices[pos].into());
-                    input_indices.push(row_idx as u32);
-                    remaining -= 1;
-                }
+            if let Some(off) = emit_packed(
+                *packed,
+                remainder_start + i,
+                0,
+                flat_indices,
+                group_offsets,
+                &mut remaining,
+                input_indices,
+                match_indices,
+            ) {
+                return Some(off);
             }
         }
     }
     None
 }
 
-// --- JoinHashMapU32 ---
+// --- JoinHashMapType impl ---
 
-pub struct JoinHashMapU32 {
-    map: HashTable<(u64, u32)>,
-    flat_indices: Vec<u32>,
-    group_offsets: Vec<u32>,
-    overflow: Vec<(u32, u32)>, // (group_id, row_index)
-    num_groups: u32,
-}
-
-impl JoinHashMapU32 {
-    pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            map: HashTable::with_capacity(cap),
-            flat_indices: Vec::new(),
-            group_offsets: Vec::new(),
-            overflow: Vec::new(),
-            num_groups: 0,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new(map: HashTable<(u64, u32)>, _next: Vec<u32>) -> Self {
-        Self {
-            map,
-            flat_indices: Vec::new(),
-            group_offsets: Vec::new(),
-            overflow: Vec::new(),
-            num_groups: 0,
-        }
-    }
-}
-
-impl Debug for JoinHashMapU32 {
-    fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
-        Ok(())
-    }
-}
-
-impl JoinHashMapType for JoinHashMapU32 {
+impl<T, F> JoinHashMapType for JoinHashMap<T, F>
+where
+    T: InlineBit + Send + Sync,
+    F: Copy + Default + Into<u64> + From<u32> + Send + Sync,
+{
     fn extend_zero(&mut self, _: usize) {}
 
     fn update_from_iter<'a>(
@@ -393,7 +395,9 @@ impl JoinHashMapType for JoinHashMapU32 {
         _iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
         _deleted_offset: Option<usize>,
     ) -> (Vec<u32>, Vec<u64>) {
-        unimplemented!("use get_matched_indices_with_limit_offset")
+        unimplemented!(
+            "JoinHashMap does not support get_matched_indices; use get_matched_indices_with_limit_offset"
+        )
     }
 
     fn get_matched_indices_with_limit_offset(
@@ -423,119 +427,13 @@ impl JoinHashMapType for JoinHashMapU32 {
     fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+
     fn len(&self) -> usize {
         self.map.len()
     }
 
     fn flatten(&mut self) {
-        flatten_overflow::<u32>(
-            self.num_groups,
-            &mut self.overflow,
-            &mut self.flat_indices,
-            &mut self.group_offsets,
-        );
-    }
-}
-
-// --- JoinHashMapU64 ---
-
-pub struct JoinHashMapU64 {
-    map: HashTable<(u64, u64)>,
-    flat_indices: Vec<u64>,
-    group_offsets: Vec<u32>,
-    overflow: Vec<(u32, u64)>,
-    num_groups: u32,
-}
-
-impl JoinHashMapU64 {
-    pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            map: HashTable::with_capacity(cap),
-            flat_indices: Vec::new(),
-            group_offsets: Vec::new(),
-            overflow: Vec::new(),
-            num_groups: 0,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new(map: HashTable<(u64, u64)>, _next: Vec<u64>) -> Self {
-        Self {
-            map,
-            flat_indices: Vec::new(),
-            group_offsets: Vec::new(),
-            overflow: Vec::new(),
-            num_groups: 0,
-        }
-    }
-}
-
-impl Debug for JoinHashMapU64 {
-    fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
-        Ok(())
-    }
-}
-
-impl JoinHashMapType for JoinHashMapU64 {
-    fn extend_zero(&mut self, _: usize) {}
-
-    fn update_from_iter<'a>(
-        &mut self,
-        iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
-        _deleted_offset: usize,
-    ) {
-        for (row, hash) in iter {
-            build_insert(
-                &mut self.map,
-                &mut self.num_groups,
-                &mut self.overflow,
-                row,
-                *hash,
-            );
-        }
-    }
-
-    fn get_matched_indices<'a>(
-        &self,
-        _iter: Box<dyn Iterator<Item = (usize, &'a u64)> + 'a>,
-        _deleted_offset: Option<usize>,
-    ) -> (Vec<u32>, Vec<u64>) {
-        unimplemented!("use get_matched_indices_with_limit_offset")
-    }
-
-    fn get_matched_indices_with_limit_offset(
-        &self,
-        hash_values: &[u64],
-        limit: usize,
-        offset: MapOffset,
-        input_indices: &mut Vec<u32>,
-        match_indices: &mut Vec<u64>,
-    ) -> Option<MapOffset> {
-        probe_flat(
-            &self.map,
-            &self.flat_indices,
-            &self.group_offsets,
-            hash_values,
-            limit,
-            offset,
-            input_indices,
-            match_indices,
-        )
-    }
-
-    fn contain_hashes(&self, hash_values: &[u64]) -> BooleanArray {
-        contain_hashes(&self.map, hash_values)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-    fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    fn flatten(&mut self) {
-        flatten_overflow::<u64>(
+        flatten_overflow(
             self.num_groups,
             &mut self.overflow,
             &mut self.flat_indices,
