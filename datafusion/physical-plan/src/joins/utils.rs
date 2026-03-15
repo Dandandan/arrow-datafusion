@@ -1879,8 +1879,7 @@ pub(super) fn equal_rows_arr(
 
     let mut equal: BooleanArray = eq_dyn_null(&arr_left, &arr_right, null_equality)?;
 
-    for (key_idx, <item>) in right_arrays.iter().enumerate().take(num_keys).skip(1) {
-        let arr_left = gather_left_key(key_idx)?;
+    for (key_idx, arr_left) in right_arrays.iter().enumerate().take(num_keys).skip(1) {
         let arr_right = take(right_arrays[key_idx].as_ref(), indices_right, None)?;
         let eq_result =
             eq_dyn_null(arr_left.as_ref(), arr_right.as_ref(), null_equality)?;
