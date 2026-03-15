@@ -107,6 +107,10 @@ impl JoinHashMapType for PruningJoinHashMap {
     fn len(&self) -> usize {
         self.map.len()
     }
+
+    fn flatten(&mut self) {
+        // No-op: PruningJoinHashMap is incrementally updated and cannot be flattened.
+    }
 }
 
 /// The `PruningJoinHashMap` is similar to a regular `JoinHashMap`, but with
