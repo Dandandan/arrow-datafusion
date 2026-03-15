@@ -32,49 +32,54 @@ pub(super) fn build_struct_fields(data_types: &[DataType]) -> Result<Fields> {
         .collect()
 }
 
-/// Builds InList values from join key column arrays.
+/// Builds InList values from per-batch join key column arrays.
 ///
-/// If `join_key_arrays` is:
-/// 1. A single array, let's say Int32, this will produce a flat
-///    InList expression where the lookup is expected to be scalar Int32 values,
-///    that is: this will produce `IN LIST (1, 2, 3)` expected to be used as `2 IN LIST (1, 2, 3)`.
-/// 2. An Int32 array and a Utf8 array, this will produce a Struct InList expression
-///    where the lookup is expected to be Struct values with two fields (Int32, Utf8),
-///    that is: this will produce `IN LIST ((1, "a"), (2, "b"))` expected to be used as `(2, "b") IN LIST ((1, "a"), (2, "b"))`.
-///    The field names of the struct are auto-generated as "c0", "c1", ... and should match the struct expression used in the join keys.
+/// `values_per_batch` is indexed as `values_per_batch[batch_idx][key_idx]`.
+///
+/// If there is a single key column, this concatenates the per-batch arrays into a single flat array.
+/// If there are multiple key columns, this builds per-batch StructArrays and concatenates them.
 ///
 /// Note that this function does not deduplicate values - deduplication will happen later
 /// when building an InList expression from this array via `InListExpr::try_new_from_array`.
-///
-/// Returns `None` if the estimated size exceeds `max_size_bytes` or if the number of rows
-/// exceeds `max_distinct_values`.
 pub(super) fn build_struct_inlist_values(
-    join_key_arrays: &[ArrayRef],
+    values_per_batch: &[Vec<ArrayRef>],
 ) -> Result<Option<ArrayRef>> {
-    // Build the source array/struct
-    let source_array: ArrayRef = if join_key_arrays.len() == 1 {
-        // Single column: use directly
-        Arc::clone(&join_key_arrays[0])
-    } else {
-        // Multi-column: build StructArray once from all columns
-        let fields = build_struct_fields(
-            &join_key_arrays
-                .iter()
-                .map(|arr| arr.data_type().clone())
-                .collect::<Vec<_>>(),
-        )?;
+    if values_per_batch.is_empty() || values_per_batch[0].is_empty() {
+        return Ok(None);
+    }
 
-        // Build field references with proper Arc wrapping
-        let arrays_with_fields: Vec<(FieldRef, ArrayRef)> = fields
+    let num_keys = values_per_batch[0].len();
+
+    if num_keys == 1 {
+        // Single column: concat per-batch arrays directly
+        let arrays: Vec<&dyn arrow::array::Array> = values_per_batch
             .iter()
-            .cloned()
-            .zip(join_key_arrays.iter().cloned())
+            .map(|keys| keys[0].as_ref())
+            .collect();
+        let concatenated = arrow::compute::concat(&arrays)?;
+        Ok(Some(concatenated))
+    } else {
+        // Multi-column: build per-batch StructArrays (zero-copy wrap), then concat
+        let data_types: Vec<DataType> = values_per_batch[0]
+            .iter()
+            .map(|arr| arr.data_type().clone())
+            .collect();
+        let fields = build_struct_fields(&data_types)?;
+
+        let struct_arrays: Vec<ArrayRef> = values_per_batch
+            .iter()
+            .map(|keys| {
+                let arrays_with_fields: Vec<(FieldRef, ArrayRef)> =
+                    fields.iter().cloned().zip(keys.iter().cloned()).collect();
+                Arc::new(StructArray::from(arrays_with_fields)) as ArrayRef
+            })
             .collect();
 
-        Arc::new(StructArray::from(arrays_with_fields))
-    };
-
-    Ok(Some(source_array))
+        let refs: Vec<&dyn arrow::array::Array> =
+            struct_arrays.iter().map(|a| a.as_ref()).collect();
+        let concatenated = arrow::compute::concat(&refs)?;
+        Ok(Some(concatenated))
+    }
 }
 
 #[cfg(test)]
@@ -89,11 +94,23 @@ mod tests {
     #[test]
     fn test_build_single_column_inlist_array() {
         let array = Arc::new(Int32Array::from(vec![1, 2, 3, 2, 1])) as ArrayRef;
-        let result = build_struct_inlist_values(std::slice::from_ref(&array))
-            .unwrap()
-            .unwrap();
+        // Single batch with single key column
+        let batches = vec![vec![Arc::clone(&array)]];
+        let result = build_struct_inlist_values(&batches).unwrap().unwrap();
 
         assert!(array.eq(&result));
+    }
+
+    #[test]
+    fn test_build_single_column_multi_batch() {
+        let array1 = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let array2 = Arc::new(Int32Array::from(vec![2, 1])) as ArrayRef;
+        // Two batches with single key column
+        let batches = vec![vec![Arc::clone(&array1)], vec![Arc::clone(&array2)]];
+        let result = build_struct_inlist_values(&batches).unwrap().unwrap();
+
+        let expected = Arc::new(Int32Array::from(vec![1, 2, 3, 2, 1])) as ArrayRef;
+        assert!(expected.eq(&result));
     }
 
     #[test]
@@ -102,9 +119,9 @@ mod tests {
         let array2 =
             Arc::new(StringArray::from(vec!["a", "b", "c", "b", "a"])) as ArrayRef;
 
-        let result = build_struct_inlist_values(&[array1, array2])
-            .unwrap()
-            .unwrap();
+        // Single batch with two key columns
+        let batches = vec![vec![array1, array2]];
+        let result = build_struct_inlist_values(&batches).unwrap().unwrap();
 
         assert_eq!(
             *result.data_type(),
@@ -124,9 +141,9 @@ mod tests {
 
         let int_array = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
 
-        let result = build_struct_inlist_values(&[dict_array, int_array])
-            .unwrap()
-            .unwrap();
+        // Single batch with two key columns
+        let batches = vec![vec![dict_array, int_array]];
+        let result = build_struct_inlist_values(&batches).unwrap().unwrap();
 
         assert_eq!(result.len(), 3);
         assert_eq!(
@@ -150,9 +167,9 @@ mod tests {
         let values = Arc::new(StringArray::from(vec!["foo"]));
         let dict_array = Arc::new(DictionaryArray::new(keys, values)) as ArrayRef;
 
-        let result = build_struct_inlist_values(std::slice::from_ref(&dict_array))
-            .unwrap()
-            .unwrap();
+        // Single batch with single key column
+        let batches = vec![vec![Arc::clone(&dict_array)]];
+        let result = build_struct_inlist_values(&batches).unwrap().unwrap();
 
         assert_eq!(result.len(), 3);
         assert_eq!(result.data_type(), dict_array.data_type());

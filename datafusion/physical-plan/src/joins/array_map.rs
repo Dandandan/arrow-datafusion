@@ -157,12 +157,17 @@ impl ArrayMap {
         max_val.wrapping_sub(min_val)
     }
 
-    /// Creates a new [`ArrayMap`] from the given array of join keys.
+    /// Creates a new [`ArrayMap`] from per-batch arrays of join keys.
     ///
-    /// Note: This function processes only the non-null values in the input `array`,
+    /// Note: This function processes only the non-null values in the input arrays,
     /// ignoring any rows where the key is `NULL`.
     ///
-    pub(crate) fn try_new(array: &ArrayRef, min_val: u64, max_val: u64) -> Result<Self> {
+    pub(crate) fn try_new(
+        arrays: &[&ArrayRef],
+        total_num_rows: usize,
+        min_val: u64,
+        max_val: u64,
+    ) -> Result<Self> {
         let range = max_val.wrapping_sub(min_val);
         if range >= usize::MAX as u64 {
             return internal_err!("ArrayMap key range is too large to be allocated.");
@@ -173,10 +178,16 @@ impl ArrayMap {
         let mut next: Vec<u32> = vec![];
         let mut num_of_distinct_key = 0;
 
+        let data_type = arrays
+            .first()
+            .map(|a| a.data_type().clone())
+            .unwrap_or(DataType::Int32);
+
         downcast_supported_integer!(
-            array.data_type() => (
-                fill_data,
-                array,
+            &data_type => (
+                fill_data_batched,
+                arrays,
+                total_num_rows,
                 min_val,
                 &mut data,
                 &mut next,
@@ -192,8 +203,9 @@ impl ArrayMap {
         })
     }
 
-    fn fill_data<T: ArrowNumericType>(
-        array: &ArrayRef,
+    fn fill_data_batched<T: ArrowNumericType>(
+        arrays: &[&ArrayRef],
+        total_num_rows: usize,
         offset_val: u64,
         data: &mut [u32],
         next: &mut Vec<u32>,
@@ -202,25 +214,32 @@ impl ArrayMap {
     where
         T::Native: AsPrimitive<u64>,
     {
-        let arr = array.as_primitive::<T>();
         // Iterate in reverse to maintain FIFO order when there are duplicate keys.
-        for (i, val) in arr.iter().enumerate().rev() {
-            if let Some(val) = val {
-                let key: u64 = val.as_();
-                let idx = key.wrapping_sub(offset_val) as usize;
-                if idx >= data.len() {
-                    return internal_err!("failed build Array idx >= data.len()");
-                }
-
-                if data[idx] != 0 {
-                    if next.is_empty() {
-                        *next = vec![0; array.len()]
+        // We iterate batches in reverse, and within each batch iterate rows in reverse,
+        // using a flat index that spans all batches.
+        let mut flat_offset = total_num_rows;
+        for array in arrays.iter().rev() {
+            let arr = array.as_primitive::<T>();
+            flat_offset -= arr.len();
+            for (row_idx, val) in arr.iter().enumerate().rev() {
+                if let Some(val) = val {
+                    let key: u64 = val.as_();
+                    let idx = key.wrapping_sub(offset_val) as usize;
+                    if idx >= data.len() {
+                        return internal_err!("failed build Array idx >= data.len()");
                     }
-                    next[i] = data[idx]
-                } else {
-                    *num_of_distinct_key += 1;
+                    let flat_idx = flat_offset + row_idx;
+
+                    if data[idx] != 0 {
+                        if next.is_empty() {
+                            *next = vec![0; total_num_rows]
+                        }
+                        next[flat_idx] = data[idx]
+                    } else {
+                        *num_of_distinct_key += 1;
+                    }
+                    data[idx] = flat_idx as u32 + 1;
                 }
-                data[idx] = (i) as u32 + 1;
             }
         }
         Ok(())
@@ -419,7 +438,7 @@ mod tests {
     #[test]
     fn test_array_map_limit_offset_duplicate_elements() -> Result<()> {
         let build: ArrayRef = Arc::new(Int32Array::from(vec![1, 1, 2]));
-        let map = ArrayMap::try_new(&build, 1, 2)?;
+        let map = ArrayMap::try_new(&[&build], build.len(), 1, 2)?;
         let probe = [Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef];
 
         let mut prob_idx = Vec::new();
@@ -450,7 +469,7 @@ mod tests {
     #[test]
     fn test_array_map_with_limit_and_misses() -> Result<()> {
         let build: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
-        let map = ArrayMap::try_new(&build, 1, 2)?;
+        let map = ArrayMap::try_new(&[&build], build.len(), 1, 2)?;
         let probe = [Arc::new(Int32Array::from(vec![10, 1, 2])) as ArrayRef];
 
         let (mut p_idx, mut b_idx) = (vec![], vec![]);
@@ -483,7 +502,7 @@ mod tests {
     #[test]
     fn test_array_map_with_build_duplicates_and_misses() -> Result<()> {
         let build_array: ArrayRef = Arc::new(Int32Array::from(vec![1, 1]));
-        let array_map = ArrayMap::try_new(&build_array, 1, 1)?;
+        let array_map = ArrayMap::try_new(&[&build_array], build_array.len(), 1, 1)?;
         // prob: 10(m), 1(h1, h2), 20(m), 1(h1, h2)
         let probe_array: ArrayRef = Arc::new(Int32Array::from(vec![10, 1, 20, 1]));
         let prob_side_keys = [probe_array];
@@ -513,7 +532,12 @@ mod tests {
         let min_val = -5_i128;
         let max_val = 10_i128;
 
-        let array_map = ArrayMap::try_new(&build_array, min_val as u64, max_val as u64)?;
+        let array_map = ArrayMap::try_new(
+            &[&build_array],
+            build_array.len(),
+            min_val as u64,
+            max_val as u64,
+        )?;
 
         // Probe array
         let probe_array: ArrayRef = Arc::new(Int64Array::from(vec![0, -5, 10, -1]));

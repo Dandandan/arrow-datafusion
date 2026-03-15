@@ -65,7 +65,7 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{Array, ArrayRef, BooleanBufferBuilder, UInt64Array, new_null_array};
+use arrow::array::{ArrayRef, BooleanBufferBuilder, UInt64Array};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
@@ -112,7 +112,7 @@ fn try_create_array_map(
     perfect_hash_join_small_build_threshold: usize,
     perfect_hash_join_min_key_density: f64,
     null_equality: NullEquality,
-) -> Result<Option<(ArrayMap, Vec<ArrayRef>)>> {
+) -> Result<Option<ArrayMap>> {
     if on_left.len() != 1 {
         return Ok(None);
     }
@@ -177,32 +177,19 @@ fn try_create_array_map(
     let mem_size = ArrayMap::estimate_memory_size(min_val, max_val, num_row);
     reservation.try_grow(mem_size)?;
 
-    // Evaluate key expressions per-batch and concatenate for ArrayMap construction
-    let per_batch_keys: Vec<Vec<ArrayRef>> = batches
+    // Evaluate key expressions per-batch (no concatenation needed)
+    let per_batch_keys: Vec<ArrayRef> = batches
         .iter()
-        .map(|batch| evaluate_expressions_to_arrays(on_left, batch))
+        .map(|batch| {
+            let arrays = evaluate_expressions_to_arrays(on_left, batch)?;
+            Ok(arrays.into_iter().next().unwrap())
+        })
         .collect::<Result<Vec<_>>>()?;
-    let left_values: Vec<ArrayRef> = if per_batch_keys.is_empty() || on_left.is_empty() {
-        on_left
-            .iter()
-            .map(|_| new_null_array(&DataType::Null, 0))
-            .collect()
-    } else {
-        let num_keys = on_left.len();
-        (0..num_keys)
-            .map(|key_idx| {
-                let arrays: Vec<&dyn Array> = per_batch_keys
-                    .iter()
-                    .map(|keys| keys[key_idx].as_ref())
-                    .collect();
-                Ok(arrow::compute::concat(&arrays)?)
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
+    let key_refs: Vec<&ArrayRef> = per_batch_keys.iter().collect();
 
-    let array_map = ArrayMap::try_new(&left_values[0], min_val, max_val)?;
+    let array_map = ArrayMap::try_new(&key_refs, num_row, min_val, max_val)?;
 
-    Ok(Some((array_map, left_values)))
+    Ok(Some(array_map))
 }
 
 /// Convert flat indices (used in the visited bitmap) to packed composite indices
@@ -2026,7 +2013,7 @@ async fn collect_left_input(
         _ => None,
     };
 
-    let (join_hash_map, should_reverse_batches) = if let Some((array_map, _left_value)) =
+    let (join_hash_map, should_reverse_batches) = if let Some(array_map) =
         try_create_array_map(
             &bounds,
             &schema,
@@ -2152,30 +2139,14 @@ async fn collect_left_input(
     let membership = if num_rows == 0 {
         PushdownStrategy::Empty
     } else {
-        // For membership testing, we need concatenated key columns.
-        // Concat from the per-batch values.
-        let concat_values: Vec<ArrayRef> =
-            if values_per_batch.is_empty() || values_per_batch[0].is_empty() {
-                vec![]
-            } else {
-                let num_keys = values_per_batch[0].len();
-                (0..num_keys)
-                    .map(|key_idx| {
-                        let arrays: Vec<&dyn Array> = values_per_batch
-                            .iter()
-                            .map(|keys| keys[key_idx].as_ref())
-                            .collect();
-                        Ok(arrow::compute::concat(&arrays)?)
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            };
-
-        let estimated_size = concat_values
+        // Estimate total size from per-batch values (avoid concatenation for size check)
+        let estimated_size: usize = values_per_batch
             .iter()
+            .flat_map(|keys| keys.iter())
             .map(|arr| arr.get_array_memory_size())
-            .sum::<usize>();
-        if concat_values.is_empty()
-            || concat_values[0].is_empty()
+            .sum();
+        if values_per_batch.is_empty()
+            || values_per_batch[0].is_empty()
             || estimated_size > config.optimizer.hash_join_inlist_pushdown_max_size
             || map.num_of_distinct_key()
                 > config
@@ -2183,7 +2154,9 @@ async fn collect_left_input(
                     .hash_join_inlist_pushdown_max_distinct_values
         {
             PushdownStrategy::Map(Arc::clone(&map))
-        } else if let Some(in_list_values) = build_struct_inlist_values(&concat_values)? {
+        } else if let Some(in_list_values) =
+            build_struct_inlist_values(&values_per_batch)?
+        {
             PushdownStrategy::InList(in_list_values)
         } else {
             PushdownStrategy::Map(Arc::clone(&map))
