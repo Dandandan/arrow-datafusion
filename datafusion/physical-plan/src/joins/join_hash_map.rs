@@ -408,34 +408,28 @@ where
 
         for (chunk_idx, chunk) in chunks.enumerate() {
             let base = (start + chunk_idx * 4) as u32;
-            let hashes = [chunk[0], chunk[1], chunk[2], chunk[3]];
-            // SAFETY: We only read the returned mutable references, never write.
-            // Overlapping entries (duplicate hashes) are safe since no mutation occurs.
-            #[allow(invalid_reference_casting)]
-            let results = unsafe {
-                let map_mut = &mut *(map as *const HashTable<(u64, T)>
-                    as *mut HashTable<(u64, T)>);
-                map_mut.get_disjoint_unchecked_mut(hashes, |i, (h, _)| hashes[i] == *h)
-            };
-            if let Some((_, idx)) = results[0] {
+            let r0 = map.find(chunk[0], |(h, _)| chunk[0] == *h);
+            let r1 = map.find(chunk[1], |(h, _)| chunk[1] == *h);
+            let r2 = map.find(chunk[2], |(h, _)| chunk[2] == *h);
+            let r3 = map.find(chunk[3], |(h, _)| chunk[3] == *h);
+            if let Some((_, idx)) = r0 {
                 input_indices.push(base);
                 match_indices.push((*idx - one).into());
             }
-            if let Some((_, idx)) = results[1] {
+            if let Some((_, idx)) = r1 {
                 input_indices.push(base + 1);
                 match_indices.push((*idx - one).into());
             }
-            if let Some((_, idx)) = results[2] {
+            if let Some((_, idx)) = r2 {
                 input_indices.push(base + 2);
                 match_indices.push((*idx - one).into());
             }
-            if let Some((_, idx)) = results[3] {
+            if let Some((_, idx)) = r3 {
                 input_indices.push(base + 3);
                 match_indices.push((*idx - one).into());
             }
         }
 
-        // Handle remainder
         let remainder_start = start + slice.len() - remainder_len;
         for (i, &hash) in remainder.iter().enumerate() {
             if let Some((_, idx)) = map.find(hash, |(h, _)| hash == *h) {
@@ -481,8 +475,78 @@ where
     };
 
     let hash_values_len = hash_values.len();
-    for (i, &hash) in hash_values[to_skip..].iter().enumerate() {
-        let row_idx = to_skip + i;
+    let remaining_slice = &hash_values[to_skip..];
+    let chunks = remaining_slice.chunks_exact(4);
+    let remainder = chunks.remainder();
+
+    for (chunk_idx, chunk) in chunks.enumerate() {
+        let base = to_skip + chunk_idx * 4;
+        let r0 = map.find(chunk[0], |(h, _)| chunk[0] == *h);
+        let r1 = map.find(chunk[1], |(h, _)| chunk[1] == *h);
+        let r2 = map.find(chunk[2], |(h, _)| chunk[2] == *h);
+        let r3 = map.find(chunk[3], |(h, _)| chunk[3] == *h);
+
+        if let Some((_, idx)) = r0 {
+            let row_idx = base;
+            if let Some(next_offset) = traverse_chain(
+                next_chain,
+                row_idx,
+                *idx,
+                &mut remaining_output,
+                input_indices,
+                match_indices,
+                row_idx == hash_values_len - 1,
+            ) {
+                return Some(next_offset);
+            }
+        }
+        if let Some((_, idx)) = r1 {
+            let row_idx = base + 1;
+            if let Some(next_offset) = traverse_chain(
+                next_chain,
+                row_idx,
+                *idx,
+                &mut remaining_output,
+                input_indices,
+                match_indices,
+                row_idx == hash_values_len - 1,
+            ) {
+                return Some(next_offset);
+            }
+        }
+        if let Some((_, idx)) = r2 {
+            let row_idx = base + 2;
+            if let Some(next_offset) = traverse_chain(
+                next_chain,
+                row_idx,
+                *idx,
+                &mut remaining_output,
+                input_indices,
+                match_indices,
+                row_idx == hash_values_len - 1,
+            ) {
+                return Some(next_offset);
+            }
+        }
+        if let Some((_, idx)) = r3 {
+            let row_idx = base + 3;
+            if let Some(next_offset) = traverse_chain(
+                next_chain,
+                row_idx,
+                *idx,
+                &mut remaining_output,
+                input_indices,
+                match_indices,
+                row_idx == hash_values_len - 1,
+            ) {
+                return Some(next_offset);
+            }
+        }
+    }
+
+    let remainder_start = to_skip + remaining_slice.len() - remainder.len();
+    for (i, &hash) in remainder.iter().enumerate() {
+        let row_idx = remainder_start + i;
         if let Some((_, idx)) = map.find(hash, |(h, _)| hash == *h) {
             let idx: T = *idx;
             let is_last = row_idx == hash_values_len - 1;
