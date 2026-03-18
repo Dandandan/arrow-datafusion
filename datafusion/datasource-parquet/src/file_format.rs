@@ -341,10 +341,12 @@ impl ParquetFormat {
             .iter()
             .map(|field| {
                 if dict_columns.contains(field.name()) {
-                    // Transform string columns to Dictionary<Int32, Utf8View>
+                    // Transform string columns to Dictionary<Int32, Utf8>.
+                    // Note: arrow-rs dictionary reader only supports Utf8/LargeUtf8
+                    // as value types, NOT Utf8View. So we use Utf8 here.
                     let value_type = match field.data_type() {
                         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                            DataType::Utf8View
+                            DataType::Utf8
                         }
                         other => other.clone(),
                     };
