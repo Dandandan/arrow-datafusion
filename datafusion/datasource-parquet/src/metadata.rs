@@ -26,6 +26,7 @@ use arrow::compute::and;
 use arrow::compute::kernels::cmp::eq;
 use arrow::compute::sum;
 use arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
+use datafusion_common::HashSet;
 use datafusion_common::encryption::FileDecryptionProperties;
 use datafusion_common::stats::Precision;
 use datafusion_common::{
@@ -613,6 +614,46 @@ fn has_any_exact_match(
     let eq_mask = eq(&scalar_array, &array).ok()?;
     let combined_mask = and(&eq_mask, exactness).ok()?;
     Some(combined_mask.true_count() > 0)
+}
+
+/// Detect which string columns in the schema use dictionary encoding
+/// in the Parquet file by checking the first row group's column metadata.
+///
+/// Returns a set of column names that use dictionary encoding and are
+/// string types (Utf8, LargeUtf8, or Utf8View).
+pub(crate) fn detect_dictionary_columns(
+    metadata: &ParquetMetaData,
+    schema: &Schema,
+) -> HashSet<String> {
+    let mut dict_columns = HashSet::new();
+
+    // Check the first row group for dictionary encoding info
+    let Some(first_rg) = metadata.row_groups().first() else {
+        return dict_columns;
+    };
+
+    let parquet_schema = metadata.file_metadata().schema_descr();
+
+    for field in schema.fields().iter() {
+        // Only consider string-like columns
+        if !matches!(
+            field.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) {
+            continue;
+        }
+
+        // Find the corresponding parquet column index
+        if let Some((parquet_idx, _)) =
+            parquet_column(parquet_schema, schema, field.name())
+            && let Some(col_meta) = first_rg.columns().get(parquet_idx)
+            && col_meta.dictionary_page_offset().is_some()
+        {
+            dict_columns.insert(field.name().clone());
+        }
+    }
+
+    dict_columns
 }
 
 /// Wrapper to implement [`FileMetadata`] for [`ParquetMetaData`].

@@ -209,6 +209,7 @@ impl ParquetOptions {
             coerce_int96: _,     // not used for writer props
             skip_arrow_metadata: _,
             max_predicate_cache_size: _,
+            dictionary_encoding_preservation: _, // not used for writer props
         } = self;
 
         let mut builder = WriterProperties::builder()
@@ -576,6 +577,8 @@ mod tests {
                 binary_as_string: global_options_defaults.binary_as_string,
                 skip_arrow_metadata: global_options_defaults.skip_arrow_metadata,
                 coerce_int96: None,
+                dictionary_encoding_preservation: global_options_defaults
+                    .dictionary_encoding_preservation,
             },
             column_specific_options,
             key_value_metadata,

@@ -747,6 +747,14 @@ config_namespace! {
         /// BLOB instead.
         pub binary_as_string: bool, default = false
 
+        /// (reading) If true, parquet reader will preserve dictionary encoding
+        /// for string columns that are dictionary-encoded in the Parquet file.
+        /// Such columns will be read as `Dictionary<Int32, Utf8View>` instead
+        /// of being decoded to plain `Utf8View`. This can significantly reduce
+        /// memory usage and improve performance for columns with low cardinality
+        /// (few distinct values), such as country codes, status fields, or tags.
+        pub dictionary_encoding_preservation: bool, default = false
+
         /// (reading) If true, parquet reader will read columns of
         /// physical type int96 as originating from a different resolution
         /// than nanosecond. This is useful for reading data from systems like Spark

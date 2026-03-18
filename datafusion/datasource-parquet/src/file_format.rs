@@ -61,7 +61,9 @@ use datafusion_physical_plan::metrics::{
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion_session::Session;
 
-use crate::metadata::{DFParquetMetadata, lex_ordering_to_sorting_columns};
+use crate::metadata::{
+    DFParquetMetadata, detect_dictionary_columns, lex_ordering_to_sorting_columns,
+};
 use crate::reader::CachedParquetFileReaderFactory;
 use crate::source::{ParquetSource, parse_coerce_int96_string};
 use async_trait::async_trait;
@@ -278,6 +280,20 @@ impl ParquetFormat {
         self
     }
 
+    /// Return `true` if dictionary encoding should be preserved for string columns.
+    ///
+    /// If this returns true, DataFusion will read dictionary-encoded string columns
+    /// as `Dictionary<Int32, Utf8View>` instead of decoding them to plain `Utf8View`.
+    pub fn dictionary_encoding_preservation(&self) -> bool {
+        self.options.global.dictionary_encoding_preservation
+    }
+
+    /// If true, will preserve dictionary encoding. See [`Self::dictionary_encoding_preservation`] for details
+    pub fn with_dictionary_encoding_preservation(mut self, preserve: bool) -> Self {
+        self.options.global.dictionary_encoding_preservation = preserve;
+        self
+    }
+
     pub fn coerce_int96(&self) -> Option<String> {
         self.options.global.coerce_int96.clone()
     }
@@ -285,6 +301,71 @@ impl ParquetFormat {
     pub fn with_coerce_int96(mut self, time_unit: Option<String>) -> Self {
         self.options.global.coerce_int96 = time_unit;
         self
+    }
+
+    /// Detect dictionary-encoded string columns from the first Parquet file
+    /// and transform the schema to use `Dictionary<Int32, Utf8View>` for those columns.
+    async fn apply_dictionary_preservation(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        objects: &[ObjectMeta],
+        schema: &Schema,
+        coerce_int96: Option<TimeUnit>,
+        file_metadata_cache: &Arc<dyn FileMetadataCache>,
+    ) -> Option<Schema> {
+        // Use the first file to detect dictionary encoding
+        let first_object = objects.first()?;
+
+        let file_decryption_properties =
+            get_file_decryption_properties(state, &self.options, &first_object.location)
+                .await
+                .ok()?;
+
+        let metadata = DFParquetMetadata::new(store.as_ref(), first_object)
+            .with_metadata_size_hint(self.metadata_size_hint())
+            .with_decryption_properties(file_decryption_properties)
+            .with_file_metadata_cache(Some(Arc::clone(file_metadata_cache)))
+            .with_coerce_int96(coerce_int96)
+            .fetch_metadata()
+            .await
+            .ok()?;
+
+        let dict_columns = detect_dictionary_columns(&metadata, schema);
+        if dict_columns.is_empty() {
+            return None;
+        }
+
+        let transformed_fields: Vec<Arc<Field>> = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if dict_columns.contains(field.name()) {
+                    // Transform string columns to Dictionary<Int32, Utf8View>
+                    let value_type = match field.data_type() {
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                            DataType::Utf8View
+                        }
+                        other => other.clone(),
+                    };
+                    Arc::new(Field::new(
+                        field.name(),
+                        DataType::Dictionary(
+                            Box::new(DataType::Int32),
+                            Box::new(value_type),
+                        ),
+                        field.is_nullable(),
+                    ))
+                } else {
+                    Arc::clone(field)
+                }
+            })
+            .collect();
+
+        Some(Schema::new_with_metadata(
+            transformed_fields,
+            schema.metadata.clone(),
+        ))
     }
 }
 
@@ -377,6 +458,8 @@ impl FileFormat for ParquetFormat {
         let file_metadata_cache =
             state.runtime_env().cache_manager.get_file_metadata_cache();
 
+        let preserve_dict = self.dictionary_encoding_preservation();
+
         let mut schemas: Vec<_> = futures::stream::iter(objects)
             .map(|object| async {
                 let file_decryption_properties = get_file_decryption_properties(
@@ -425,6 +508,24 @@ impl FileFormat for ParquetFormat {
 
         let schema = if self.force_view_types() {
             transform_schema_to_view(&schema)
+        } else {
+            schema
+        };
+
+        // When dictionary encoding preservation is enabled, detect dictionary-encoded
+        // string columns and transform them to Dictionary<Int32, Utf8View> in the
+        // table schema. We check the first file's metadata for dictionary encoding info.
+        let schema = if preserve_dict {
+            self.apply_dictionary_preservation(
+                state,
+                store,
+                objects,
+                &schema,
+                coerce_int96,
+                &file_metadata_cache,
+            )
+            .await
+            .unwrap_or(schema)
         } else {
             schema
         };
@@ -639,6 +740,7 @@ pub fn apply_file_schema_type_coercions(
 ) -> Option<Schema> {
     let mut needs_view_transform = false;
     let mut needs_string_transform = false;
+    let mut needs_dictionary_transform = false;
 
     // Create a mapping of table field names to their data types for fast lookup
     // and simultaneously check if we need any transformations
@@ -658,13 +760,17 @@ pub fn apply_file_schema_type_coercions(
             ) {
                 needs_string_transform = true;
             }
+            // Check if we need dictionary type transformation
+            if matches!(dt, DataType::Dictionary(_, _)) {
+                needs_dictionary_transform = true;
+            }
 
             (f.name(), dt)
         })
         .collect();
 
     // Early return if no transformation needed
-    if !needs_view_transform && !needs_string_transform {
+    if !needs_view_transform && !needs_string_transform && !needs_dictionary_transform {
         return None;
     }
 
@@ -678,6 +784,15 @@ pub fn apply_file_schema_type_coercions(
             // Look up the corresponding field type in the table schema
             if let Some(table_type) = table_fields.get(field_name) {
                 match (table_type, field_type) {
+                    // table schema uses Dictionary type, coerce the file schema to Dictionary
+                    (DataType::Dictionary(key_type, value_type), _)
+                        if is_string_like(field_type) =>
+                    {
+                        return field_with_new_type(
+                            field,
+                            DataType::Dictionary(key_type.clone(), value_type.clone()),
+                        );
+                    }
                     // table schema uses string type, coerce the file schema to use string type
                     (
                         &DataType::Utf8,
@@ -719,6 +834,19 @@ pub fn apply_file_schema_type_coercions(
         transformed_fields,
         file_schema.metadata.clone(),
     ))
+}
+
+/// Returns true if the data type is a string-like type that can be coerced to Dictionary
+fn is_string_like(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+    )
 }
 
 /// Coerces the file schema's Timestamps to the provided TimeUnit if Parquet schema contains INT96.
