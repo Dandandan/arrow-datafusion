@@ -23,6 +23,7 @@ pub mod bytes_view;
 pub mod primitive;
 
 use std::mem::{self, size_of};
+use std::sync::Arc;
 
 use crate::aggregates::group_values::GroupValues;
 use crate::aggregates::group_values::multi_group_by::{
@@ -888,14 +889,57 @@ macro_rules! instantiate_primitive {
     };
 }
 
+/// Returns the value data type for a given data type, unwrapping Dictionary
+/// types to their value type. For non-Dictionary types, returns the type as-is.
+fn value_data_type(data_type: &DataType) -> &DataType {
+    match data_type {
+        DataType::Dictionary(_, value_type) => value_data_type(value_type.as_ref()),
+        other => other,
+    }
+}
+
+/// Unpacks dictionary arrays to their value-type arrays so that
+/// the existing [`GroupColumn`] implementations can process them.
+///
+/// For non-dictionary arrays, returns the array as-is (cheap Arc clone).
+fn unpack_dictionaries(cols: &[ArrayRef], schema: &Schema) -> Result<Vec<ArrayRef>> {
+    cols.iter()
+        .zip(schema.fields().iter())
+        .map(|(col, field)| {
+            if let DataType::Dictionary(_, value_type) = field.data_type() {
+                // Cast the dictionary array to its value type.
+                // This unpacks the dictionary, producing a plain value array.
+                Ok(cast(col.as_ref(), value_type.as_ref())?)
+            } else {
+                Ok(Arc::clone(col))
+            }
+        })
+        .collect()
+}
+
 impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
+        // Unpack any dictionary-encoded columns to their value types
+        // so the specialized GroupColumn implementations can process them.
+        let unpacked;
+        let cols = if self
+            .schema
+            .fields()
+            .iter()
+            .any(|f| matches!(f.data_type(), DataType::Dictionary(_, _)))
+        {
+            unpacked = unpack_dictionaries(cols, self.schema.as_ref())?;
+            unpacked.as_slice()
+        } else {
+            cols
+        };
+
         if self.group_values.is_empty() {
             let mut v = Vec::with_capacity(cols.len());
 
             for f in self.schema.fields().iter() {
                 let nullable = f.is_nullable();
-                let data_type = f.data_type();
+                let data_type = value_data_type(f.data_type());
                 match data_type {
                     &DataType::Int8 => {
                         instantiate_primitive!(v, nullable, Int8Type, data_type)
@@ -1211,31 +1255,35 @@ pub fn supported_schema(schema: &Schema) -> bool {
 /// In order to be supported, there must be a specialized implementation of
 /// [`GroupColumn`] for the data type, instantiated in [`GroupValuesColumn::intern`]
 fn supported_type(data_type: &DataType) -> bool {
-    matches!(
-        *data_type,
+    match data_type {
         DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Binary
-            | DataType::LargeBinary
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Time32(_)
-            | DataType::Timestamp(_, _)
-            | DataType::Utf8View
-            | DataType::BinaryView
-            | DataType::Boolean
-    )
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(_, _)
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Timestamp(_, _)
+        | DataType::Utf8View
+        | DataType::BinaryView
+        | DataType::Boolean => true,
+        // Dictionary types are supported if the value type is supported.
+        // During intern(), dictionary arrays are unpacked to their value
+        // type and grouped using the value type's GroupColumn implementation.
+        DataType::Dictionary(_, value_type) => supported_type(value_type.as_ref()),
+        _ => false,
+    }
 }
 
 ///Shows how many `null`s there are in an array
