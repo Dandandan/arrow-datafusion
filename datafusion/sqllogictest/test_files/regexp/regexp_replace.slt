@@ -127,3 +127,18 @@ from (values ('a'), ('b')) as tbl(col);
 ----
 NULL NULL NULL
 NULL NULL NULL
+
+# Extract domain from URL using anchored pattern with trailing .*
+# This tests that the full URL suffix is replaced, not just the matched prefix
+query T
+SELECT regexp_replace(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1') FROM (VALUES
+    ('https://www.example.com/path/to/page?q=1'),
+    ('http://test.org/foo/bar'),
+    ('https://example.com/'),
+    ('not-a-url')
+) AS t(url);
+----
+example.com
+test.org
+example.com
+not-a-url

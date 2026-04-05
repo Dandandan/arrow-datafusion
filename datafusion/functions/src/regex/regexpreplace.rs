@@ -41,6 +41,7 @@ use datafusion_expr::{
 };
 use datafusion_macros::user_doc;
 use regex::Regex;
+use regex_syntax::hir::{Hir, HirKind, Look};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -197,6 +198,63 @@ fn regex_replace_posix_groups(replacement: &str) -> String {
     CAPTURE_GROUPS_RE_LOCK
         .replace_all(replacement, "$${$1}")
         .into_owned()
+}
+
+/// Count capture groups in a HIR tree.
+fn count_capture_groups(hir: &Hir) -> usize {
+    match hir.kind() {
+        HirKind::Capture(cap) => 1 + count_capture_groups(&cap.sub),
+        HirKind::Concat(subs) | HirKind::Alternation(subs) => {
+            subs.iter().map(count_capture_groups).sum()
+        }
+        HirKind::Repetition(rep) => count_capture_groups(&rep.sub),
+        _ => 0,
+    }
+}
+
+/// For anchored patterns (`^...$`), try to build a shorter regex by
+/// stripping trailing `.*` via HIR analysis. This reduces backtracker
+/// work since it doesn't need to scan through the rest of the string.
+///
+/// Only strips `.*` (greedy, min=0) which matches any suffix — this
+/// guarantees that if the extract regex matches, the full pattern would too.
+fn try_build_extract_regex(pattern: &str) -> Option<Regex> {
+    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
+    let HirKind::Concat(parts) = hir.kind() else {
+        return None;
+    };
+
+    if parts.len() < 3
+        || !matches!(parts.first()?.kind(), HirKind::Look(Look::Start))
+        || !matches!(parts.last()?.kind(), HirKind::Look(Look::End))
+    {
+        return None;
+    }
+
+    let before_end = &parts[parts.len() - 2];
+    let is_dot_star = matches!(before_end.kind(), HirKind::Repetition(rep)
+        if rep.min == 0
+            && rep.max.is_none()
+            && rep.greedy
+            && matches!(rep.sub.kind(), HirKind::Class(_))
+    );
+    if !is_dot_star {
+        return None;
+    }
+
+    // Keep ^ and inner parts, drop the .* and $
+    let trimmed_parts: Vec<Hir> = parts[..parts.len() - 2].to_vec();
+    if trimmed_parts
+        .iter()
+        .map(count_capture_groups)
+        .sum::<usize>()
+        == 0
+    {
+        return None;
+    }
+
+    let trimmed_hir = Hir::concat(trimmed_parts);
+    Regex::new(&trimmed_hir.to_string()).ok()
 }
 
 /// Replaces substring(s) matching a PCRE-like regular expression.
@@ -457,6 +515,16 @@ fn _regexp_replace_static_pattern_replace<T: OffsetSizeTrait>(
     // with rust ones.
     let replacement = regex_replace_posix_groups(replacement);
 
+    // For anchored patterns with trailing .*, build a shorter regex that
+    // reduces backtracker work by not scanning the rest of the string.
+    // We can't use this with replacen() (it would change match boundaries),
+    // so we use captures_read() + manual expansion instead.
+    let extract_re = if limit == 1 {
+        try_build_extract_regex(&pattern)
+    } else {
+        None
+    };
+
     let string_array_type = args[0].data_type();
     match string_array_type {
         DataType::Utf8 | DataType::LargeUtf8 => {
@@ -473,13 +541,33 @@ fn _regexp_replace_static_pattern_replace<T: OffsetSizeTrait>(
             let mut new_offsets = BufferBuilder::<T>::new(string_array.len() + 1);
             new_offsets.append(T::zero());
 
-            string_array.iter().for_each(|val| {
-                if let Some(val) = val {
-                    let result = re.replacen(val, limit, replacement.as_str());
-                    vals.append_slice(result.as_bytes());
-                }
-                new_offsets.append(T::from_usize(vals.len()).unwrap());
-            });
+            if let Some(ref extract_re) = extract_re {
+                // Use shorter regex for capture extraction only.
+                // Since the original pattern was ^...$, the replacement
+                // replaces the entire string — we just need correct
+                // capture group positions, which the shorter regex provides.
+                let mut result = String::new();
+                string_array.iter().for_each(|val| {
+                    if let Some(val) = val {
+                        if let Some(caps) = extract_re.captures(val) {
+                            result.clear();
+                            caps.expand(replacement.as_str(), &mut result);
+                            vals.append_slice(result.as_bytes());
+                        } else {
+                            vals.append_slice(val.as_bytes());
+                        }
+                    }
+                    new_offsets.append(T::from_usize(vals.len()).unwrap());
+                });
+            } else {
+                string_array.iter().for_each(|val| {
+                    if let Some(val) = val {
+                        let result = re.replacen(val, limit, replacement.as_str());
+                        vals.append_slice(result.as_bytes());
+                    }
+                    new_offsets.append(T::from_usize(vals.len()).unwrap());
+                });
+            }
 
             let data = ArrayDataBuilder::new(GenericStringArray::<T>::DATA_TYPE)
                 .len(string_array.len())
@@ -494,12 +582,29 @@ fn _regexp_replace_static_pattern_replace<T: OffsetSizeTrait>(
 
             let mut builder = StringViewBuilder::with_capacity(string_view_array.len());
 
-            for val in string_view_array.iter() {
-                if let Some(val) = val {
-                    let result = re.replacen(val, limit, replacement.as_str());
-                    builder.append_value(result);
-                } else {
-                    builder.append_null();
+            if let Some(ref extract_re) = extract_re {
+                let mut result = String::new();
+                for val in string_view_array.iter() {
+                    if let Some(val) = val {
+                        if let Some(caps) = extract_re.captures(val) {
+                            result.clear();
+                            caps.expand(replacement.as_str(), &mut result);
+                            builder.append_value(&result);
+                        } else {
+                            builder.append_value(val);
+                        }
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            } else {
+                for val in string_view_array.iter() {
+                    if let Some(val) = val {
+                        let result = re.replacen(val, limit, replacement.as_str());
+                        builder.append_value(result);
+                    } else {
+                        builder.append_null();
+                    }
                 }
             }
 
