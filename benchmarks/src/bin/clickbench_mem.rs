@@ -31,11 +31,11 @@ use datafusion::execution::memory_pool::{
 };
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::*;
+use datafusion_common::instant::Instant;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use datafusion_common::instant::Instant;
 
 const NUM_ROWS: usize = 5_000_000; // 5M rows
 const BATCH_SIZE: usize = 8192;
