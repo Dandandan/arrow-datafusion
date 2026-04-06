@@ -267,6 +267,15 @@ where
         // Get raw views buffer for direct comparison
         let input_views = values.views();
 
+        // Lazily register the input array's data buffers to create views
+        // that reference them directly, avoiding copies of string data.
+        // Buffer::clone() is O(1) — it just increments an Arc refcount.
+        // We only register buffers when we encounter the first new non-inline
+        // value, to avoid retaining buffers when all values already exist.
+        let input_buffers = values.data_buffers();
+        let mut input_buffers_registered = false;
+        let mut buffer_offset: u32 = 0;
+
         // Ensure lengths are equivalent
         assert_eq!(values.len(), self.hashes_buffer.len());
 
@@ -342,8 +351,39 @@ where
                 let value: &[u8] = values.value(i).as_ref();
                 let payload = make_payload_fn(Some(value));
 
-                // Create view pointing to our buffers
-                let new_view = self.append_value(value);
+                // Create view referencing the input array's buffers directly
+                // when possible, avoiding a copy of the string data.
+                let new_view = if len <= 12 || input_buffers.is_empty() {
+                    // Inline values don't reference buffers — use existing
+                    // copy path. Also fall back to copy when the input has
+                    // no data buffers.
+                    self.append_value(value)
+                } else {
+                    // Lazily register input buffers on first new non-inline value
+                    if !input_buffers_registered {
+                        input_buffers_registered = true;
+                        // Flush in_progress so buffer indices are contiguous
+                        if !self.in_progress.is_empty() {
+                            let flushed = std::mem::take(&mut self.in_progress);
+                            self.completed.push(Buffer::from_vec(flushed));
+                        }
+                        buffer_offset = self.completed.len() as u32;
+                        for buf in input_buffers {
+                            self.completed.push(buf.clone());
+                        }
+                    }
+                    // Remap the input view's buffer_index to point to our
+                    // copy of the input buffer (stored in self.completed).
+                    let input_byte_view = ByteView::from(view_u128);
+                    let remapped_buffer_index =
+                        buffer_offset + input_byte_view.buffer_index;
+                    let remapped_view =
+                        make_view(value, remapped_buffer_index, input_byte_view.offset);
+                    self.views.push(remapped_view);
+                    self.nulls.append_non_null();
+                    remapped_view
+                };
+
                 let new_header = Entry {
                     view: new_view,
                     hash,
