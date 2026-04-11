@@ -34,9 +34,12 @@ use datafusion_common::instant::Instant;
 /// ClickBench stores EventDate as UInt16 (days since 1970-01-01) for
 /// storage efficiency (2 bytes vs 4-8 bytes for date types).
 /// This view transforms it to SQL DATE type for query compatibility.
+///
+/// A single CAST(UInt16 → DATE) is sufficient because DATE is
+/// internally stored as days since epoch, matching the UInt16 encoding.
 const HITS_VIEW_DDL: &str = r#"CREATE VIEW hits AS
 SELECT * EXCEPT ("EventDate"),
-       CAST(CAST("EventDate" AS INTEGER) AS DATE) AS "EventDate"
+       CAST("EventDate" AS DATE) AS "EventDate"
 FROM hits_raw"#;
 
 /// Driver program to run the ClickBench benchmark

@@ -52,7 +52,7 @@ impl PriorityMap {
     }
 
     pub fn insert(&mut self, row_idx: usize) -> Result<()> {
-        assert!(self.map.len() <= self.capacity, "Overflow");
+        debug_assert!(self.map.len() <= self.capacity, "Overflow");
 
         // if we're full, and the new val is worse than all our values, just bail
         if self.heap.is_worse(row_idx) {
@@ -67,7 +67,9 @@ impl PriorityMap {
         let (map_idx, did_insert) = self.map.find_or_insert(row_idx, replace_idx);
         if did_insert {
             self.heap.insert(row_idx, map_idx, map);
-            self.map.update_heap_idx(map);
+            if !map.is_empty() {
+                self.map.update_heap_idx(map);
+            }
             return Ok(());
         };
 
@@ -75,7 +77,9 @@ impl PriorityMap {
         map.clear();
         let heap_idx = self.map.heap_idx_at(map_idx);
         self.heap.replace_if_better(heap_idx, row_idx, map);
-        self.map.update_heap_idx(map);
+        if !map.is_empty() {
+            self.map.update_heap_idx(map);
+        }
 
         Ok(())
     }

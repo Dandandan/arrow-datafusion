@@ -122,34 +122,28 @@ impl StringHashTable {
             data_type,
         }
     }
+}
 
-    /// Extracts the string value at the given row index, handling nulls and different string types.
-    ///
-    /// Returns `None` if the value is null, otherwise `Some(value.to_string())`.
-    fn extract_string_value(&self, row_idx: usize) -> Option<String> {
-        let is_null_and_value = match self.data_type {
-            DataType::Utf8 => {
-                let arr = self.owned.as_string::<i32>();
-                (arr.is_null(row_idx), arr.value(row_idx))
-            }
-            DataType::LargeUtf8 => {
-                let arr = self.owned.as_string::<i64>();
-                (arr.is_null(row_idx), arr.value(row_idx))
-            }
-            DataType::Utf8View => {
-                let arr = self.owned.as_string_view();
-                (arr.is_null(row_idx), arr.value(row_idx))
-            }
-            _ => panic!("Unsupported data type"),
-        };
-
-        let (is_null, value) = is_null_and_value;
-        if is_null {
-            None
-        } else {
-            Some(value.to_string())
-        }
+/// Extracts a borrowed string reference from the given array at `row_idx`.
+///
+/// Returns `None` if the value is null, otherwise `Some(&str)`.
+/// This is a freestanding function so that callers can borrow the array
+/// while mutating other struct fields (avoiding whole-`&self` borrows).
+fn extract_string_ref<'a>(
+    arr: &'a ArrayRef,
+    data_type: &DataType,
+    row_idx: usize,
+) -> Option<&'a str> {
+    if arr.is_null(row_idx) {
+        return None;
     }
+    let value = match data_type {
+        DataType::Utf8 => arr.as_string::<i32>().value(row_idx),
+        DataType::LargeUtf8 => arr.as_string::<i64>().value(row_idx),
+        DataType::Utf8View => arr.as_string_view().value(row_idx),
+        _ => panic!("Unsupported data type"),
+    };
+    Some(value)
 }
 
 impl ArrowHashTable for StringHashTable {
@@ -180,15 +174,25 @@ impl ArrowHashTable for StringHashTable {
     }
 
     fn find_or_insert(&mut self, row_idx: usize, replace_idx: usize) -> (usize, bool) {
-        let id = self.extract_string_value(row_idx);
+        // Extract a borrowed &str from the batch — zero allocation.
+        // Using a freestanding function to borrow `self.owned` and `self.data_type`
+        // independently from `self.map`, enabling Rust's disjoint struct field borrows.
+        let borrowed: Option<&str> =
+            extract_string_ref(&self.owned, &self.data_type, row_idx);
 
-        // Compute hash and create equality closure for hash table lookup.
-        let hash = self.rnd.hash_one(id.as_deref());
-        let id_for_eq = id.clone();
-        let eq = move |mi: &Option<String>| id_for_eq.as_deref() == mi.as_deref();
+        // Hash from the borrowed reference — no String allocation needed.
+        let hash = self.rnd.hash_one(borrowed);
 
-        // Use entry API to avoid double lookup
-        self.map.find_or_insert(hash, id, replace_idx, eq)
+        // Equality closure compares borrowed &str against stored Option<String>.
+        let eq = |mi: &Option<String>| borrowed == mi.as_deref();
+
+        // Lazily allocate: only create an owned String when inserting a new entry.
+        self.map.find_or_insert_lazy(
+            hash,
+            || borrowed.map(|s| s.to_string()),
+            replace_idx,
+            eq,
+        )
     }
 }
 
@@ -314,8 +318,28 @@ impl<ID: KeyType + PartialEq> TopKHashTable<ID> {
         hash: u64,
         id: ID,
         replace_idx: usize,
-        mut eq: impl FnMut(&ID) -> bool,
+        eq: impl FnMut(&ID) -> bool,
     ) -> (usize, bool) {
+        self.find_or_insert_lazy(hash, || id, replace_idx, eq)
+    }
+
+    /// Like [`find_or_insert`](Self::find_or_insert), but defers creation of the
+    /// owned key (`ID`) until an insertion is actually needed.
+    ///
+    /// This is an optimization for key types with expensive construction
+    /// (e.g. `Option<String>`): the caller can hash and compare using a
+    /// cheap borrowed reference, and only allocate the owned key when a new
+    /// entry must be stored.
+    pub fn find_or_insert_lazy<F>(
+        &mut self,
+        hash: u64,
+        make_id: F,
+        replace_idx: usize,
+        mut eq: impl FnMut(&ID) -> bool,
+    ) -> (usize, bool)
+    where
+        F: FnOnce() -> ID,
+    {
         // Check if entry exists - this is the only hash table lookup
         {
             let eq_fn = |idx: &usize| eq(&self.store[*idx].as_ref().unwrap().id);
@@ -324,7 +348,10 @@ impl<ID: KeyType + PartialEq> TopKHashTable<ID> {
             }
         }
 
-        // Entry doesn't exist - compute heap_idx and prepare item
+        // Entry doesn't exist — create the owned key now.
+        let id = make_id();
+
+        // Compute heap_idx and prepare item
         let heap_idx = self.remove_if_full(replace_idx);
         let mi = HashTableItem::new(hash, id, heap_idx);
         let store_idx = if let Some(idx) = self.free_index.take() {
