@@ -23,6 +23,19 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 use datafusion_common::Result;
 
+/// Result of a [`PriorityMap::insert_with_action`] call, indicating what happened.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InsertAction {
+    /// The row was worse than all current entries and was skipped.
+    Skipped,
+    /// A new group was added at the given `map_idx` (map was not full).
+    Added(usize),
+    /// The row belongs to an existing group at the given `map_idx`.
+    Updated(usize),
+    /// A new group replaced the worst existing group at this `map_idx`.
+    Replaced(usize),
+}
+
 /// A `Map<K, V>` / `PriorityQueue` combo that evicts the worst values after reaching `capacity`
 pub struct PriorityMap {
     map: Box<dyn ArrowHashTable + Send>,
@@ -52,15 +65,19 @@ impl PriorityMap {
     }
 
     pub fn insert(&mut self, row_idx: usize) -> Result<()> {
+        self.insert_with_action(row_idx).map(|_| ())
+    }
+
+    /// Like [`Self::insert`], but returns an [`InsertAction`] describing what happened.
+    pub fn insert_with_action(&mut self, row_idx: usize) -> Result<InsertAction> {
         assert!(self.map.len() <= self.capacity, "Overflow");
 
-        // if we're full, and the new val is worse than all our values, just bail
         if self.heap.is_worse(row_idx) {
-            return Ok(());
+            return Ok(InsertAction::Skipped);
         }
+        let was_at_capacity = self.map.len() == self.capacity;
         let map = &mut self.mapper;
 
-        // handle new groups we haven't seen yet
         map.clear();
         let replace_idx = self.heap.worst_map_idx();
 
@@ -68,22 +85,31 @@ impl PriorityMap {
         if did_insert {
             self.heap.insert(row_idx, map_idx, map);
             self.map.update_heap_idx(map);
-            return Ok(());
+            return if was_at_capacity {
+                Ok(InsertAction::Replaced(map_idx))
+            } else {
+                Ok(InsertAction::Added(map_idx))
+            };
         };
 
-        // this is a value for an existing group
         map.clear();
         let heap_idx = self.map.heap_idx_at(map_idx);
         self.heap.replace_if_better(heap_idx, row_idx, map);
         self.map.update_heap_idx(map);
 
-        Ok(())
+        Ok(InsertAction::Updated(map_idx))
     }
 
     pub fn emit(&mut self) -> Result<Vec<ArrayRef>> {
+        let (cols, _) = self.emit_with_indices()?;
+        Ok(cols)
+    }
+
+    /// Like [`Self::emit`], but also returns the `map_idx` for each emitted row.
+    pub fn emit_with_indices(&mut self) -> Result<(Vec<ArrayRef>, Vec<usize>)> {
         let (vals, map_idxs) = self.heap.drain();
-        let ids = self.map.take_all(map_idxs);
-        Ok(vec![ids, vals])
+        let ids = self.map.take_all(map_idxs.clone());
+        Ok((vec![ids, vals], map_idxs))
     }
 
     pub fn is_empty(&self) -> bool {

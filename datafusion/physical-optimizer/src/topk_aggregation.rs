@@ -79,8 +79,14 @@ impl TopKAggregation {
             if order_by != group_key_alias {
                 return None;
             }
+        } else if order_by == group_key_alias {
+            // ORDER BY group_key with arbitrary aggregates.
+            // This is safe because group key ordering is deterministic:
+            // a group's position in the sorted output depends only on its
+            // key value, so we can maintain a bounded top-K set of groups
+            // and track aggregate accumulators only for those groups.
         } else {
-            // Has aggregates but not MIN/MAX, or doesn't DISTINCT
+            // Has aggregates but ordering is not on group key or MIN/MAX
             return None;
         }
 
