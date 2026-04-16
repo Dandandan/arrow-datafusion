@@ -70,6 +70,7 @@ use futures::{
 use log::debug;
 use parquet::DecodeResult;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, RowSelectionPolicy,
@@ -80,7 +81,7 @@ use parquet::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder
 use parquet::basic::Type;
 use parquet::bloom_filter::Sbbf;
 use parquet::errors::ParquetError;
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 
 /// Implements [`FileOpener`] for Parquet
 #[derive(Clone)]
@@ -1236,6 +1237,12 @@ impl RowGroupsPrunedParquetOpen {
             reader_metadata.parquet_schema(),
         );
 
+        // Save metadata and row group indexes before they are consumed by the
+        // decoder builder so the stream can compute prefetch ranges.
+        let parquet_metadata = Arc::clone(reader_metadata.metadata());
+        let row_group_indexes = prepared_plan.row_group_indexes.clone();
+        let projection_mask = read_plan.projection_mask.clone();
+
         let mut decoder_builder =
             ParquetPushDecoderBuilder::new_with_metadata(reader_metadata)
                 .with_projection(read_plan.projection_mask)
@@ -1295,6 +1302,10 @@ impl RowGroupsPrunedParquetOpen {
                 predicate_cache_inner_records,
                 predicate_cache_records,
                 baseline_metrics: prepared.baseline_metrics,
+                parquet_metadata,
+                row_group_indexes,
+                projection_mask,
+                did_prefetch: false,
             },
             |mut state| async move {
                 let result = state.transition().await;
@@ -1324,6 +1335,14 @@ impl RowGroupsPrunedParquetOpen {
 /// byte ranges from the [`AsyncFileReader`], pushes the fetched data into the
 /// [`ParquetPushDecoder`], and yields projected [`RecordBatch`]es until the file is
 /// fully consumed.
+///
+/// To reduce the number of I/O round-trips (each of which may incur
+/// `spawn_blocking` overhead with local file systems), the stream prefetches
+/// byte ranges for all remaining row groups on the first `NeedsData` request.
+/// Because the [`ParquetPushDecoder`] accepts data pushed before it is requested,
+/// the prefetched bytes are simply pushed into the decoder and subsequent
+/// `NeedsData` calls can be served from the decoder's internal buffer without
+/// additional I/O.
 struct PushDecoderStreamState {
     decoder: ParquetPushDecoder,
     reader: Box<dyn AsyncFileReader>,
@@ -1334,9 +1353,38 @@ struct PushDecoderStreamState {
     predicate_cache_inner_records: Gauge,
     predicate_cache_records: Gauge,
     baseline_metrics: BaselineMetrics,
+
+    // -- Prefetching state --
+    /// Parquet file metadata (needed to compute column chunk byte ranges).
+    parquet_metadata: Arc<ParquetMetaData>,
+    /// Ordered list of row group indices that will be read.
+    row_group_indexes: Vec<usize>,
+    /// Which leaf columns are projected (needed to determine byte ranges).
+    projection_mask: ProjectionMask,
+    /// Set to `true` after the first prefetch to avoid re-prefetching.
+    did_prefetch: bool,
 }
 
 impl PushDecoderStreamState {
+    /// Computes the byte ranges for all projected column chunks across all
+    /// remaining row groups. These ranges form a superset of what the push
+    /// decoder will request via `NeedsData` (it may request fewer bytes when
+    /// page-level pruning is active, but extra pushed data is harmless).
+    fn prefetch_ranges(&self) -> Vec<std::ops::Range<u64>> {
+        let mut ranges = Vec::new();
+        for &rg_idx in &self.row_group_indexes {
+            let rg_meta = self.parquet_metadata.row_group(rg_idx);
+            for col_idx in 0..rg_meta.columns().len() {
+                if self.projection_mask.leaf_included(col_idx) {
+                    let col = rg_meta.column(col_idx);
+                    let (start, length) = col.byte_range();
+                    ranges.push(start..(start + length));
+                }
+            }
+        }
+        ranges
+    }
+
     /// Advances the decoder state machine until the next [`RecordBatch`] is
     /// produced, the file is fully consumed, or an error occurs.
     ///
@@ -1345,13 +1393,74 @@ impl PushDecoderStreamState {
     ///   fetched from the [`AsyncFileReader`] and fed back into the decoder.
     /// - [`Data`](DecodeResult::Data) – a decoded batch is projected and returned.
     /// - [`Finished`](DecodeResult::Finished) – signals end-of-stream (`None`).
+    ///
+    /// On the first `NeedsData`, byte ranges for all remaining row groups are
+    /// computed from the Parquet metadata and fetched alongside the requested
+    /// ranges in a single I/O call. This reduces the number of `spawn_blocking`
+    /// round-trips from N (one per row group) to 1.
     async fn transition(&mut self) -> Option<Result<RecordBatch>> {
         loop {
             match self.decoder.try_decode() {
                 Ok(DecodeResult::NeedsData(ranges)) => {
                     let fetch = async {
-                        let data = self.reader.get_byte_ranges(ranges.clone()).await?;
-                        self.decoder.push_ranges(ranges, data)?;
+                        if !self.did_prefetch {
+                            self.did_prefetch = true;
+
+                            // Compute the full set of column-chunk byte ranges
+                            // for all remaining row groups.
+                            let prefetch = self.prefetch_ranges();
+
+                            // Deduplicate: keep only prefetch ranges that are
+                            // not already in the requested set.
+                            let requested: std::collections::HashSet<_> =
+                                ranges.iter().cloned().collect();
+                            let extra: Vec<_> = prefetch
+                                .into_iter()
+                                .filter(|r| !requested.contains(r))
+                                .collect();
+
+                            if extra.is_empty() {
+                                // Nothing additional to prefetch — fall through
+                                // to the normal single-fetch path.
+                                let data =
+                                    self.reader.get_byte_ranges(ranges.clone()).await?;
+                                self.decoder.push_ranges(ranges, data)?;
+                            } else {
+                                // Build one combined request: requested first,
+                                // then prefetch ranges.
+                                let n_requested = ranges.len();
+                                let mut all_ranges = ranges.clone();
+                                let extra_ranges = extra;
+                                all_ranges.extend(extra_ranges.iter().cloned());
+
+                                let all_data =
+                                    self.reader.get_byte_ranges(all_ranges).await?;
+
+                                // Split the results: requested vs prefetched.
+                                let requested_data: Vec<_> =
+                                    all_data[..n_requested].to_vec();
+                                let prefetch_data: Vec<_> =
+                                    all_data[n_requested..].to_vec();
+
+                                // Push the requested data first so the decoder
+                                // can make immediate progress.
+                                self.decoder.push_ranges(ranges, requested_data)?;
+
+                                // Push the prefetched data; the decoder buffers
+                                // it for later NeedsData requests.
+                                if !prefetch_data.is_empty() {
+                                    self.decoder
+                                        .push_ranges(extra_ranges, prefetch_data)?;
+                                }
+                            }
+                        } else {
+                            // Already prefetched — just fetch whatever the
+                            // decoder still needs (e.g. filter column pages
+                            // not covered by the column-chunk-level prefetch).
+                            let data =
+                                self.reader.get_byte_ranges(ranges.clone()).await?;
+                            self.decoder.push_ranges(ranges, data)?;
+                        }
                         Ok::<_, ParquetError>(())
                     };
                     if let Err(e) = fetch.await {
@@ -2772,6 +2881,196 @@ mod test {
         assert_eq!(
             rows_without_page_index, 100,
             "without page index all rows are returned"
+        );
+    }
+
+    /// Verify that prefetching issues fewer I/O round-trips for multi-row-group
+    /// files while still producing correct data.
+    #[tokio::test]
+    async fn test_prefetch_reduces_io_roundtrips() {
+        use parquet::arrow::async_reader::AsyncFileReader;
+        use parquet::file::metadata::ParquetMetaData;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // --- counting reader factory ---
+
+        /// Wraps an [`AsyncFileReader`] and counts `get_byte_ranges` calls.
+        struct CountingReader {
+            inner: Box<dyn AsyncFileReader + Send>,
+            call_count: Arc<AtomicUsize>,
+        }
+
+        impl AsyncFileReader for CountingReader {
+            fn get_bytes(
+                &mut self,
+                range: std::ops::Range<u64>,
+            ) -> futures::future::BoxFuture<'_, parquet::errors::Result<bytes::Bytes>>
+            {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+                self.inner.get_bytes(range)
+            }
+
+            fn get_byte_ranges(
+                &mut self,
+                ranges: Vec<std::ops::Range<u64>>,
+            ) -> futures::future::BoxFuture<'_, parquet::errors::Result<Vec<bytes::Bytes>>>
+            where
+                Self: Send,
+            {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+                self.inner.get_byte_ranges(ranges)
+            }
+
+            fn get_metadata<'a>(
+                &'a mut self,
+                options: Option<&'a parquet::arrow::arrow_reader::ArrowReaderOptions>,
+            ) -> futures::future::BoxFuture<
+                'a,
+                parquet::errors::Result<Arc<ParquetMetaData>>,
+            > {
+                self.inner.get_metadata(options)
+            }
+        }
+
+        /// Factory that produces [`CountingReader`] and exposes the call counter.
+        #[derive(Debug)]
+        struct CountingReaderFactory {
+            inner: Arc<DefaultParquetFileReaderFactory>,
+            call_count: Arc<AtomicUsize>,
+        }
+
+        impl crate::ParquetFileReaderFactory for CountingReaderFactory {
+            fn create_reader(
+                &self,
+                partition_index: usize,
+                file: PartitionedFile,
+                metadata_size_hint: Option<usize>,
+                metrics: &ExecutionPlanMetricsSet,
+            ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>> {
+                let inner = self.inner.create_reader(
+                    partition_index,
+                    file,
+                    metadata_size_hint,
+                    metrics,
+                )?;
+                Ok(Box::new(CountingReader {
+                    inner,
+                    call_count: Arc::clone(&self.call_count),
+                }))
+            }
+        }
+
+        // --- write a parquet file with 4 row groups, 2 columns ---
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+
+        let batch1 = record_batch!(
+            ("a", Int32, vec![Some(1), Some(2), Some(3)]),
+            ("b", Int32, vec![Some(10), Some(20), Some(30)])
+        )
+        .unwrap();
+        let batch2 = record_batch!(
+            ("a", Int32, vec![Some(4), Some(5), Some(6)]),
+            ("b", Int32, vec![Some(40), Some(50), Some(60)])
+        )
+        .unwrap();
+        let batch3 = record_batch!(
+            ("a", Int32, vec![Some(7), Some(8), Some(9)]),
+            ("b", Int32, vec![Some(70), Some(80), Some(90)])
+        )
+        .unwrap();
+        let batch4 = record_batch!(
+            ("a", Int32, vec![Some(10), Some(11), Some(12)]),
+            ("b", Int32, vec![Some(100), Some(110), Some(120)])
+        )
+        .unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![
+                batch1.clone(),
+                batch2.clone(),
+                batch3.clone(),
+                batch4.clone(),
+            ],
+            Some(props),
+        )
+        .await;
+
+        let schema = batch1.schema();
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        );
+
+        // --- build opener with counting reader ---
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counting_factory = Arc::new(CountingReaderFactory {
+            inner: Arc::new(DefaultParquetFileReaderFactory::new(Arc::clone(&store))),
+            call_count: Arc::clone(&call_count),
+        });
+
+        let table_schema = TableSchema::from_file_schema(Arc::clone(&schema));
+        let file_schema = Arc::clone(table_schema.file_schema());
+        let projection = ProjectionExprs::from_indices(&[0, 1], &file_schema);
+        let metrics = ExecutionPlanMetricsSet::new();
+
+        let morselizer = ParquetMorselizer {
+            partition_index: 0,
+            projection,
+            batch_size: 1024,
+            limit: None,
+            preserve_order: false,
+            predicate: None,
+            table_schema,
+            metadata_size_hint: None,
+            metrics,
+            parquet_file_reader_factory: counting_factory,
+            pushdown_filters: false,
+            reorder_filters: false,
+            force_filter_selections: false,
+            enable_page_index: false,
+            enable_bloom_filter: false,
+            enable_row_group_stats_pruning: false,
+            coerce_int96: None,
+            #[cfg(feature = "parquet_encryption")]
+            file_decryption_properties: None,
+            expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
+            #[cfg(feature = "parquet_encryption")]
+            encryption_factory: None,
+            max_predicate_cache_size: None,
+            reverse_row_groups: false,
+        };
+        let opener = ParquetOpener { morselizer };
+
+        // --- read and verify correctness ---
+        let stream = opener.open(file).unwrap().await.unwrap();
+        let values = collect_int32_values(stream).await;
+        assert_eq!(
+            values,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            "data should be intact after prefetching"
+        );
+
+        // --- verify fewer I/O calls than row groups ---
+        // Without prefetching there would be at least 4 get_byte_ranges
+        // calls (one per row group) plus metadata fetches.
+        // With prefetching the data fetch is coalesced into a single
+        // get_byte_ranges call. The metadata loading adds a few more
+        // calls, so we check the total is strictly less than
+        // (metadata_calls + num_row_groups).
+        let total_calls = call_count.load(Ordering::SeqCst);
+        // The metadata loading itself requires some calls (typically 1-2).
+        // With prefetching the 4 data-row-group fetches become 1, so the
+        // total should be significantly less than 4 + metadata calls.
+        assert!(
+            total_calls < 4,
+            "expected fewer than 4 get_byte_ranges calls with prefetching, got {total_calls}"
         );
     }
 }
