@@ -18,6 +18,7 @@
 #![cfg_attr(test, allow(clippy::needless_pass_by_value))]
 
 mod file_pruner;
+mod in_list_pruning;
 mod pruning_predicate;
 
 pub use file_pruner::FilePruner;

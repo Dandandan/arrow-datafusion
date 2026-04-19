@@ -47,6 +47,8 @@ use datafusion_physical_expr::{PhysicalExprRef, expressions as phys_expr};
 use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr_opt;
 use datafusion_physical_plan::{ColumnarValue, PhysicalExpr};
 
+use crate::in_list_pruning::InListPruningExpr;
+
 /// Used to prove that arbitrary predicates (boolean expression) can not
 /// possibly evaluate to `true` given information about a column provided by
 /// [`PruningStatistics`].
@@ -1353,6 +1355,58 @@ fn build_is_null_column_expr(
 /// an OR chain
 const MAX_LIST_VALUE_SIZE_REWRITE: usize = 20;
 
+/// Build a native pruning expression for `col IN (v1, ..., vN)` on a plain
+/// column whose list is too large to expand via [`MAX_LIST_VALUE_SIZE_REWRITE`].
+///
+/// Returns `None` (caller falls back to the unhandled hook) if the input
+/// isn't a plain column, any list element isn't a literal, or the literal
+/// values aren't pairwise comparable.
+fn build_in_list_pruning_expr(
+    in_list: &phys_expr::InListExpr,
+    schema: &SchemaRef,
+    required_columns: &mut RequiredColumns,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    let column = in_list.expr().downcast_ref::<phys_expr::Column>()?;
+    let field = schema.field_with_name(column.name()).ok()?;
+
+    let mut values = Vec::with_capacity(in_list.list().len());
+    for element in in_list.list() {
+        let lit = element.downcast_ref::<phys_expr::Literal>()?;
+        values.push(lit.value().clone());
+    }
+
+    let col_ref: Arc<dyn PhysicalExpr> = Arc::new(column.clone());
+    let min_expr = required_columns
+        .min_column_expr(column, &col_ref, field)
+        .ok()?;
+    let max_expr = required_columns
+        .max_column_expr(column, &col_ref, field)
+        .ok()?;
+
+    let pruning = InListPruningExpr::try_new(min_expr, max_expr, values, column.name())?;
+    let pruning_expr: Arc<dyn PhysicalExpr> = Arc::new(pruning);
+
+    // Guard with `null_count != row_count` so all-null row groups are pruned,
+    // matching the wrapping used for `col = lit` pruning expressions.
+    let null_count_field = Field::new(field.name(), DataType::UInt64, true);
+    let null_count_expr = required_columns
+        .null_count_column_expr(column, &col_ref, &null_count_field)
+        .ok()?;
+    let row_count_expr = required_columns
+        .row_count_column_expr(column, &col_ref, &null_count_field)
+        .ok()?;
+
+    Some(Arc::new(phys_expr::BinaryExpr::new(
+        Arc::new(phys_expr::BinaryExpr::new(
+            null_count_expr,
+            Operator::NotEq,
+            row_count_expr,
+        )),
+        Operator::And,
+        pruning_expr,
+    )))
+}
+
 /// Rewrite a predicate expression in terms of statistics (min/max/null_counts)
 /// for use as a [`PruningPredicate`].
 pub struct PredicateRewriter {
@@ -1453,9 +1507,24 @@ fn build_predicate_expression(
         }
     }
     if let Some(in_list) = expr.downcast_ref::<phys_expr::InListExpr>() {
-        if !in_list.list().is_empty()
-            && in_list.list().len() <= MAX_LIST_VALUE_SIZE_REWRITE
+        if in_list.list().is_empty() {
+            return unhandled_hook.handle(expr);
+        }
+        // Prefer native list pruning for any non-negated IN on a plain column.
+        // It evaluates `min <= v AND v <= max` across all containers with
+        // vectorized arrow kernels for each (deduped, sorted) list value and
+        // OR-reduces with short-circuiting — independent of the list size,
+        // without building an O(N)-sized AST.
+        if !in_list.negated()
+            && let Some(pruning) =
+                build_in_list_pruning_expr(in_list, schema, required_columns)
         {
+            return pruning;
+        }
+        // Fallback: expand small lists into an OR/AND chain of equalities.
+        // Handles negation and non-plain-column expressions (e.g. `cast(c1)
+        // IN (...)`) that `build_in_list_pruning_expr` doesn't support.
+        if in_list.list().len() <= MAX_LIST_VALUE_SIZE_REWRITE {
             let eq_op = if in_list.negated() {
                 Operator::NotEq
             } else {
@@ -1484,9 +1553,8 @@ fn build_predicate_expression(
                 required_columns,
                 unhandled_hook,
             );
-        } else {
-            return unhandled_hook.handle(expr);
         }
+        return unhandled_hook.handle(expr);
     }
 
     let (left, op, right) = {
@@ -3121,7 +3189,7 @@ mod tests {
             vec![lit(1), lit(2), lit(3)],
             false,
         ));
-        let expected_expr = "c1_null_count@2 != row_count@3 AND c1_min@0 <= 1 AND 1 <= c1_max@1 OR c1_null_count@2 != row_count@3 AND c1_min@0 <= 2 AND 2 <= c1_max@1 OR c1_null_count@2 != row_count@3 AND c1_min@0 <= 3 AND 3 <= c1_max@1";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND InListPruning(c1_min@0, c1_max@1, [1, 2, 3])";
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
@@ -3203,7 +3271,7 @@ mod tests {
         // test c1 in(1, 2) and c2 BETWEEN 4 AND 5
         let expr3 = expr1.and(expr2);
 
-        let expected_expr = "(c1_null_count@2 != row_count@3 AND c1_min@0 <= 1 AND 1 <= c1_max@1 OR c1_null_count@2 != row_count@3 AND c1_min@0 <= 2 AND 2 <= c1_max@1) AND c2_null_count@5 != row_count@3 AND c2_max@4 >= 4 AND c2_null_count@5 != row_count@3 AND c2_min@6 <= 5";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND InListPruning(c1_min@0, c1_max@1, [1, 2]) AND c2_null_count@5 != row_count@3 AND c2_max@4 >= 4 AND c2_null_count@5 != row_count@3 AND c2_min@6 <= 5";
         let predicate_expr =
             test_build_predicate_expression(&expr3, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
@@ -3215,15 +3283,74 @@ mod tests {
     fn row_group_predicate_in_list_to_many_values() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
         // test c1 in(1..21)
-        // in pruning.rs has MAX_LIST_VALUE_SIZE_REWRITE = 20, more than this value will be rewrite
-        // always true
+        // in pruning.rs has MAX_LIST_VALUE_SIZE_REWRITE = 20, more than this value
+        // is lowered to a native `InListPruning` over min/max stats.
         let expr = col("c1").in_list((1..=21).map(lit).collect(), false);
+
+        let expected_expr = "c1_null_count@2 != row_count@3 AND InListPruning(c1_min@0, c1_max@1, [1, 2, 3, 4, 5, +16 more])";
+        let predicate_expr =
+            test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
+        assert_eq!(predicate_expr.to_string(), expected_expr);
+
+        Ok(())
+    }
+
+    #[test]
+    fn row_group_predicate_in_list_large_negated() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
+        // NOT IN with large list: no useful pruning, falls back to true.
+        let expr = col("c1").in_list((1..=21).map(lit).collect(), true);
 
         let expected_expr = "true";
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
 
+        Ok(())
+    }
+
+    #[test]
+    fn row_group_predicate_in_list_large_unsorted() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
+        // Values out of order — InListPruning sorts them internally.
+        let values = vec![lit(50), lit(3), lit(99), lit(7), lit(1)];
+        let mut all_values = values;
+        for i in 100..116i32 {
+            all_values.push(lit(i));
+        }
+        let expr = col("c1").in_list(all_values, false);
+
+        // Sorted list: [1, 3, 7, 50, 99, 100, 101, ...]
+        let expected_expr = "c1_null_count@2 != row_count@3 AND InListPruning(c1_min@0, c1_max@1, [1, 3, 7, 50, 99, +16 more])";
+        let predicate_expr =
+            test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
+        assert_eq!(predicate_expr.to_string(), expected_expr);
+
+        Ok(())
+    }
+
+    #[test]
+    fn row_group_predicate_in_list_large_mixed_timestamp_units() -> Result<()> {
+        // An IN list whose values mix timestamp units (Second vs Millisecond) are
+        // incomparable via partial_cmp → InListPruning::try_new bails out → the
+        // unhandled hook returns `true` (no pruning).
+        use arrow::datatypes::TimeUnit;
+        let schema = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        )]);
+
+        let mut values: Vec<Expr> = (0..20i64)
+            .map(|i| lit(ScalarValue::TimestampSecond(Some(i * 1000), None)))
+            .collect();
+        values.push(lit(ScalarValue::TimestampMillisecond(Some(999_999), None)));
+
+        let expr = col("ts").in_list(values, false);
+        let expected_expr = "true";
+        let predicate_expr =
+            test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
+        assert_eq!(predicate_expr.to_string(), expected_expr);
         Ok(())
     }
 
