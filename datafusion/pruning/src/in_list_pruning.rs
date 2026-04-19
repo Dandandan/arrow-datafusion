@@ -24,7 +24,10 @@
 //! with vectorized arrow kernels across all containers, OR-reducing until
 //! every container is known-true (then short-circuits).
 //!
-//! A container is kept iff `∃ v ∈ list : min ≤ v ≤ max`.
+//! - `col IN (list)`: keep container iff `∃ v ∈ list : min ≤ v ≤ max`.
+//! - `col NOT IN (list)`: keep container unless `min == max` and that single
+//!   value is in the list — the only case where `min`/`max` stats let us
+//!   prove the predicate is false for every row.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -33,8 +36,8 @@ use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray};
 use arrow::buffer::BooleanBuffer;
-use arrow::compute::kernels::boolean::{and_kleene, or_kleene};
-use arrow::compute::kernels::cmp::lt_eq;
+use arrow::compute::kernels::boolean::{and_kleene, not, or_kleene};
+use arrow::compute::kernels::cmp::{eq, lt_eq};
 use arrow::datatypes::{DataType, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, ScalarValue, internal_err};
@@ -56,6 +59,8 @@ pub(crate) struct InListPruningExpr {
     /// are pairwise comparable (constructor rejects lists where `partial_cmp`
     /// would return `None` between any pair).
     sorted_values: Vec<ScalarValue>,
+    /// `true` for `NOT IN`: container is kept unless `min == max ∈ list`.
+    negated: bool,
     /// Source column name, for `Display` / explain output only.
     column_name: String,
 }
@@ -69,6 +74,7 @@ impl InListPruningExpr {
         min_expr: Arc<dyn PhysicalExpr>,
         max_expr: Arc<dyn PhysicalExpr>,
         values: Vec<ScalarValue>,
+        negated: bool,
         column_name: impl Into<String>,
     ) -> Option<Self> {
         if values.is_empty() {
@@ -92,6 +98,7 @@ impl InListPruningExpr {
             min_expr,
             max_expr,
             sorted_values,
+            negated,
             column_name: column_name.into(),
         })
     }
@@ -102,6 +109,7 @@ impl PartialEq for InListPruningExpr {
         self.min_expr.eq(&other.min_expr)
             && self.max_expr.eq(&other.max_expr)
             && self.sorted_values == other.sorted_values
+            && self.negated == other.negated
     }
 }
 
@@ -112,6 +120,7 @@ impl Hash for InListPruningExpr {
         self.min_expr.hash(state);
         self.max_expr.hash(state);
         self.sorted_values.hash(state);
+        self.negated.hash(state);
     }
 }
 
@@ -125,17 +134,22 @@ impl fmt::Display for InListPruningExpr {
             .collect::<Vec<_>>()
             .join(", ");
         let rest = self.sorted_values.len().saturating_sub(5);
+        let name = if self.negated {
+            "NotInListPruning"
+        } else {
+            "InListPruning"
+        };
         if rest > 0 {
             write!(
                 f,
-                "InListPruning({}, {}, [{}, +{} more])",
-                self.min_expr, self.max_expr, preview, rest
+                "{name}({}, {}, [{}, +{rest} more])",
+                self.min_expr, self.max_expr, preview
             )
         } else {
             write!(
                 f,
-                "InListPruning({}, {}, [{}])",
-                self.min_expr, self.max_expr, preview
+                "{name}({}, {}, [{preview}])",
+                self.min_expr, self.max_expr
             )
         }
     }
@@ -169,27 +183,12 @@ impl PhysicalExpr for InListPruningExpr {
         }
         let num_rows = min_array.len();
 
-        // For each list value `v`, compute `(min <= v) AND (v <= max)` across
-        // all containers via vectorized kernels, then OR-reduce into `found`.
-        // Kleene semantics propagate nulls: if a container's min or max stat
-        // is null the corresponding output row is null (treated as "keep").
-        let mut iter = self.sorted_values.iter();
-        let mut found: BooleanArray = match iter.next() {
-            Some(first) => hit_array(first, &min_array, &max_array)?,
-            None => BooleanArray::new(BooleanBuffer::new_unset(num_rows), None),
+        let result = if self.negated {
+            evaluate_not_in(&self.sorted_values, &min_array, &max_array, num_rows)?
+        } else {
+            evaluate_in(&self.sorted_values, &min_array, &max_array, num_rows)?
         };
-
-        for value in iter {
-            // Short-circuit: once every row is known-true, further values can't
-            // change the result.
-            if found.null_count() == 0 && found.true_count() == num_rows {
-                break;
-            }
-            let hit = hit_array(value, &min_array, &max_array)?;
-            found = or_kleene(&found, &hit)?;
-        }
-
-        Ok(ColumnarValue::Array(Arc::new(found)))
+        Ok(ColumnarValue::Array(Arc::new(result)))
     }
 
     fn return_field(&self, _input_schema: &Schema) -> Result<FieldRef> {
@@ -218,6 +217,7 @@ impl PhysicalExpr for InListPruningExpr {
             min_expr: Arc::clone(&children[0]),
             max_expr: Arc::clone(&children[1]),
             sorted_values: self.sorted_values.clone(),
+            negated: self.negated,
             column_name: self.column_name.clone(),
         }))
     }
@@ -225,6 +225,58 @@ impl PhysicalExpr for InListPruningExpr {
     fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self}")
     }
+}
+
+/// `col IN (list)` over stats: keep iff `∃ v ∈ list : min ≤ v ≤ max`.
+fn evaluate_in(
+    sorted_values: &[ScalarValue],
+    min_array: &dyn Array,
+    max_array: &dyn Array,
+    num_rows: usize,
+) -> Result<BooleanArray> {
+    let mut iter = sorted_values.iter();
+    let mut found: BooleanArray = match iter.next() {
+        Some(first) => hit_array(first, min_array, max_array)?,
+        None => BooleanArray::new(BooleanBuffer::new_unset(num_rows), None),
+    };
+    for value in iter {
+        if found.null_count() == 0 && found.true_count() == num_rows {
+            break;
+        }
+        let hit = hit_array(value, min_array, max_array)?;
+        found = or_kleene(&found, &hit)?;
+    }
+    Ok(found)
+}
+
+/// `col NOT IN (list)` over stats: only prunable case is
+/// `min == max ∈ list`, where every row in the container has a value that's
+/// excluded. Returns `NOT(min == max AND min ∈ list)`; null min/max propagate
+/// as null (treated as "keep").
+fn evaluate_not_in(
+    sorted_values: &[ScalarValue],
+    min_array: &dyn Array,
+    max_array: &dyn Array,
+    num_rows: usize,
+) -> Result<BooleanArray> {
+    let min_eq_max = eq(&min_array, &max_array)?;
+
+    // `min ∈ list`: OR of (min == v) over all list values.
+    let mut iter = sorted_values.iter();
+    let mut min_in_list: BooleanArray = match iter.next() {
+        Some(first) => eq(&min_array, &first.to_scalar()?)?,
+        None => BooleanArray::new(BooleanBuffer::new_unset(num_rows), None),
+    };
+    for value in iter {
+        if min_in_list.null_count() == 0 && min_in_list.true_count() == num_rows {
+            break;
+        }
+        let hit = eq(&min_array, &value.to_scalar()?)?;
+        min_in_list = or_kleene(&min_in_list, &hit)?;
+    }
+
+    let prune = and_kleene(&min_eq_max, &min_in_list)?;
+    Ok(not(&prune)?)
 }
 
 /// Compute `(min <= v) AND (v <= max)` across all containers using vectorized
@@ -261,6 +313,7 @@ mod tests {
                 ScalarValue::Int32(Some(50)),
                 ScalarValue::Int32(Some(500)),
             ],
+            false,
             "c",
         )
         .unwrap();
@@ -295,6 +348,7 @@ mod tests {
                 col_int32("c_min", 0),
                 col_int32("c_max", 1),
                 vec![],
+                false,
                 "c",
             )
             .is_none()
@@ -313,6 +367,7 @@ mod tests {
                 col_int32("c_min", 0),
                 col_int32("c_max", 1),
                 values,
+                false,
                 "c",
             )
             .is_none()
@@ -326,6 +381,7 @@ mod tests {
             col_int32("c_min", 0),
             col_int32("c_max", 1),
             vec![ScalarValue::Int32(Some(5)), ScalarValue::Int32(Some(100))],
+            false,
             "c",
         )
         .unwrap();
@@ -346,5 +402,45 @@ mod tests {
         };
         let bools = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(!bools.value(0));
+    }
+
+    #[test]
+    fn not_in_prunes_only_when_range_is_single_value_in_list() {
+        // `col NOT IN (5, 100)` pruned iff min == max ∈ {5, 100}.
+        let expr = InListPruningExpr::try_new(
+            col_int32("c_min", 0),
+            col_int32("c_max", 1),
+            vec![ScalarValue::Int32(Some(5)), ScalarValue::Int32(Some(100))],
+            true,
+            "c",
+        )
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c_min", DataType::Int32, true),
+            Field::new("c_max", DataType::Int32, true),
+        ]));
+        // Row 0: [5, 5]      → min=max=5, 5 ∈ list → prune (false)
+        // Row 1: [100, 100]  → min=max=100, 100 ∈ list → prune (false)
+        // Row 2: [7, 7]      → min=max=7, 7 ∉ list → keep (true)
+        // Row 3: [5, 100]    → min ≠ max → keep (true)
+        // Row 4: null min    → keep (null)
+        let mins = Int32Array::from(vec![Some(5), Some(100), Some(7), Some(5), None]);
+        let maxs =
+            Int32Array::from(vec![Some(5), Some(100), Some(7), Some(100), Some(5)]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(mins), Arc::new(maxs)]).unwrap();
+
+        let out = expr.evaluate(&batch).unwrap();
+        let arr = match out {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("expected array"),
+        };
+        let bools = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(!bools.value(0));
+        assert!(!bools.value(1));
+        assert!(bools.value(2));
+        assert!(bools.value(3));
+        assert!(bools.is_null(4));
     }
 }

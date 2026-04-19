@@ -1355,12 +1355,12 @@ fn build_is_null_column_expr(
 /// an OR chain
 const MAX_LIST_VALUE_SIZE_REWRITE: usize = 20;
 
-/// Build a native pruning expression for `col IN (v1, ..., vN)` on a plain
-/// column whose list is too large to expand via [`MAX_LIST_VALUE_SIZE_REWRITE`].
+/// Build a native pruning expression for `col IN (v1, ..., vN)` (or `NOT IN`)
+/// on a plain column.
 ///
-/// Returns `None` (caller falls back to the unhandled hook) if the input
-/// isn't a plain column, any list element isn't a literal, or the literal
-/// values aren't pairwise comparable.
+/// Returns `None` (caller falls back to the unhandled hook or OR-expansion)
+/// if the input isn't a plain column, any list element isn't a literal, or
+/// the literal values aren't pairwise comparable.
 fn build_in_list_pruning_expr(
     in_list: &phys_expr::InListExpr,
     schema: &SchemaRef,
@@ -1383,7 +1383,13 @@ fn build_in_list_pruning_expr(
         .max_column_expr(column, &col_ref, field)
         .ok()?;
 
-    let pruning = InListPruningExpr::try_new(min_expr, max_expr, values, column.name())?;
+    let pruning = InListPruningExpr::try_new(
+        min_expr,
+        max_expr,
+        values,
+        in_list.negated(),
+        column.name(),
+    )?;
     let pruning_expr: Arc<dyn PhysicalExpr> = Arc::new(pruning);
 
     // Guard with `null_count != row_count` so all-null row groups are pruned,
@@ -1510,14 +1516,13 @@ fn build_predicate_expression(
         if in_list.list().is_empty() {
             return unhandled_hook.handle(expr);
         }
-        // Prefer native list pruning for any non-negated IN on a plain column.
-        // It evaluates `min <= v AND v <= max` across all containers with
-        // vectorized arrow kernels for each (deduped, sorted) list value and
-        // OR-reduces with short-circuiting — independent of the list size,
-        // without building an O(N)-sized AST.
-        if !in_list.negated()
-            && let Some(pruning) =
-                build_in_list_pruning_expr(in_list, schema, required_columns)
+        // Prefer native list pruning for any IN (or NOT IN) on a plain column.
+        // Non-negated case evaluates `min <= v AND v <= max` across all
+        // containers via vectorized arrow kernels and OR-reduces; negated
+        // only prunes when `min == max ∈ list`, the only case derivable from
+        // min/max stats. Works for any list size without building an O(N) AST.
+        if let Some(pruning) =
+            build_in_list_pruning_expr(in_list, schema, required_columns)
         {
             return pruning;
         }
@@ -3225,7 +3230,7 @@ mod tests {
             vec![lit(1), lit(2), lit(3)],
             true,
         ));
-        let expected_expr = "c1_null_count@2 != row_count@3 AND (c1_min@0 != 1 OR 1 != c1_max@1) AND c1_null_count@2 != row_count@3 AND (c1_min@0 != 2 OR 2 != c1_max@1) AND c1_null_count@2 != row_count@3 AND (c1_min@0 != 3 OR 3 != c1_max@1)";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND NotInListPruning(c1_min@0, c1_max@1, [1, 2, 3])";
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
@@ -3298,10 +3303,11 @@ mod tests {
     #[test]
     fn row_group_predicate_in_list_large_negated() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        // NOT IN with large list: no useful pruning, falls back to true.
+        // NOT IN with large list: native pruning prunes only row groups where
+        // min == max ∈ list.
         let expr = col("c1").in_list((1..=21).map(lit).collect(), true);
 
-        let expected_expr = "true";
+        let expected_expr = "c1_null_count@2 != row_count@3 AND NotInListPruning(c1_min@0, c1_max@1, [1, 2, 3, 4, 5, +16 more])";
         let predicate_expr =
             test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
         assert_eq!(predicate_expr.to_string(), expected_expr);
