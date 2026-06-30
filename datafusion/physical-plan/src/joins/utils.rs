@@ -2180,6 +2180,63 @@ pub(super) fn equal_rows_arr(
     right_arrays: &[ArrayRef],
     null_equality: NullEquality,
 ) -> Result<(UInt64Array, UInt32Array)> {
+    if can_compare_rows_directly(left_arrays, right_arrays)
+        && let Ok(comparator) =
+            JoinKeyComparator::for_equality(left_arrays, right_arrays, null_equality)
+    {
+        return equal_rows_arr_direct(indices_left, indices_right, &comparator);
+    }
+
+    equal_rows_arr_with_take(
+        indices_left,
+        indices_right,
+        left_arrays,
+        right_arrays,
+        null_equality,
+    )
+}
+
+fn can_compare_rows_directly(
+    left_arrays: &[ArrayRef],
+    right_arrays: &[ArrayRef],
+) -> bool {
+    !left_arrays.is_empty()
+        && left_arrays.len() == right_arrays.len()
+        && !left_arrays
+            .iter()
+            .chain(right_arrays.iter())
+            .any(|array| array.data_type().is_nested())
+}
+
+fn equal_rows_arr_direct(
+    indices_left: &UInt64Array,
+    indices_right: &UInt32Array,
+    comparator: &JoinKeyComparator,
+) -> Result<(UInt64Array, UInt32Array)> {
+    let mut left_filtered = Vec::with_capacity(indices_left.len());
+    let mut right_filtered = Vec::with_capacity(indices_right.len());
+
+    for (&left_idx, &right_idx) in indices_left
+        .values()
+        .iter()
+        .zip(indices_right.values().iter())
+    {
+        if comparator.is_equal(left_idx as usize, right_idx as usize) {
+            left_filtered.push(left_idx);
+            right_filtered.push(right_idx);
+        }
+    }
+
+    Ok((left_filtered.into(), right_filtered.into()))
+}
+
+fn equal_rows_arr_with_take(
+    indices_left: &UInt64Array,
+    indices_right: &UInt32Array,
+    left_arrays: &[ArrayRef],
+    right_arrays: &[ArrayRef],
+    null_equality: NullEquality,
+) -> Result<(UInt64Array, UInt32Array)> {
     let mut iter = left_arrays.iter().zip(right_arrays.iter());
 
     let Some((first_left, first_right)) = iter.next() else {
@@ -2330,6 +2387,19 @@ impl JoinKeyComparator {
         let first = iter.next().expect("join must have at least one key")?;
         let rest = iter.collect::<Result<Vec<_>>>()?;
         Ok(Self { first, rest })
+    }
+
+    /// Build equality-only comparators for each join key column pair.
+    ///
+    /// Equality checks only care whether the comparator returns
+    /// [`Ordering::Equal`], so the default ordering options are sufficient.
+    pub fn for_equality(
+        left_arrays: &[ArrayRef],
+        right_arrays: &[ArrayRef],
+        null_equality: NullEquality,
+    ) -> Result<Self> {
+        let sort_options = vec![SortOptions::default(); left_arrays.len()];
+        Self::new(left_arrays, right_arrays, &sort_options, null_equality)
     }
 
     /// Compare row `left` (in the left arrays) with row `right` (in the right
@@ -2570,6 +2640,80 @@ mod tests {
             matched_build_indices(&map, &hashes_buffer),
             vec![0, 1, 2, 3, 4]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn equal_rows_arr_filters_candidate_pairs() -> Result<()> {
+        let left: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "a"]));
+        let right: ArrayRef = Arc::new(StringArray::from(vec!["a", "c", "b"]));
+
+        let build_indices: UInt64Array = vec![0, 1, 2, 1].into();
+        let probe_indices: UInt32Array = vec![0, 0, 1, 2].into();
+
+        let (build_filtered, probe_filtered) = equal_rows_arr(
+            &build_indices,
+            &probe_indices,
+            &[left],
+            &[right],
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        assert_eq!(build_filtered.values().as_ref(), &[0, 1]);
+        assert_eq!(probe_filtered.values().as_ref(), &[0, 2]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn equal_rows_arr_handles_empty_key_arrays() -> Result<()> {
+        let build_indices: UInt64Array = vec![0, 1].into();
+        let probe_indices: UInt32Array = vec![0, 1].into();
+
+        let (build_filtered, probe_filtered) = equal_rows_arr(
+            &build_indices,
+            &probe_indices,
+            &[],
+            &[],
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        assert!(build_filtered.is_empty());
+        assert!(probe_filtered.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn equal_rows_arr_respects_null_equality() -> Result<()> {
+        let left: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None]));
+        let right: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None]));
+
+        let build_indices: UInt64Array = vec![0, 1].into();
+        let probe_indices: UInt32Array = vec![0, 1].into();
+
+        let (build_filtered, probe_filtered) = equal_rows_arr(
+            &build_indices,
+            &probe_indices,
+            &[Arc::clone(&left)],
+            &[Arc::clone(&right)],
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        assert_eq!(build_filtered.values().as_ref(), &[0]);
+        assert_eq!(probe_filtered.values().as_ref(), &[0]);
+
+        let (build_filtered, probe_filtered) = equal_rows_arr(
+            &build_indices,
+            &probe_indices,
+            &[left],
+            &[right],
+            NullEquality::NullEqualsNull,
+        )?;
+
+        assert_eq!(build_filtered.values().as_ref(), &[0, 1]);
+        assert_eq!(probe_filtered.values().as_ref(), &[0, 1]);
 
         Ok(())
     }
