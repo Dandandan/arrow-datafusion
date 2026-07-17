@@ -334,30 +334,25 @@ impl PrunableStatistics {
         get_stat: impl Fn(&ColumnStatistics) -> &Precision<ScalarValue>,
     ) -> Option<ArrayRef> {
         let index = self.schema.index_of(column.name()).ok()?;
+        let data_type = self.schema.field(index).data_type();
+        let typed_null = ScalarValue::try_from(data_type).ok()?;
         let mut has_value = false;
-        match ScalarValue::iter_to_array(self.statistics.iter().map(|s| {
+        let values = self.statistics.iter().map(|s| {
             s.column_statistics
                 .get(index)
                 .and_then(|stat| {
-                    if let Precision::Exact(min) = get_stat(stat) {
-                        has_value = true;
-                        Some(min.clone())
-                    } else {
-                        None
+                    if let Precision::Exact(value) = get_stat(stat)
+                        && value.data_type() == *data_type
+                    {
+                        has_value |= !value.is_null();
+                        return Some(value.clone());
                     }
+                    None
                 })
-                .unwrap_or(ScalarValue::Null)
-        })) {
-            // If there is any non-null value and no errors, return the array
-            Ok(array) => has_value.then_some(array),
-            Err(_) => {
-                log::warn!(
-                    "Failed to convert min values to array for column {}",
-                    column.name()
-                );
-                None
-            }
-        }
+                .unwrap_or_else(|| typed_null.clone())
+        });
+        let array = ScalarValue::iter_to_array(values).ok()?;
+        has_value.then_some(array)
     }
 }
 
@@ -529,7 +524,7 @@ impl PruningStatistics for CompositePruningStatistics {
 mod tests {
     use crate::{
         ColumnStatistics,
-        cast::{as_int32_array, as_uint64_array},
+        cast::{as_int32_array, as_int64_array, as_uint64_array},
     };
 
     use super::*;
@@ -859,6 +854,71 @@ mod tests {
         assert!(pruning_stats.null_counts(&column_d).is_none());
         assert!(pruning_stats.row_counts().is_some());
         assert!(pruning_stats.contained(&column_d, &values).is_none());
+    }
+
+    #[test]
+    fn test_statistics_pruning_preserves_typed_nulls_for_inexact_bounds() {
+        let statistics = vec![
+            Arc::new(
+                Statistics::default().add_column_statistics(
+                    ColumnStatistics::new_unknown()
+                        .with_min_value(Precision::Exact(ScalarValue::Int64(Some(
+                            i64::MIN,
+                        ))))
+                        .with_max_value(Precision::Exact(ScalarValue::Int64(Some(-5)))),
+                ),
+            ),
+            Arc::new(
+                Statistics::default().add_column_statistics(
+                    ColumnStatistics::new_unknown()
+                        .with_min_value(Precision::Inexact(ScalarValue::Int64(Some(0))))
+                        .with_max_value(Precision::Inexact(ScalarValue::Int64(Some(10)))),
+                ),
+            ),
+            Arc::new(
+                Statistics::default()
+                    .add_column_statistics(ColumnStatistics::new_unknown()),
+            ),
+            Arc::new(
+                Statistics::default().add_column_statistics(
+                    ColumnStatistics::new_unknown()
+                        .with_min_value(Precision::Exact(ScalarValue::Int32(Some(7))))
+                        .with_max_value(Precision::Exact(ScalarValue::Int32(Some(8)))),
+                ),
+            ),
+            Arc::new(
+                Statistics::default().add_column_statistics(
+                    ColumnStatistics::new_unknown()
+                        .with_min_value(Precision::Exact(ScalarValue::Int64(Some(
+                            i64::MAX - 1,
+                        ))))
+                        .with_max_value(Precision::Exact(ScalarValue::Int64(Some(
+                            i64::MAX,
+                        )))),
+                ),
+            ),
+        ];
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "big_id",
+            DataType::Int64,
+            true,
+        )]));
+        let pruning_stats = PrunableStatistics::new(statistics, schema);
+        let column = Column::new_unqualified("big_id");
+
+        let min_values = as_int64_array(&pruning_stats.min_values(&column).unwrap())
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            min_values,
+            vec![Some(i64::MIN), None, None, None, Some(i64::MAX - 1)]
+        );
+        let max_values = as_int64_array(&pruning_stats.max_values(&column).unwrap())
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(max_values, vec![Some(-5), None, None, None, Some(i64::MAX)]);
     }
 
     #[test]
